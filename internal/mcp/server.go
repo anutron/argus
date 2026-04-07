@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -49,6 +50,7 @@ const maxConcurrentCreates = 5
 type Server struct {
 	db          KBQuerier
 	port        int
+	vaultPath   string // Metis vault path for write-back to Obsidian
 	httpSrv     *http.Server
 	createTask  TaskCreator
 	taskDB      TaskQuerier
@@ -58,8 +60,8 @@ type Server struct {
 }
 
 // New creates a new MCP server.
-func New(db KBQuerier, port int) *Server {
-	return &Server{db: db, port: port}
+func New(db KBQuerier, port int, vaultPath string) *Server {
+	return &Server{db: db, port: port, vaultPath: vaultPath}
 }
 
 // SetTaskManager wires in task management capabilities.
@@ -427,16 +429,54 @@ func (s *Server) toolKBIngest(id interface{}, args json.RawMessage) *Response {
 	if p.Path == "" || p.Content == "" {
 		return toolError(id, "path and content are required")
 	}
-	if filepath.IsAbs(p.Path) || strings.Contains(p.Path, "..") {
+
+	// Canonicalize and validate the path: must be vault-relative, no escaping.
+	cleanPath := filepath.Clean(p.Path)
+	if filepath.IsAbs(cleanPath) || strings.HasPrefix(cleanPath, "..") {
 		return toolError(id, "invalid path: must be vault-relative with no '..' components")
 	}
+	// After Clean, verify the resolved path stays within the vault.
+	if s.vaultPath != "" {
+		absPath := filepath.Join(s.vaultPath, cleanPath)
+		if !strings.HasPrefix(absPath, s.vaultPath+string(filepath.Separator)) && absPath != s.vaultPath {
+			return toolError(id, "invalid path: escapes vault directory")
+		}
+	}
 
-	doc := kb.ParseDocument(p.Path, p.Content)
+	doc := kb.ParseDocument(cleanPath, p.Content)
 	doc.IngestedAt = time.Now()
 	doc.ModifiedAt = time.Now()
 	if err := s.db.KBUpsert(&doc); err != nil {
 		return toolError(id, fmt.Sprintf("Ingest failed: %v", err))
 	}
+
+	// Write back to Obsidian vault so the file appears in the vault.
+	if s.vaultPath != "" {
+		absPath := filepath.Join(s.vaultPath, cleanPath)
+		if err := os.MkdirAll(filepath.Dir(absPath), 0o755); err != nil {
+			log.Printf("[mcp] vault write-back mkdir failed: %v", err)
+		} else {
+			content := kb.RenderMarkdown(&doc)
+			// Atomic write: temp file + rename.
+			dir := filepath.Dir(absPath)
+			tmp, err := os.CreateTemp(dir, ".kb-ingest-*.tmp")
+			if err != nil {
+				log.Printf("[mcp] vault write-back tempfile failed: %v", err)
+			} else {
+				tmpName := tmp.Name()
+				_, writeErr := tmp.WriteString(content)
+				tmp.Close() //nolint:errcheck
+				if writeErr != nil {
+					log.Printf("[mcp] vault write-back write failed: %v", writeErr)
+					os.Remove(tmpName) //nolint:errcheck
+				} else if err := os.Rename(tmpName, absPath); err != nil {
+					log.Printf("[mcp] vault write-back rename failed: %v", err)
+					os.Remove(tmpName) //nolint:errcheck
+				}
+			}
+		}
+	}
+
 	return toolResult(id, fmt.Sprintf("Ingested %s (%d words)", p.Path, doc.WordCount))
 }
 
