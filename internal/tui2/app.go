@@ -2392,6 +2392,24 @@ func (a *App) executeDeleteToDo() {
 	a.todos.RefreshAsync(a.tapp)
 }
 
+// removeTodoVaultFile removes a todo vault file if it falls within the configured vault directory.
+// No-op if the vault path is unconfigured or todoPath falls outside it.
+// Does NOT trigger a vault refresh — callers must call a.todos.RefreshAsync when done.
+func (a *App) removeTodoVaultFile(todoPath string) {
+	vaultPath := a.todos.VaultPath()
+	cleanPath := filepath.Clean(todoPath)
+	cleanVault := filepath.Clean(vaultPath)
+	if cleanVault == "" || !strings.HasPrefix(cleanPath, cleanVault+string(os.PathSeparator)) {
+		uxlog.Log("[todos] auto-delete: skipping %s (not in vault %s)", todoPath, vaultPath)
+		return
+	}
+	if err := os.Remove(cleanPath); err != nil {
+		uxlog.Log("[todos] auto-delete: failed to remove %s: %v", cleanPath, err)
+	} else {
+		uxlog.Log("[todos] auto-delete: removed %s", cleanPath)
+	}
+}
+
 // closeDeleteToDoModal closes the delete to-do confirmation modal.
 func (a *App) closeDeleteToDoModal() {
 	a.mode = modeTaskList
@@ -2992,6 +3010,12 @@ func (a *App) deleteTask(t *model.Task) {
 	// Remove session log file.
 	os.Remove(agent.SessionLogPath(t.ID)) //nolint:errcheck
 
+	// Delete the linked todo vault file if present.
+	if t.TodoPath != "" {
+		a.removeTodoVaultFile(t.TodoPath)
+		a.todos.RefreshAsync(a.tapp)
+	}
+
 	// Delete from database first so the UI updates immediately.
 	if err := a.db.Delete(t.ID); err != nil {
 		uxlog.Log("[tui2] failed to delete task %s: %v", t.ID, err)
@@ -3037,9 +3061,17 @@ func (a *App) pruneCompletedTasks() {
 		}
 	}
 
-	// Remove session logs for all pruned tasks.
+	// Remove session logs and linked todo vault files for all pruned tasks.
+	hasTodo := false
 	for _, t := range pruned {
 		os.Remove(agent.SessionLogPath(t.ID)) //nolint:errcheck
+		if t.TodoPath != "" {
+			a.removeTodoVaultFile(t.TodoPath)
+			hasTodo = true
+		}
+	}
+	if hasTodo {
+		a.todos.RefreshAsync(a.tapp)
 	}
 
 	cfg := a.db.Config()
