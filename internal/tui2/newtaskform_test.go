@@ -1,11 +1,14 @@
 package tui2
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/drn/argus/internal/config"
 	"github.com/drn/argus/internal/model"
 	"github.com/drn/argus/internal/skills"
+	"github.com/drn/argus/internal/testutil"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -986,6 +989,85 @@ func TestNewTaskForm_ProjectTypeahead(t *testing.T) {
 		}
 		if f.Canceled() {
 			t.Error("should not cancel form when AC was open")
+		}
+	})
+}
+
+func TestNewTaskForm_ProjectChangeReloadsSkills(t *testing.T) {
+	// Create two projects with different skill directories.
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+
+	// Project A has skill "test-skill-alpha"
+	skillDirA := filepath.Join(dirA, ".claude", "skills", "test-skill-alpha")
+	testutil.NoError(t, os.MkdirAll(skillDirA, 0o755))
+	testutil.NoError(t, os.WriteFile(filepath.Join(skillDirA, "SKILL.md"), []byte("---\ndescription: Alpha skill\n---\n"), 0o644))
+
+	// Project B has skill "test-skill-bravo"
+	skillDirB := filepath.Join(dirB, ".claude", "skills", "test-skill-bravo")
+	testutil.NoError(t, os.MkdirAll(skillDirB, 0o755))
+	testutil.NoError(t, os.WriteFile(filepath.Join(skillDirB, "SKILL.md"), []byte("---\ndescription: Bravo skill\n---\n"), 0o644))
+
+	projects := map[string]config.Project{
+		"alpha": {Path: dirA},
+		"bravo": {Path: dirB},
+	}
+	backends := map[string]config.Backend{"b": {Command: "claude"}}
+
+	hasSkill := func(f *NewTaskForm, name string) bool {
+		for _, s := range f.skills {
+			if s.Name == name {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("enter without AC reloads skills", func(t *testing.T) {
+		f := NewNewTaskForm(projects, "alpha", backends, "b")
+
+		// Verify initial skills loaded from project alpha.
+		if !hasSkill(f, "test-skill-alpha") {
+			t.Error("initial skills should include test-skill-alpha")
+		}
+		if hasSkill(f, "test-skill-bravo") {
+			t.Error("initial skills should not include test-skill-bravo")
+		}
+
+		// Switch to project bravo by typing the name and pressing Enter
+		// (without using AC selection).
+		f.focused = ntFieldProject
+		f.projInput = []rune("bravo")
+		f.projCursorPos = 5
+		f.projACOpen = false
+
+		handler := f.InputHandler()
+		handler(tcell.NewEventKey(tcell.KeyEnter, 0, 0), func(p tview.Primitive) {})
+
+		if !hasSkill(f, "test-skill-bravo") {
+			t.Error("skills should include test-skill-bravo after switching")
+		}
+		if hasSkill(f, "test-skill-alpha") {
+			t.Error("test-skill-alpha from old project should be gone")
+		}
+	})
+
+	t.Run("down arrow without AC reloads skills", func(t *testing.T) {
+		f := NewNewTaskForm(projects, "alpha", backends, "b")
+
+		f.focused = ntFieldProject
+		f.projInput = []rune("bravo")
+		f.projCursorPos = 5
+		f.projACOpen = false
+
+		handler := f.InputHandler()
+		handler(tcell.NewEventKey(tcell.KeyDown, 0, 0), func(p tview.Primitive) {})
+
+		if !hasSkill(f, "test-skill-bravo") {
+			t.Error("skills should include test-skill-bravo after down-arrow project change")
+		}
+		if hasSkill(f, "test-skill-alpha") {
+			t.Error("test-skill-alpha from old project should be gone")
 		}
 	})
 }
