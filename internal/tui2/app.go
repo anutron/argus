@@ -1660,7 +1660,10 @@ func (a *App) switchTab(t Tab) {
 	switch t {
 	case TabTasks:
 		if a.mode == modeAgent {
+			// exitAgentView is a complete "return to tasks" primitive:
+			// resets mode, tab state, page, and focus. No extra work needed.
 			a.exitAgentView()
+			return
 		}
 		a.mode = modeTaskList
 		a.pages.SwitchToPage("tasks")
@@ -3156,7 +3159,8 @@ func (a *App) navigateAgentTask(direction int) {
 	a.onTaskSelect(next)
 }
 
-// exitAgentView returns to the task list.
+// exitAgentView returns to the task list. Always resets the active tab to
+// TabTasks so the global key handler routes navigation keys correctly.
 func (a *App) exitAgentView() {
 	uxlog.Log("[tui2] exiting agent view")
 	a.mu.Lock()
@@ -3170,6 +3174,8 @@ func (a *App) exitAgentView() {
 	a.worktreeDir = ""
 	// Restore the tab header when returning to root views.
 	a.root.ResizeItem(a.header, 1, 0)
+	a.header.SetTab(TabTasks)
+	a.statusbar.SetTab(TabTasks)
 	a.pages.SwitchToPage("tasks")
 	a.tapp.SetFocus(a.tasklist)
 	a.statusbar.ClearError()
