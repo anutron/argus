@@ -60,6 +60,9 @@ const sandboxProfileBase = `(version 1)
 (allow file-write* (subpath (string-append (param "HOME") "/.cargo")))
 (allow file-write* (subpath (string-append (param "HOME") "/.local")))
 (allow file-write* (subpath (string-append (param "HOME") "/.cache")))
+; macOS Keychain -- needed for Claude Code to store API keys via security(1).
+; Mach IPC alone is insufficient; security(1) requires direct file-write access.
+(allow file-write* (subpath (string-append (param "HOME") "/Library/Keychains")))
 ; Dotfiles — full write required for merge skill (git reset --hard origin/master).
 ; Expands from ~/.dots/sys/skill-usage; acceptable since sole-user threat model.
 (allow file-write* (subpath (string-append (param "HOME") "/.dots")))
