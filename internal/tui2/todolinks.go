@@ -22,11 +22,22 @@ type Link struct {
 var mdLinkRe = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^\s)]+)\)`)
 
 // bareLinkRe matches bare URLs not already inside markdown link syntax.
-var bareLinkRe = regexp.MustCompile(`https?://[^\s)\]>]+`)
+// Excludes all ASCII control characters (\x00-\x1f, including \x1b ESC) to
+// prevent matching through residual escape sequence bytes.
+var bareLinkRe = regexp.MustCompile(`https?://[^\s)\]>\x00-\x1f]+`)
+
+// osc8Re matches OSC 8 hyperlink tags: \x1b]8;params;URL\x07 or \x1b]8;params;URL\x1b\\
+// Captures the URL in group 1. Opening tags have a non-empty URL; closing tags are empty.
+var osc8Re = regexp.MustCompile(`\x1b\]8;[^;]*;([^\x07\x1b]*)(?:\x07|\x1b\\)`)
 
 // stripANSI removes ANSI escape sequences from raw terminal output.
-// Uses the package-level ansiRe defined in agentpane.go.
+// OSC 8 hyperlink tags are replaced with their embedded URL (+ space separator)
+// so the URL is preserved for extraction. Uses the package-level ansiRe from agentpane.go.
 func stripANSI(s string) string {
+	// First pass: extract URLs from OSC 8 hyperlinks before general stripping.
+	// Opening tags become "URL " (preserving the link target); closing tags
+	// (empty URL) become just a space — harmless for subsequent URL matching.
+	s = osc8Re.ReplaceAllString(s, "$1 ")
 	return ansiRe.ReplaceAllString(s, "")
 }
 
