@@ -375,6 +375,98 @@ func TestResolveStartPoint(t *testing.T) {
 	}
 }
 
+func TestCreateWorktree_FetchesRemote(t *testing.T) {
+	// Verify that CreateWorktree fetches remotes before resolving the base
+	// branch. We set up a local repo with a remote, push a new branch to
+	// the remote AFTER the clone, and confirm the worktree can be based on
+	// that branch even though the local repo hasn't seen it yet.
+	upstreamDir := t.TempDir()
+	for _, args := range [][]string{
+		{"init"},
+		{"config", "user.email", "test@test.com"},
+		{"config", "user.name", "Test"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = upstreamDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s\n%s", args, err, out)
+		}
+	}
+	readme := filepath.Join(upstreamDir, "README.md")
+	if err := os.WriteFile(readme, []byte("test"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"add", "."},
+		{"commit", "-m", "initial"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = upstreamDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s\n%s", args, err, out)
+		}
+	}
+
+	// Clone the upstream.
+	repoDir := t.TempDir()
+	cloneCmd := exec.Command("git", "clone", upstreamDir, repoDir)
+	if out, err := cloneCmd.CombinedOutput(); err != nil {
+		t.Fatalf("git clone: %s\n%s", err, out)
+	}
+
+	// Now create a new branch on the upstream AFTER the clone.
+	for _, args := range [][]string{
+		{"checkout", "-b", "feature-new"},
+		{"commit", "--allow-empty", "-m", "feature commit"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = upstreamDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %s\n%s", args, err, out)
+		}
+	}
+
+	// The local repo doesn't know about feature-new yet.
+	checkCmd := exec.Command("git", "rev-parse", "--verify", "--quiet", "origin/feature-new")
+	checkCmd.Dir = repoDir
+	if checkCmd.Run() == nil {
+		t.Fatal("expected origin/feature-new to NOT exist before fetch")
+	}
+
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	// CreateWorktree should fetch and resolve origin/feature-new.
+	wtPath, finalName, _, err := CreateWorktree(repoDir, "testproj", "fetch-test", "feature-new")
+	if err != nil {
+		t.Fatalf("CreateWorktree with unfetched remote branch failed: %v", err)
+	}
+	if finalName != "fetch-test" {
+		t.Errorf("expected finalName %q, got %q", "fetch-test", finalName)
+	}
+	if _, err := os.Stat(filepath.Join(wtPath, ".git")); err != nil {
+		t.Errorf("expected worktree at %q", wtPath)
+	}
+
+	// Verify the worktree HEAD matches the upstream feature-new commit.
+	wtHead := exec.Command("git", "rev-parse", "HEAD")
+	wtHead.Dir = wtPath
+	wtOut, err := wtHead.Output()
+	if err != nil {
+		t.Fatalf("rev-parse HEAD in worktree: %v", err)
+	}
+	upstreamHead := exec.Command("git", "rev-parse", "feature-new")
+	upstreamHead.Dir = upstreamDir
+	upOut, err := upstreamHead.Output()
+	if err != nil {
+		t.Fatalf("rev-parse feature-new in upstream: %v", err)
+	}
+	if strings.TrimSpace(string(wtOut)) != strings.TrimSpace(string(upOut)) {
+		t.Errorf("worktree HEAD %q does not match upstream feature-new %q",
+			strings.TrimSpace(string(wtOut)), strings.TrimSpace(string(upOut)))
+	}
+}
+
 func TestCreateWorktree_ExistingBranch(t *testing.T) {
 	// Test the fallback path where the branch already exists but worktree doesn't.
 	repoDir := t.TempDir()
