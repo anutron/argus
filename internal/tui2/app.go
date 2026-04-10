@@ -2003,10 +2003,14 @@ func (a *App) handleNewTaskKey(event *tcell.EventKey) {
 
 				// If the user navigated away from the pending agent view
 				// (escaped to task list, or opened a different task), don't
-				// yank them back — just select in the list for easy access.
+				// yank them back — just start the session in the background
+				// and select in the list for easy access. Without this, the
+				// session never starts because new tasks have no SessionID
+				// for onTaskSelect's auto-resume guard.
 				if a.mode != modeAgent || a.agentState.TaskID != pendingTaskID {
-					uxlog.Log("[tui2] user left pending view, skipping auto-select for new task %s", task.ID)
+					uxlog.Log("[tui2] user left pending view, starting session in background for task %s", task.ID)
 					a.tasklist.SelectByID(task.ID)
+					a.startSession(task)
 					return
 				}
 
@@ -2023,7 +2027,8 @@ func (a *App) handleNewTaskKey(event *tcell.EventKey) {
 	}
 }
 
-// startSession starts a session for the current task (agent view must already be active).
+// startSession starts a session for the current task. Safe to call when the
+// agent view is not active — pane attachment is skipped and deferred to onTaskSelect.
 func (a *App) startSession(task *model.Task) {
 	cfg := a.db.Config()
 
@@ -2098,16 +2103,14 @@ func (a *App) startSession(task *model.Task) {
 	a.recentStarts[task.ID] = time.Now() // grace period: protect from false reconciliation
 	a.db.Update(task) //nolint:errcheck
 
-	// Record start time for reconciliation grace period.
-	if a.recentStarts == nil {
-		a.recentStarts = make(map[string]time.Time)
+	// Attach to the terminal pane and start the redraw loop only if the
+	// agent view is active for this task. When startSession is called from
+	// the background (user navigated away during worktree creation), the
+	// pane isn't visible — onTaskSelect will attach when the user returns.
+	if a.mode == modeAgent && a.agentState.TaskID == task.ID {
+		a.agentPane.SetSession(sess)
+		a.startAgentRedrawLoop(task.ID, sess)
 	}
-	a.recentStarts[task.ID] = time.Now()
-
-	// Now that the session exists, attach it to the terminal pane.
-	a.agentPane.SetSession(sess)
-
-	a.startAgentRedrawLoop(task.ID, sess)
 }
 
 // startAgentRedrawLoop runs a goroutine that triggers redraws every 200ms
