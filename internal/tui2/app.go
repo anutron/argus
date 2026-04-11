@@ -241,7 +241,7 @@ func (a *App) buildUI() {
 	a.statusbar = NewStatusBar()
 
 	a.tasklist = NewTaskListView()
-	a.tasklist.OnSelect = a.onTaskSelect
+	a.tasklist.OnSelect = func(task *model.Task) { a.onTaskSelect(task, true) }
 	a.tasklist.OnNew = a.onNewTask
 	a.tasklist.OnCursorChange = a.onTaskCursorChange
 	a.tasklist.OnStatusChange = func(t *model.Task) {
@@ -1834,7 +1834,7 @@ func (a *App) enterPendingAgentView(task *model.Task) {
 }
 
 // onTaskSelect handles Enter on a task — enters the agent view.
-func (a *App) onTaskSelect(task *model.Task) {
+func (a *App) onTaskSelect(task *model.Task, autoStart bool) {
 	uxlog.Log("[tui2] entering agent view for task %s (%s)", task.ID, task.Name)
 
 	// User is viewing the agent — clear the "idle unvisited" flag so the task
@@ -1885,13 +1885,18 @@ func (a *App) onTaskSelect(task *model.Task) {
 		return
 	}
 
-	// Auto-resume sessions that were interrupted (e.g., daemon restart).
-	// The task has a SessionID from the previous conversation but no running
-	// session — resume immediately instead of requiring a second Enter press.
-	// NOTE: Call sites that do onTaskSelect + startSession explicitly (new task,
-	// todo launch, fork) are safe because new tasks never have a SessionID.
-	if (sess == nil || !sess.Alive()) && task.SessionID != "" && task.Status != model.StatusComplete && !task.Archived {
-		uxlog.Log("[tui2] auto-resuming session for task %s (sessionID=%s)", task.ID, task.SessionID)
+	// Auto-start sessions when entering agent view for a non-running task.
+	// Covers both fresh tasks (no SessionID) and interrupted sessions
+	// (e.g., daemon restart with a preserved SessionID). Excludes completed
+	// and archived tasks — those are view-only until the user explicitly
+	// presses Enter to restart.
+	// After the sess.Alive() early-return above, any session here is dead.
+	if autoStart && task.Status != model.StatusComplete && !task.Archived {
+		sid := task.SessionID
+		if sid == "" {
+			sid = "(none)"
+		}
+		uxlog.Log("[tui2] auto-starting session for task %s (sessionID=%s)", task.ID, sid)
 		a.startSession(task)
 	}
 }
@@ -1958,8 +1963,7 @@ func (a *App) handleNewTaskKey(event *tcell.EventKey) {
 			uxlog.Log("[tui2] created task %s (%s)", task.ID, task.Name)
 			a.refreshTasksLocal()
 			a.tasklist.SelectByID(task.ID)
-			a.onTaskSelect(task)
-			a.startSession(task)
+			a.onTaskSelect(task, true)
 			return
 		}
 
@@ -2014,9 +2018,7 @@ func (a *App) handleNewTaskKey(event *tcell.EventKey) {
 				// If the user navigated away from the pending agent view
 				// (escaped to task list, or opened a different task), don't
 				// yank them back — just start the session in the background
-				// and select in the list for easy access. Without this, the
-				// session never starts because new tasks have no SessionID
-				// for onTaskSelect's auto-resume guard.
+				// and select in the list for easy access.
 				if a.mode != modeAgent || a.agentState.TaskID != pendingTaskID {
 					uxlog.Log("[tui2] user left pending view, starting session in background for task %s", task.ID)
 					a.tasklist.SelectByID(task.ID)
@@ -2025,13 +2027,11 @@ func (a *App) handleNewTaskKey(event *tcell.EventKey) {
 				}
 
 				// Complete the transition: update agent header with final name,
-				// select the task in the list, and start the session.
-				// startSession must be called explicitly — new tasks have no
-				// SessionID so onTaskSelect's auto-resume guard skips it.
+				// select the task in the list, and enter agent view (which
+				// auto-starts the session).
 				a.agentHeader.SetTaskName(task.Name)
 				a.tasklist.SelectByID(task.ID)
-				a.onTaskSelect(task)
-				a.startSession(task)
+				a.onTaskSelect(task, true)
 			})
 		}()
 	}
@@ -2222,8 +2222,7 @@ func (a *App) handleLaunchToDoKey(event *tcell.EventKey) {
 			uxlog.Log("[todos] launched to-do %q as task %s (%s)", item.Name, task.ID, task.Name)
 			a.refreshTasksLocal()
 			a.tasklist.SelectByID(task.ID)
-			a.onTaskSelect(task)
-			a.startSession(task)
+			a.onTaskSelect(task, true)
 			return
 		}
 
@@ -2272,8 +2271,7 @@ func (a *App) handleLaunchToDoKey(event *tcell.EventKey) {
 					return
 				}
 				a.tasklist.SelectByID(task.ID)
-				a.onTaskSelect(task)
-				a.startSession(task)
+				a.onTaskSelect(task, true)
 			})
 		}()
 	}
@@ -2329,7 +2327,7 @@ func (a *App) startReviewTask(pr *github.PR) {
 		a.switchTab(TabTasks)
 		a.refreshTasksLocal()
 		a.tasklist.SelectByID(existing.ID)
-		a.onTaskSelect(existing)
+		a.onTaskSelect(existing, true)
 		return
 	}
 
@@ -2371,8 +2369,7 @@ func (a *App) startReviewTask(pr *github.PR) {
 		a.switchTab(TabTasks)
 		a.refreshTasksLocal()
 		a.tasklist.SelectByID(task.ID)
-		a.onTaskSelect(task)
-		a.startSession(task)
+		a.onTaskSelect(task, true)
 		return
 	}
 
@@ -2415,8 +2412,7 @@ func (a *App) startReviewTask(pr *github.PR) {
 			a.switchTab(TabTasks)
 			a.refreshTasksLocal()
 			a.tasklist.SelectByID(task.ID)
-			a.onTaskSelect(task)
-			a.startSession(task)
+			a.onTaskSelect(task, true)
 		})
 	}()
 }
@@ -2875,8 +2871,7 @@ func (a *App) executeFork(source *model.Task, targetProject string) {
 
 			a.refreshTasksLocal()
 			a.tasklist.SelectByID(task.ID)
-			a.onTaskSelect(task)
-			a.startSession(task)
+			a.onTaskSelect(task, true)
 		})
 	}()
 }
@@ -3315,7 +3310,7 @@ func (a *App) navigateAgentTask(direction int) {
 	a.tasklist.SelectByID(next.ID)
 	// Enter the agent view for the new task (reuses onTaskSelect which
 	// resets all agent state, wires up the session, kicks off git status, etc.)
-	a.onTaskSelect(next)
+	a.onTaskSelect(next, false)
 }
 
 // exitAgentView returns to the task list. Always resets the active tab to
