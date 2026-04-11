@@ -159,6 +159,31 @@ func TestExtractLinks(t *testing.T) {
 			content: "https://example.com/articles/16\x1b[39m\x1b[2C\x1b[1Bextra",
 			want:    []Link{{Label: "https://example.com/articles/16", URL: "https://example.com/articles/16"}},
 		},
+		{
+			name:    "bare URL with unicode ellipsis excluded",
+			content: "see https://example.com/very/long/path/that/gets\u2026 for info",
+			want:    nil,
+		},
+		{
+			name:    "bare URL with three-dot ellipsis excluded",
+			content: "see https://example.com/very/long/path/that/gets... for info",
+			want:    nil,
+		},
+		{
+			name:    "markdown link with ellipsis in URL excluded",
+			content: "[Truncated](https://example.com/path\u2026)",
+			want:    nil,
+		},
+		{
+			name:    "ellipsis URL excluded but valid URL kept",
+			content: "https://example.com/truncated\u2026 and https://example.com/valid",
+			want:    []Link{{Label: "https://example.com/valid", URL: "https://example.com/valid"}},
+		},
+		{
+			name:    "github compare range with triple dots not excluded",
+			content: "https://github.com/org/repo/compare/v1.0...v1.1",
+			want:    []Link{{Label: "https://github.com/org/repo/compare/v1.0...v1.1", URL: "https://github.com/org/repo/compare/v1.0...v1.1"}},
+		},
 	}
 
 	for _, tt := range tests {
