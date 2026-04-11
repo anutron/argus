@@ -9,6 +9,8 @@ import (
 	"github.com/rivo/tview"
 
 	"github.com/drn/argus/internal/model"
+	"github.com/drn/argus/internal/tui/theme"
+	"github.com/drn/argus/internal/tui/widget"
 	"github.com/drn/argus/internal/uxlog"
 )
 
@@ -349,13 +351,13 @@ func (p *ToDoListPanel) Draw(screen tcell.Screen) {
 	}
 
 	title := fmt.Sprintf(" To Dos (%d) ", len(p.items))
-	inner := drawBorderedPanel(screen, x, y, width, height, title, StyleBorder)
+	inner := widget.DrawBorderedPanel(screen, x, y, width, height, title, theme.StyleBorder)
 	if inner.W <= 0 || inner.H <= 0 {
 		return
 	}
 
 	if len(p.items) == 0 {
-		drawText(screen, inner.X, inner.Y, inner.W, "No items", StyleDimmed)
+		widget.DrawText(screen, inner.X, inner.Y, inner.W, "No items", theme.StyleDimmed)
 		return
 	}
 
@@ -369,27 +371,27 @@ func (p *ToDoListPanel) Draw(screen tcell.Screen) {
 
 		col := inner.X
 		prefix := "  "
-		drawText(screen, col, inner.Y+i, 2, prefix, StyleDefault)
+		widget.DrawText(screen, col, inner.Y+i, 2, prefix, theme.StyleDefault)
 		col += 2
 
 		// Status-aware bullet
 		bullet := '○'
-		bulletStyle := StyleDimmed
+		bulletStyle := theme.StyleDimmed
 		if p.taskMap != nil {
 			if t, ok := p.taskMap[item.Path]; ok {
 				switch t.Status {
 				case model.StatusPending:
 					bullet = '○'
-					bulletStyle = StylePending
+					bulletStyle = theme.StylePending
 				case model.StatusInProgress:
 					bullet = '●'
-					bulletStyle = StyleInProgress
+					bulletStyle = theme.StyleInProgress
 				case model.StatusInReview:
-					bullet = IconMoonStars
-					bulletStyle = StyleInReview
+					bullet = theme.IconMoonStars
+					bulletStyle = theme.StyleInReview
 				case model.StatusComplete:
 					bullet = '✓'
-					bulletStyle = StyleComplete
+					bulletStyle = theme.StyleComplete
 				}
 			}
 		}
@@ -397,16 +399,16 @@ func (p *ToDoListPanel) Draw(screen tcell.Screen) {
 		col += 2
 
 		// Name
-		nameStyle := StyleNormal
+		nameStyle := theme.StyleNormal
 		if isCursor {
-			nameStyle = StyleSelected
+			nameStyle = theme.StyleSelected
 		}
 		nameStr := item.Name
 		maxNameW := inner.W - (col - inner.X)
 		if maxNameW > 0 && len(nameStr) > maxNameW {
 			nameStr = nameStr[:maxNameW-1] + "…"
 		}
-		drawText(screen, col, inner.Y+i, maxNameW, nameStr, nameStyle)
+		widget.DrawText(screen, col, inner.Y+i, maxNameW, nameStr, nameStyle)
 	}
 }
 
@@ -440,13 +442,13 @@ func (p *ToDoPreviewPanel) Draw(screen tcell.Screen) {
 		return
 	}
 
-	inner := drawBorderedPanel(screen, x, y, width, height, " Preview ", StyleBorder)
+	inner := widget.DrawBorderedPanel(screen, x, y, width, height, " Preview ", theme.StyleBorder)
 	if inner.W <= 0 || inner.H <= 0 {
 		return
 	}
 
 	if p.item == nil {
-		drawText(screen, inner.X, inner.Y, inner.W, "No item selected", StyleDimmed)
+		widget.DrawText(screen, inner.X, inner.Y, inner.W, "No item selected", theme.StyleDimmed)
 		return
 	}
 
@@ -457,7 +459,7 @@ func (p *ToDoPreviewPanel) Draw(screen tcell.Screen) {
 		if li >= len(lines) {
 			break
 		}
-		drawText(screen, inner.X, inner.Y+i, inner.W, lines[li], StyleNormal)
+		widget.DrawText(screen, inner.X, inner.Y+i, inner.W, lines[li], theme.StyleNormal)
 	}
 }
 
@@ -489,13 +491,13 @@ func (p *ToDoDetailPanel) Draw(screen tcell.Screen) {
 		return
 	}
 
-	inner := drawBorderedPanel(screen, x, y, width, height, " Details ", StyleBorder)
+	inner := widget.DrawBorderedPanel(screen, x, y, width, height, " Details ", theme.StyleBorder)
 	if inner.W <= 0 || inner.H <= 0 {
 		return
 	}
 
 	if p.item == nil {
-		drawText(screen, inner.X, inner.Y, inner.W, "No item selected", StyleDimmed)
+		widget.DrawText(screen, inner.X, inner.Y, inner.W, "No item selected", theme.StyleDimmed)
 		return
 	}
 
@@ -506,7 +508,7 @@ func (p *ToDoDetailPanel) Draw(screen tcell.Screen) {
 	if len(name) > inner.W-1 {
 		name = name[:inner.W-4] + "..."
 	}
-	drawText(screen, inner.X, row, inner.W, name, StyleTitle)
+	widget.DrawText(screen, inner.X, row, inner.W, name, theme.StyleTitle)
 	row += 2
 
 	// File path (truncated)
@@ -515,23 +517,23 @@ func (p *ToDoDetailPanel) Draw(screen tcell.Screen) {
 	if maxLen > 3 && len(path) > maxLen {
 		path = "..." + path[len(path)-maxLen+3:]
 	}
-	drawField(screen, inner.X, row, inner.W, "File", path, StyleNormal)
+	drawField(screen, inner.X, row, inner.W, "File", path, theme.StyleNormal)
 	row++
 
 	// Modified date
-	drawField(screen, inner.X, row, inner.W, "Modified", p.item.ModTime.Format(time.DateOnly), StyleNormal)
+	drawField(screen, inner.X, row, inner.W, "Modified", p.item.ModTime.Format(time.DateOnly), theme.StyleNormal)
 	row++
 
 	// Content size
 	size := fmt.Sprintf("%d chars", len(p.item.Content))
-	drawField(screen, inner.X, row, inner.W, "Size", size, StyleNormal)
+	drawField(screen, inner.X, row, inner.W, "Size", size, theme.StyleNormal)
 }
 
 // drawField renders "Label: Value" for the detail panel.
 func drawField(screen tcell.Screen, x, row, w int, label, value string, valStyle tcell.Style) {
 	labelStr := fmt.Sprintf("%s: ", label)
-	drawText(screen, x, row, len(labelStr), labelStr, StyleDimmed)
-	drawText(screen, x+len(labelStr), row, w-len(labelStr), value, valStyle)
+	widget.DrawText(screen, x, row, len(labelStr), labelStr, theme.StyleDimmed)
+	widget.DrawText(screen, x+len(labelStr), row, w-len(labelStr), value, valStyle)
 }
 
 // wrapTextLines wraps a multi-line string to fit within maxWidth.

@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"github.com/drn/argus/internal/tui/theme"
+	"github.com/drn/argus/internal/tui/widget"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -26,9 +28,9 @@ func NewRenameTaskForm(currentName string) *RenameTaskForm {
 	}
 }
 
-func (rf *RenameTaskForm) Done() bool      { return rf.done }
-func (rf *RenameTaskForm) Canceled() bool  { return rf.canceled }
-func (rf *RenameTaskForm) Name() string    { return string(rf.name) }
+func (rf *RenameTaskForm) Done() bool          { return rf.done }
+func (rf *RenameTaskForm) Canceled() bool      { return rf.canceled }
+func (rf *RenameTaskForm) Name() string        { return string(rf.name) }
 func (rf *RenameTaskForm) SetError(msg string) { rf.errMsg = msg }
 func (rf *RenameTaskForm) ResetDone()          { rf.done = false }
 
@@ -44,7 +46,7 @@ func (rf *RenameTaskForm) HandleKey(ev *tcell.EventKey) {
 		rf.done = true
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		if hasAlt {
-			rf.name, rf.cursor = deleteWordLeft(rf.name, rf.cursor)
+			rf.name, rf.cursor = widget.DeleteWordLeft(rf.name, rf.cursor)
 			return
 		}
 		if rf.cursor > 0 {
@@ -52,10 +54,10 @@ func (rf *RenameTaskForm) HandleKey(ev *tcell.EventKey) {
 			rf.cursor--
 		}
 	case tcell.KeyCtrlW:
-		rf.name, rf.cursor = deleteWordLeft(rf.name, rf.cursor)
+		rf.name, rf.cursor = widget.DeleteWordLeft(rf.name, rf.cursor)
 	case tcell.KeyDelete:
 		if hasAlt {
-			rf.name, rf.cursor = deleteWordRight(rf.name, rf.cursor)
+			rf.name, rf.cursor = widget.DeleteWordRight(rf.name, rf.cursor)
 			return
 		}
 		if rf.cursor < len(rf.name) {
@@ -63,7 +65,7 @@ func (rf *RenameTaskForm) HandleKey(ev *tcell.EventKey) {
 		}
 	case tcell.KeyLeft:
 		if hasAlt {
-			rf.cursor = wordLeftPos(rf.name, rf.cursor)
+			rf.cursor = widget.WordLeftPos(rf.name, rf.cursor)
 			return
 		}
 		if rf.cursor > 0 {
@@ -71,7 +73,7 @@ func (rf *RenameTaskForm) HandleKey(ev *tcell.EventKey) {
 		}
 	case tcell.KeyRight:
 		if hasAlt {
-			rf.cursor = wordRightPos(rf.name, rf.cursor)
+			rf.cursor = widget.WordRightPos(rf.name, rf.cursor)
 			return
 		}
 		if rf.cursor < len(rf.name) {
@@ -91,11 +93,11 @@ func (rf *RenameTaskForm) HandleKey(ev *tcell.EventKey) {
 		if hasAlt {
 			switch r {
 			case 'b', 'B':
-				rf.cursor = wordLeftPos(rf.name, rf.cursor)
+				rf.cursor = widget.WordLeftPos(rf.name, rf.cursor)
 			case 'f', 'F':
-				rf.cursor = wordRightPos(rf.name, rf.cursor)
+				rf.cursor = widget.WordRightPos(rf.name, rf.cursor)
 			case 'd', 'D':
-				rf.name, rf.cursor = deleteWordRight(rf.name, rf.cursor)
+				rf.name, rf.cursor = widget.DeleteWordRight(rf.name, rf.cursor)
 			}
 			return
 		}
@@ -135,8 +137,8 @@ func (rf *RenameTaskForm) Draw(screen tcell.Screen) {
 	formY := y + (height-formH)/2
 	formY = max(formY, y)
 
-	drawBorder(screen, formX, formY, formW, formH, StyleFocusedBorder)
-	drawText(screen, formX+2, formY+1, formW-4, "Rename Task", StyleTitle)
+	widget.DrawBorder(screen, formX, formY, formW, formH, theme.StyleFocusedBorder)
+	widget.DrawText(screen, formX+2, formY+1, formW-4, "Rename Task", theme.StyleTitle)
 
 	// Name field with cursor.
 	before := string(rf.name[:rf.cursor])
@@ -148,9 +150,9 @@ func (rf *RenameTaskForm) Draw(screen tcell.Screen) {
 		valRunes = valRunes[len(valRunes)-maxW:]
 	}
 	val = string(valRunes)
-	drawText(screen, formX+2, formY+3, maxW, val, tcell.StyleDefault)
+	widget.DrawText(screen, formX+2, formY+3, maxW, val, tcell.StyleDefault)
 
 	if rf.errMsg != "" {
-		drawText(screen, formX+2, formY+5, formW-4, rf.errMsg, StyleError)
+		widget.DrawText(screen, formX+2, formY+5, formW-4, rf.errMsg, theme.StyleError)
 	}
 }

@@ -24,6 +24,11 @@ import (
 	"github.com/drn/argus/internal/github"
 	"github.com/drn/argus/internal/gitutil"
 	"github.com/drn/argus/internal/model"
+	"github.com/drn/argus/internal/tui/gitpanel"
+	"github.com/drn/argus/internal/tui/modal"
+	"github.com/drn/argus/internal/tui/taskview"
+	"github.com/drn/argus/internal/tui/terminal"
+	"github.com/drn/argus/internal/tui/widget"
 	"github.com/drn/argus/internal/uxlog"
 )
 
@@ -73,16 +78,16 @@ type App struct {
 	mu     sync.Mutex
 
 	// Sub-views
-	header       *Header
-	statusbar    *StatusBar
-	tasklist     *TaskListView
-	taskGitPanel *GitPanel // git status for selected task (task list center-top)
+	header       *widget.Header
+	statusbar    *widget.StatusBar
+	tasklist     *taskview.TaskListView
+	taskGitPanel *gitpanel.GitPanel // git status for selected task (task list center-top)
 	taskPreview  *TaskPreviewPanel
-	taskDetail   *TaskDetailPanel
-	agentPane    *TerminalPane
-	agentHeader  *AgentHeader
-	gitPanel     *GitPanel // git status for agent view (left panel)
-	filePanel    *FilePanel
+	taskDetail   *taskview.TaskDetailPanel
+	agentPane    *terminal.TerminalPane
+	agentHeader  *widget.AgentHeader
+	gitPanel     *gitpanel.GitPanel // git status for agent view (left panel)
+	filePanel    *gitpanel.FilePanel
 
 	// Tabs
 	todos        *ToDosView
@@ -94,15 +99,15 @@ type App struct {
 	newTaskForm *NewTaskForm
 
 	// Confirm delete modal (created on demand)
-	confirmDeleteModal        *ConfirmDeleteModal
-	confirmDeleteProjectModal *ConfirmDeleteProjectModal
+	confirmDeleteModal        *modal.ConfirmDeleteModal
+	confirmDeleteProjectModal *modal.ConfirmDeleteProjectModal
 
 	// Launch to-do modal (created on demand)
-	launchToDoModal    *LaunchToDoModal
+	launchToDoModal      *LaunchToDoModal
 	cleanupToDosModal    *ConfirmCleanupToDosModal
 	deleteToDoModal      *ConfirmDeleteToDoModal
-	linkPickerModal          *LinkPickerModal
-	linkPickerPrevPage      string
+	linkPickerModal      *LinkPickerModal
+	linkPickerPrevPage   string
 	fuzzyLinkPickerModal *FuzzyLinkPickerModal
 
 	// Fork task modal (created on demand)
@@ -119,25 +124,25 @@ type App struct {
 
 	// Layout containers
 	root      *tview.Flex
-	taskPage  *TaskPage
+	taskPage  *taskview.TaskPage
 	agentPage *tview.Flex
 	pages     *tview.Pages
 
 	// State
-	mode            viewMode
-	agentFocus      agentFocus
-	agentState      agentview.State
-	daemonConnected bool
-	tasks           []*model.Task
-	runningIDs      []string
-	idleIDs         []string
-	worktreeDir     string // resolved worktree dir for current agent view task
+	mode               viewMode
+	agentFocus         agentFocus
+	agentState         agentview.State
+	daemonConnected    bool
+	tasks              []*model.Task
+	runningIDs         []string
+	idleIDs            []string
+	worktreeDir        string // resolved worktree dir for current agent view task
 	lastGitRefresh     time.Time
 	lastTaskGitRefresh time.Time
-	lastPreviewTW       uint64 // TotalWritten when preview was last refreshed
-	lastPreviewTaskID   string // task ID for the cached TotalWritten
-	lastPreviewLogSize  int64  // log file size when dead-session preview was last refreshed
-	prScanTW            map[string]uint64 // per-session TotalWritten for PR URL scan throttling
+	lastPreviewTW      uint64            // TotalWritten when preview was last refreshed
+	lastPreviewTaskID  string            // task ID for the cached TotalWritten
+	lastPreviewLogSize int64             // log file size when dead-session preview was last refreshed
+	prScanTW           map[string]uint64 // per-session TotalWritten for PR URL scan throttling
 
 	// Idle-unvisited tracking (for visual InReview promotion)
 	idleUnvisited    map[string]bool // task IDs idle since user last opened their agent view
@@ -146,15 +151,15 @@ type App struct {
 	// Daemon health
 	daemonFailures    int
 	daemonRestarting  bool
-	daemonFreshStart  bool            // no prior sessions (fresh auto-start or restart); first reconciliation uses InReview
-	lastDaemonRestart time.Time       // cooldown: minimum 30s between restart attempts
+	daemonFreshStart  bool      // no prior sessions (fresh auto-start or restart); first reconciliation uses InReview
+	lastDaemonRestart time.Time // cooldown: minimum 30s between restart attempts
 	daemonClient      *dclient.Client
 	restartedClient   *dclient.Client // set after daemon restart
 
 	// Tick control
 	tickDone            chan struct{}
-	tickCallbackPending atomic.Bool   // debounce: skip enqueue if prior callback hasn't run
-	startGen            atomic.Uint64 // double-bumped by startSession (before+after Start RPC); tick captures before its RPC and skips reconciliation on mismatch
+	tickCallbackPending atomic.Bool          // debounce: skip enqueue if prior callback hasn't run
+	startGen            atomic.Uint64        // double-bumped by startSession (before+after Start RPC); tick captures before its RPC and skips reconciliation on mismatch
 	recentStarts        map[string]time.Time // task ID → time of last startSession; grace period prevents false reconciliation
 
 	// Worktree root for orphan sweep (default: ~/.argus/worktrees/).
@@ -211,7 +216,7 @@ func New(database *db.DB, runner agent.SessionProvider, daemonConnected bool, da
 	app.todos = NewToDosView()
 	app.todos.SetApp(app.tapp)
 	cfg := database.Config()
-	SetActiveSpinner(cfg.UI.SpinnerStyle)
+	widget.SetActiveSpinner(cfg.UI.SpinnerStyle)
 	vaultPath := cfg.KB.ArgusVaultPath
 	if vaultPath == "" {
 		vaultPath = config.DefaultArgusVaultPath()
@@ -237,10 +242,10 @@ func New(database *db.DB, runner agent.SessionProvider, daemonConnected bool, da
 
 // buildUI constructs the tview widget tree.
 func (a *App) buildUI() {
-	a.header = NewHeader()
-	a.statusbar = NewStatusBar()
+	a.header = widget.NewHeader()
+	a.statusbar = widget.NewStatusBar()
 
-	a.tasklist = NewTaskListView()
+	a.tasklist = taskview.NewTaskListView()
 	a.tasklist.OnSelect = func(task *model.Task) { a.onTaskSelect(task, true) }
 	a.tasklist.OnNew = a.onNewTask
 	a.tasklist.OnCursorChange = a.onTaskCursorChange
@@ -283,14 +288,14 @@ func (a *App) buildUI() {
 		}()
 	}
 
-	a.taskGitPanel = NewGitPanel()
+	a.taskGitPanel = gitpanel.NewGitPanel()
 	a.taskPreview = NewTaskPreviewPanel()
-	a.taskDetail = NewTaskDetailPanel()
+	a.taskDetail = taskview.NewTaskDetailPanel()
 
-	a.gitPanel = NewGitPanel()
-	a.filePanel = NewFilePanel()
-	a.agentPane = NewTerminalPane()
-	a.agentHeader = NewAgentHeader()
+	a.gitPanel = gitpanel.NewGitPanel()
+	a.filePanel = gitpanel.NewFilePanel()
+	a.agentPane = terminal.NewTerminalPane()
+	a.agentHeader = widget.NewAgentHeader()
 
 	// Wire mouse click callbacks so clicking a panel switches agentFocus.
 	a.filePanel.OnClick = func() {
@@ -319,7 +324,7 @@ func (a *App) buildUI() {
 		AddItem(a.tasklist, 0, 1, true).
 		AddItem(taskCenter, 0, 3, false).
 		AddItem(a.taskDetail, 0, 1, false)
-	a.taskPage = NewTaskPage(taskFlex, a.tasklist)
+	a.taskPage = taskview.NewTaskPage(taskFlex, a.tasklist)
 
 	// Agent page — header + three-panel layout
 	agentPanels := tview.NewFlex().SetDirection(tview.FlexColumn).
@@ -547,7 +552,7 @@ func (a *App) onTick() {
 		}
 
 		// Reviews tab: check diff/comment staleness.
-		if a.header.ActiveTab() == TabReviews && a.reviews.SelectedPR() != nil {
+		if a.header.ActiveTab() == widget.TabReviews && a.reviews.SelectedPR() != nil {
 			if a.reviews.IsDiffStale() && !a.reviews.DiffFetching() {
 				a.reviews.fetchDiffAndComments(a)
 			} else if a.reviews.AreCommentsStale() && !a.reviews.CommentsFetching() {
@@ -1110,45 +1115,45 @@ func (a *App) handleGlobalKey(event *tcell.EventKey) *tcell.EventKey {
 			return nil
 		}
 	case tcell.KeyCtrlD:
-		if a.mode == modeTaskList && a.header.ActiveTab() == TabTasks {
+		if a.mode == modeTaskList && a.header.ActiveTab() == widget.TabTasks {
 			if t := a.tasklist.SelectedTask(); t != nil {
 				a.openConfirmDelete(t)
 				return nil
 			}
 		}
-		if a.mode == modeTaskList && a.header.ActiveTab() == TabToDos {
+		if a.mode == modeTaskList && a.header.ActiveTab() == widget.TabToDos {
 			if item := a.todos.SelectedItem(); item != nil {
 				a.openConfirmDeleteToDo(*item)
 				return nil
 			}
 		}
 	case tcell.KeyCtrlP:
-		if a.mode == modeTaskList && a.header.ActiveTab() == TabTasks {
+		if a.mode == modeTaskList && a.header.ActiveTab() == widget.TabTasks {
 			if t := a.tasklist.SelectedTask(); t != nil && t.PRURL != "" && a.tasklist.OnOpenPR != nil {
 				a.tasklist.OnOpenPR(t)
 				return nil
 			}
 		}
 	case tcell.KeyCtrlF:
-		if a.mode == modeTaskList && a.header.ActiveTab() == TabTasks {
+		if a.mode == modeTaskList && a.header.ActiveTab() == widget.TabTasks {
 			if t := a.tasklist.SelectedTask(); t != nil && t.Worktree != "" {
 				a.openForkModal(t)
 				return nil
 			}
 		}
 	case tcell.KeyCtrlR:
-		if a.mode == modeTaskList && a.header.ActiveTab() == TabTasks {
+		if a.mode == modeTaskList && a.header.ActiveTab() == widget.TabTasks {
 			a.pruneCompletedTasks()
 			return nil
 		}
-		if a.mode == modeTaskList && a.header.ActiveTab() == TabToDos {
+		if a.mode == modeTaskList && a.header.ActiveTab() == widget.TabToDos {
 			a.cleanupCompletedToDos()
 			return nil
 		}
 	case tcell.KeyLeft:
 		if a.mode != modeAgent {
 			cur := a.header.ActiveTab()
-			if cur > TabTasks {
+			if cur > widget.TabTasks {
 				a.switchTab(cur - 1)
 			}
 			return nil
@@ -1156,7 +1161,7 @@ func (a *App) handleGlobalKey(event *tcell.EventKey) *tcell.EventKey {
 	case tcell.KeyRight:
 		if a.mode != modeAgent {
 			cur := a.header.ActiveTab()
-			if cur < TabSettings {
+			if cur < widget.TabSettings {
 				a.switchTab(cur + 1)
 			}
 			return nil
@@ -1178,22 +1183,22 @@ func (a *App) handleGlobalKey(event *tcell.EventKey) *tcell.EventKey {
 			}
 		case '1':
 			if a.mode != modeAgent {
-				a.switchTab(TabTasks)
+				a.switchTab(widget.TabTasks)
 				return nil
 			}
 		case '2':
 			if a.mode != modeAgent {
-				a.switchTab(TabToDos)
+				a.switchTab(widget.TabToDos)
 				return nil
 			}
 		case '3':
 			if a.mode != modeAgent {
-				a.switchTab(TabReviews)
+				a.switchTab(widget.TabReviews)
 				return nil
 			}
 		case '4':
 			if a.mode != modeAgent {
-				a.switchTab(TabSettings)
+				a.switchTab(widget.TabSettings)
 				return nil
 			}
 		}
@@ -1205,21 +1210,21 @@ func (a *App) handleGlobalKey(event *tcell.EventKey) *tcell.EventKey {
 	}
 
 	// To Dos tab key routing.
-	if a.header.ActiveTab() == TabToDos {
+	if a.header.ActiveTab() == widget.TabToDos {
 		if a.todos.HandleKey(event) {
 			return nil
 		}
 	}
 
 	// Reviews tab key routing.
-	if a.header.ActiveTab() == TabReviews {
+	if a.header.ActiveTab() == widget.TabReviews {
 		if a.reviews.HandleKey(event, a) {
 			return nil
 		}
 	}
 
 	// Settings tab key routing.
-	if a.header.ActiveTab() == TabSettings {
+	if a.header.ActiveTab() == widget.TabSettings {
 		if a.settings.HandleKey(event) {
 			return nil
 		}
@@ -1663,12 +1668,12 @@ func tcellKeyToBytes(ev *tcell.EventKey) []byte {
 }
 
 // switchTab changes the active top-level tab.
-func (a *App) switchTab(t Tab) {
+func (a *App) switchTab(t widget.Tab) {
 	a.header.SetTab(t)
 	a.statusbar.SetTab(t)
 
 	switch t {
-	case TabTasks:
+	case widget.TabTasks:
 		if a.mode == modeAgent {
 			// exitAgentView is a complete "return to tasks" primitive:
 			// resets mode, tab state, page, and focus. No extra work needed.
@@ -1678,11 +1683,11 @@ func (a *App) switchTab(t Tab) {
 		a.mode = modeTaskList
 		a.pages.SwitchToPage("tasks")
 		a.tapp.SetFocus(a.tasklist)
-	case TabToDos:
+	case widget.TabToDos:
 		a.mode = modeTaskList
 		a.todos.RefreshAsync(a.tapp)
 		a.pages.SwitchToPage("todos")
-	case TabReviews:
+	case widget.TabReviews:
 		a.mode = modeTaskList // reuse task list mode for non-agent tabs
 		a.pages.SwitchToPage("reviews")
 		a.tapp.SetFocus(a.reviews)
@@ -1690,7 +1695,7 @@ func (a *App) switchTab(t Tab) {
 			a.reviews.StartLoading()
 			a.reviews.fetchPRList(a)
 		}
-	case TabSettings:
+	case widget.TabSettings:
 		a.mode = modeTaskList
 		a.settings.Refresh()
 		a.pages.SwitchToPage("settings")
@@ -2127,7 +2132,7 @@ func (a *App) startSession(task *model.Task) {
 	task.SetStatus(model.StatusInProgress)
 	task.AgentPID = sess.PID()
 	a.recentStarts[task.ID] = time.Now() // grace period: protect from false reconciliation
-	a.db.Update(task) //nolint:errcheck
+	a.db.Update(task)                    //nolint:errcheck
 
 	// Attach to the terminal pane and start the redraw loop only if the
 	// agent view is active for this task. When startSession is called from
@@ -2344,7 +2349,7 @@ func (a *App) startReviewTask(pr *github.PR) {
 	}
 	if existing != nil {
 		uxlog.Log("[reviews] found existing review task %s for %s", existing.ID, prURL)
-		a.switchTab(TabTasks)
+		a.switchTab(widget.TabTasks)
 		a.refreshTasksLocal()
 		a.tasklist.SelectByID(existing.ID)
 		a.onTaskSelect(existing, true)
@@ -2386,7 +2391,7 @@ func (a *App) startReviewTask(pr *github.PR) {
 			return
 		}
 		uxlog.Log("[reviews] created review task %s (%s) for %s", task.ID, task.Name, prURL)
-		a.switchTab(TabTasks)
+		a.switchTab(widget.TabTasks)
 		a.refreshTasksLocal()
 		a.tasklist.SelectByID(task.ID)
 		a.onTaskSelect(task, true)
@@ -2429,7 +2434,7 @@ func (a *App) startReviewTask(pr *github.PR) {
 			}
 			uxlog.Log("[reviews] created review task %s (%s) for %s", task.ID, task.Name, prURL)
 
-			a.switchTab(TabTasks)
+			a.switchTab(widget.TabTasks)
 			a.refreshTasksLocal()
 			a.tasklist.SelectByID(task.ID)
 			a.onTaskSelect(task, true)
@@ -2671,7 +2676,7 @@ func (a *App) closeFuzzyLinkPickerModal() {
 
 // openConfirmDelete shows the confirm delete modal for the given task.
 func (a *App) openConfirmDelete(t *model.Task) {
-	a.confirmDeleteModal = NewConfirmDeleteModal(t)
+	a.confirmDeleteModal = modal.NewConfirmDeleteModal(t)
 	a.mode = modeConfirmDelete
 	a.pages.AddPage("confirmdelete", a.confirmDeleteModal, true, true)
 	a.pages.SwitchToPage("confirmdelete")
@@ -3102,7 +3107,7 @@ func (a *App) deleteProject(name string) {
 
 // openConfirmDeleteProject shows the confirm delete modal for the given project.
 func (a *App) openConfirmDeleteProject(name string, taskCount int) {
-	a.confirmDeleteProjectModal = NewConfirmDeleteProjectModal(name, taskCount)
+	a.confirmDeleteProjectModal = modal.NewConfirmDeleteProjectModal(name, taskCount)
 	a.mode = modeConfirmDeleteProject
 	a.pages.AddPage("confirmdeleteproject", a.confirmDeleteProjectModal, true, true)
 	a.pages.SwitchToPage("confirmdeleteproject")
@@ -3337,7 +3342,7 @@ func (a *App) navigateAgentTask(direction int) {
 }
 
 // exitAgentView returns to the task list. Always resets the active tab to
-// TabTasks so the global key handler routes navigation keys correctly.
+// widget.TabTasks so the global key handler routes navigation keys correctly.
 func (a *App) exitAgentView() {
 	uxlog.Log("[tui] exiting agent view")
 	a.mu.Lock()
@@ -3351,10 +3356,9 @@ func (a *App) exitAgentView() {
 	a.worktreeDir = ""
 	// Restore the tab header when returning to root views.
 	a.root.ResizeItem(a.header, 1, 0)
-	a.header.SetTab(TabTasks)
-	a.statusbar.SetTab(TabTasks)
+	a.header.SetTab(widget.TabTasks)
+	a.statusbar.SetTab(widget.TabTasks)
 	a.pages.SwitchToPage("tasks")
 	a.tapp.SetFocus(a.tasklist)
 	a.statusbar.ClearError()
 }
-

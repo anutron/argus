@@ -3,6 +3,8 @@ package tui
 import (
 	"fmt"
 
+	"github.com/drn/argus/internal/tui/theme"
+	"github.com/drn/argus/internal/tui/widget"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -26,7 +28,7 @@ func NewConfirmCleanupToDosModal(count int) *ConfirmCleanupToDosModal {
 
 func (m *ConfirmCleanupToDosModal) Confirmed() bool { return m.confirmed }
 func (m *ConfirmCleanupToDosModal) Canceled() bool  { return m.canceled }
-func (m *ConfirmCleanupToDosModal) Count() int       { return m.count }
+func (m *ConfirmCleanupToDosModal) Count() int      { return m.count }
 
 // InputHandler handles key events for the confirm dialog.
 func (m *ConfirmCleanupToDosModal) InputHandler() func(event *tcell.EventKey, setFocus func(p tview.Primitive)) {
@@ -64,15 +66,15 @@ func (m *ConfirmCleanupToDosModal) Draw(screen tcell.Screen) {
 		}
 	}
 
-	drawBorder(screen, formX, formY, formW, formH, StyleFocusedBorder)
-	drawText(screen, formX+2, formY+1, formW-4, "Clean up completed to-dos?", StyleTitle)
+	widget.DrawBorder(screen, formX, formY, formW, formH, theme.StyleFocusedBorder)
+	widget.DrawText(screen, formX+2, formY+1, formW-4, "Clean up completed to-dos?", theme.StyleTitle)
 
 	noun := "note"
 	if m.count != 1 {
 		noun = "notes"
 	}
 	detail := fmt.Sprintf("Delete %d completed %s from vault", m.count, noun)
-	drawText(screen, formX+4, formY+3, formW-6, detail, StyleNormal)
+	widget.DrawText(screen, formX+4, formY+3, formW-6, detail, theme.StyleNormal)
 
-	drawText(screen, formX+4, formY+5, formW-6, "[enter] confirm  [esc] cancel", StyleDimmed)
+	widget.DrawText(screen, formX+4, formY+5, formW-6, "[enter] confirm  [esc] cancel", theme.StyleDimmed)
 }

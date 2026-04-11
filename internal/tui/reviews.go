@@ -12,8 +12,10 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 
-	"github.com/drn/argus/internal/gitutil"
 	"github.com/drn/argus/internal/github"
+	"github.com/drn/argus/internal/gitutil"
+	"github.com/drn/argus/internal/tui/theme"
+	"github.com/drn/argus/internal/tui/widget"
 	"github.com/drn/argus/internal/uxlog"
 )
 
@@ -51,28 +53,27 @@ type ReviewsView struct {
 	fileCursor int
 
 	// Diff state.
-	fullDiff         string
-	diffFetchedAt    time.Time
-	rawDiff          string
-	parsedDiff       *gitutil.ParsedDiff
-	diffRendered     []renderedDiffLine // pre-rendered syntax-highlighted lines
-	diffScrollOff    int
-	splitMode        bool
-	diffFetching     bool
+	fullDiff      string
+	diffFetchedAt time.Time
+	rawDiff       string
+	parsedDiff    *gitutil.ParsedDiff
+	diffRendered  []widget.RenderedDiffLine // pre-rendered syntax-highlighted lines
+	diffScrollOff int
+	diffFetching  bool
 
 	// Comments state.
-	comments         []github.PRComment
+	comments          []github.PRComment
 	commentsFetchedAt time.Time
-	commentCursor    int
-	commentsFetching bool
+	commentCursor     int
+	commentsFetching  bool
 
 	// Comment compose / review action.
-	focus          reviewFocus
-	draftBody      string
-	draftLine      int
-	draftPath      string
+	focus           reviewFocus
+	draftBody       string
+	draftLine       int
+	draftPath       string
 	reviewDraftMode bool
-	submitErr      string
+	submitErr       string
 
 	// Callback to trigger async fetches from the App.
 	onFetch func(fn func())
@@ -221,7 +222,7 @@ func (rv *ReviewsView) cursoredPR() *github.PR {
 	return nil
 }
 
-func (rv *ReviewsView) DiffFetching() bool  { return rv.diffFetching }
+func (rv *ReviewsView) DiffFetching() bool     { return rv.diffFetching }
 func (rv *ReviewsView) CommentsFetching() bool { return rv.commentsFetching }
 
 // --- Internal helpers ---
@@ -235,7 +236,7 @@ func (rv *ReviewsView) applyFileDiff() {
 	if rv.rawDiff != "" {
 		pd := gitutil.ParseUnifiedDiff(rv.rawDiff)
 		rv.parsedDiff = &pd
-		rv.diffRendered = buildUnifiedDiffLines(pd, filePath)
+		rv.diffRendered = widget.BuildUnifiedDiffLines(pd, filePath)
 	} else {
 		rv.parsedDiff = nil
 		rv.diffRendered = nil
@@ -669,26 +670,26 @@ func (rv *ReviewsView) Draw(screen tcell.Screen) {
 // --- Render: PR list ---
 
 func (rv *ReviewsView) renderPRList(screen tcell.Screen, x, y, w, h int) {
-	borderStyle := StyleBorder
+	borderStyle := theme.StyleBorder
 	if rv.focus == rfList {
-		borderStyle = StyleFocusedBorder
+		borderStyle = theme.StyleFocusedBorder
 	}
-	inner := drawBorderedPanel(screen, x, y, w, h, "", borderStyle)
+	inner := widget.DrawBorderedPanel(screen, x, y, w, h, "", borderStyle)
 	if inner.W <= 0 || inner.H <= 0 {
 		return
 	}
 	innerX, innerY, innerW, innerH := inner.X, inner.Y, inner.W, inner.H
 
 	if rv.loading && len(rv.prs) == 0 {
-		drawText(screen, innerX, innerY, innerW, "Loading PRs...", StyleDimmed)
+		widget.DrawText(screen, innerX, innerY, innerW, "Loading PRs...", theme.StyleDimmed)
 		return
 	}
 	if rv.loadErr != "" && len(rv.prs) == 0 {
-		drawText(screen, innerX, innerY, innerW, "Error: "+rv.loadErr, tcell.StyleDefault.Foreground(ColorError))
+		widget.DrawText(screen, innerX, innerY, innerW, "Error: "+rv.loadErr, tcell.StyleDefault.Foreground(theme.ColorError))
 		return
 	}
 	if len(rv.prs) == 0 {
-		drawText(screen, innerX, innerY, innerW, "No open PRs", StyleDimmed)
+		widget.DrawText(screen, innerX, innerY, innerW, "No open PRs", theme.StyleDimmed)
 		return
 	}
 
@@ -709,7 +710,7 @@ func (rv *ReviewsView) renderPRList(screen tcell.Screen, x, y, w, h int) {
 
 		// Section headers.
 		if pr.IsReviewRequest && !drewReviewHeader {
-			drawText(screen, innerX, innerY+row, innerW, "Review Requests", tcell.StyleDefault.Foreground(ColorTitle).Bold(true))
+			widget.DrawText(screen, innerX, innerY+row, innerW, "Review Requests", tcell.StyleDefault.Foreground(theme.ColorTitle).Bold(true))
 			row++
 			drewReviewHeader = true
 		}
@@ -719,7 +720,7 @@ func (rv *ReviewsView) renderPRList(screen tcell.Screen, x, y, w, h int) {
 				row++ // spacer
 			}
 			if row < innerH {
-				drawText(screen, innerX, innerY+row, innerW, "My Open PRs", tcell.StyleDefault.Foreground(ColorTitle).Bold(true))
+				widget.DrawText(screen, innerX, innerY+row, innerW, "My Open PRs", tcell.StyleDefault.Foreground(theme.ColorTitle).Bold(true))
 				row++
 			}
 		}
@@ -731,13 +732,13 @@ func (rv *ReviewsView) renderPRList(screen tcell.Screen, x, y, w, h int) {
 		// PR row.
 		style := tcell.StyleDefault
 		if i == rv.prCursor {
-			style = style.Background(ColorHighlight)
+			style = style.Background(theme.ColorHighlight)
 		}
 
 		badge := rv.reviewBadge(pr)
 		title := truncString(pr.Title, innerW-len(badge)-2)
 		line := fmt.Sprintf("%s %s", badge, title)
-		drawText(screen, innerX, innerY+row, innerW, line, style)
+		widget.DrawText(screen, innerX, innerY+row, innerW, line, style)
 		row++
 
 		// Subtitle row.
@@ -746,7 +747,7 @@ func (rv *ReviewsView) renderPRList(screen tcell.Screen, x, y, w, h int) {
 			if len(sub) > innerW {
 				sub = sub[:innerW]
 			}
-			drawText(screen, innerX, innerY+row, innerW, sub, StyleDimmed)
+			widget.DrawText(screen, innerX, innerY+row, innerW, sub, theme.StyleDimmed)
 			row++
 		}
 	}
@@ -760,10 +761,10 @@ func (rv *ReviewsView) renderFileList(screen tcell.Screen, x, y, w, h int) {
 
 	// Header.
 	header := fmt.Sprintf("#%d %s", pr.Number, truncString(pr.Title, w-8))
-	drawText(screen, x, y, w, header, tcell.StyleDefault.Foreground(ColorTitle).Bold(true))
+	widget.DrawText(screen, x, y, w, header, tcell.StyleDefault.Foreground(theme.ColorTitle).Bold(true))
 
 	if len(rv.files) == 0 {
-		drawText(screen, x, y+2, w, "Loading files...", StyleDimmed)
+		widget.DrawText(screen, x, y+2, w, "Loading files...", theme.StyleDimmed)
 		return
 	}
 
@@ -774,24 +775,24 @@ func (rv *ReviewsView) renderFileList(screen tcell.Screen, x, y, w, h int) {
 		}
 		style := tcell.StyleDefault
 		if i == rv.fileCursor {
-			style = style.Background(ColorHighlight)
+			style = style.Background(theme.ColorHighlight)
 		}
 		name := f
 		if len(name) > w {
 			name = "…" + name[len(name)-w+1:]
 		}
-		drawText(screen, x, y+row, w, name, style)
+		widget.DrawText(screen, x, y+row, w, name, style)
 	}
 }
 
 // --- Render: Diff ---
 
 func (rv *ReviewsView) renderDiff(screen tcell.Screen, x, y, w, h int) {
-	borderStyle := StyleBorder
+	borderStyle := theme.StyleBorder
 	if rv.focus == rfDiff {
-		borderStyle = StyleFocusedBorder
+		borderStyle = theme.StyleFocusedBorder
 	}
-	inner := drawBorderedPanel(screen, x, y, w, h, "", borderStyle)
+	inner := widget.DrawBorderedPanel(screen, x, y, w, h, "", borderStyle)
 	if inner.W <= 0 || inner.H <= 0 {
 		return
 	}
@@ -809,7 +810,7 @@ func (rv *ReviewsView) renderDiff(screen tcell.Screen, x, y, w, h int) {
 		} else if rv.diffFetching {
 			msg = "Loading diff..."
 		}
-		drawText(screen, innerX+(innerW-len(msg))/2, innerY+innerH/2, innerW, msg, StyleDimmed)
+		widget.DrawText(screen, innerX+(innerW-len(msg))/2, innerY+innerH/2, innerW, msg, theme.StyleDimmed)
 		return
 	}
 
@@ -828,31 +829,30 @@ func (rv *ReviewsView) renderDiff(screen tcell.Screen, x, y, w, h int) {
 		if lineIdx >= len(lines) {
 			break
 		}
-		drawStyledLine(screen, innerX, innerY+i, innerW, lines[lineIdx].cells)
+		widget.DrawStyledLine(screen, innerX, innerY+i, innerW, lines[lineIdx].Cells)
 	}
 }
-
 
 func (rv *ReviewsView) renderApproveConfirm(screen tcell.Screen, x, y, w, h int) {
 	midY := y + h/2 - 1
 	title := "Approve this PR?"
-	drawText(screen, x+(w-len(title))/2, midY, w, title, tcell.StyleDefault.Bold(true))
+	widget.DrawText(screen, x+(w-len(title))/2, midY, w, title, tcell.StyleDefault.Bold(true))
 	if rv.selectedPR != nil {
 		prTitle := truncString(rv.selectedPR.Title, w-4)
-		drawText(screen, x+(w-len(prTitle))/2, midY+1, w, prTitle, StyleDimmed)
+		widget.DrawText(screen, x+(w-len(prTitle))/2, midY+1, w, prTitle, theme.StyleDimmed)
 	}
 	hint := "[y] yes  [n] no  [esc] cancel"
-	drawText(screen, x+(w-len(hint))/2, midY+3, w, hint, StyleDimmed)
+	widget.DrawText(screen, x+(w-len(hint))/2, midY+3, w, hint, theme.StyleDimmed)
 }
 
 // --- Render: Comments ---
 
 func (rv *ReviewsView) renderComments(screen tcell.Screen, x, y, w, h int) {
-	borderStyle := StyleBorder
+	borderStyle := theme.StyleBorder
 	if rv.focus == rfComment {
-		borderStyle = StyleFocusedBorder
+		borderStyle = theme.StyleFocusedBorder
 	}
-	inner := drawBorderedPanel(screen, x, y, w, h, "", borderStyle)
+	inner := widget.DrawBorderedPanel(screen, x, y, w, h, "", borderStyle)
 	if inner.W <= 0 || inner.H <= 0 {
 		return
 	}
@@ -865,11 +865,11 @@ func (rv *ReviewsView) renderComments(screen tcell.Screen, x, y, w, h int) {
 	}
 
 	if len(rv.comments) == 0 {
-		drawText(screen, innerX, innerY, innerW, "No comments", StyleDimmed)
+		widget.DrawText(screen, innerX, innerY, innerW, "No comments", theme.StyleDimmed)
 		if rv.selectedPR != nil {
-			drawText(screen, innerX, innerY+2, innerW, "[c] comment", StyleDimmed)
-			drawText(screen, innerX, innerY+3, innerW, "[a] approve", StyleDimmed)
-			drawText(screen, innerX, innerY+4, innerW, "[r] request changes", StyleDimmed)
+			widget.DrawText(screen, innerX, innerY+2, innerW, "[c] comment", theme.StyleDimmed)
+			widget.DrawText(screen, innerX, innerY+3, innerW, "[a] approve", theme.StyleDimmed)
+			widget.DrawText(screen, innerX, innerY+4, innerW, "[r] request changes", theme.StyleDimmed)
 		}
 		return
 	}
@@ -887,7 +887,7 @@ func (rv *ReviewsView) renderComments(screen tcell.Screen, x, y, w, h int) {
 		if len(loc) > innerW {
 			loc = loc[:innerW]
 		}
-		drawText(screen, innerX, innerY+row, innerW, loc, tcell.StyleDefault.Foreground(ColorTitle))
+		widget.DrawText(screen, innerX, innerY+row, innerW, loc, tcell.StyleDefault.Foreground(theme.ColorTitle))
 		row++
 
 		// Body (truncated to 2 lines).
@@ -897,7 +897,7 @@ func (rv *ReviewsView) renderComments(screen tcell.Screen, x, y, w, h int) {
 			if len(text) > innerW {
 				text = text[:innerW]
 			}
-			drawText(screen, innerX, innerY+row, innerW, text, tcell.StyleDefault)
+			widget.DrawText(screen, innerX, innerY+row, innerW, text, tcell.StyleDefault)
 			row++
 		}
 		row++ // spacer
@@ -909,14 +909,14 @@ func (rv *ReviewsView) renderCompose(screen tcell.Screen, x, y, w, h int) {
 	if rv.reviewDraftMode {
 		title = "Request Changes"
 	}
-	drawText(screen, x, y, w, title, tcell.StyleDefault.Foreground(ColorTitle).Bold(true))
+	widget.DrawText(screen, x, y, w, title, tcell.StyleDefault.Foreground(theme.ColorTitle).Bold(true))
 
 	if !rv.reviewDraftMode {
 		loc := fmt.Sprintf("%s:%d", rv.draftPath, rv.draftLine)
 		if len(loc) > w {
 			loc = loc[:w]
 		}
-		drawText(screen, x, y+1, w, loc, StyleDimmed)
+		widget.DrawText(screen, x, y+1, w, loc, theme.StyleDimmed)
 	}
 
 	// Draft body with cursor.
@@ -930,13 +930,13 @@ func (rv *ReviewsView) renderCompose(screen tcell.Screen, x, y, w, h int) {
 		if len(line) > w {
 			line = line[:w]
 		}
-		drawText(screen, x, bodyY+i, w, line, tcell.StyleDefault)
+		widget.DrawText(screen, x, bodyY+i, w, line, tcell.StyleDefault)
 	}
 
 	// Hints.
 	hint := "[ctrl+s] submit  [esc] cancel"
 	if y+h-1 > bodyY {
-		drawText(screen, x, y+h-1, w, hint, StyleDimmed)
+		widget.DrawText(screen, x, y+h-1, w, hint, theme.StyleDimmed)
 	}
 
 	if rv.submitErr != "" {
@@ -944,7 +944,7 @@ func (rv *ReviewsView) renderCompose(screen tcell.Screen, x, y, w, h int) {
 		if len(errMsg) > w {
 			errMsg = errMsg[:w]
 		}
-		drawText(screen, x, y+h-2, w, errMsg, tcell.StyleDefault.Foreground(ColorError))
+		widget.DrawText(screen, x, y+h-2, w, errMsg, tcell.StyleDefault.Foreground(theme.ColorError))
 	}
 }
 
