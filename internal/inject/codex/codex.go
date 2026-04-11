@@ -24,6 +24,7 @@ func InjectGlobal(port int) error {
 
 // injectCodexTOML inserts or updates the [mcp_servers.argus-kb] section.
 // Uses targeted string manipulation to avoid pulling in a TOML library.
+// Assumes standard Codex-generated TOML — no multi-line values, no inline tables.
 func injectCodexTOML(path string, port int) error {
 	url := fmt.Sprintf("http://localhost:%d/mcp", port)
 
@@ -33,7 +34,8 @@ func injectCodexTOML(path string, port int) error {
 		content = string(raw)
 	}
 
-	// Check if already correct.
+	// Check if MCP section already exists.
+	urlCorrect := false
 	if strings.Contains(content, "[mcp_servers.argus-kb]") {
 		// Find the url line in the section and check its value.
 		idx := strings.Index(content, "[mcp_servers.argus-kb]")
@@ -48,25 +50,30 @@ func injectCodexTOML(path string, port int) error {
 		}
 		wantLine := fmt.Sprintf(`url = "%s"`, url)
 		if strings.Contains(sectionBody, wantLine) {
-			return nil // already correct
+			urlCorrect = true
+		} else {
+			// Port changed — remove old section and re-add below.
+			content = removeSection(content, "[mcp_servers.argus-kb]")
 		}
-		// Port changed — remove old section and re-add below.
-		content = removeSection(content, "[mcp_servers.argus-kb]")
 	}
 
-	// Ensure experimental_use_rmcp_client is present.
-	if !strings.Contains(content, "experimental_use_rmcp_client") {
-		if content != "" && !strings.HasSuffix(content, "\n") {
-			content += "\n"
+	// Ensure experimental_use_rmcp_client = true is at the TOML top level.
+	// Must appear before the first [section] header — appending to the end
+	// places it inside the last section (e.g. [notice.model_migrations]),
+	// causing a type error ("expected a string" for boolean true).
+	updated := ensureTopLevel(content, "experimental_use_rmcp_client", "experimental_use_rmcp_client = true")
+
+	if !urlCorrect {
+		// Append the MCP server section.
+		if updated != "" && !strings.HasSuffix(updated, "\n") {
+			updated += "\n"
 		}
-		content += "experimental_use_rmcp_client = true\n"
+		updated += fmt.Sprintf("\n[mcp_servers.argus-kb]\nurl = %q\n", url)
 	}
 
-	// Append the section.
-	if content != "" && !strings.HasSuffix(content, "\n") {
-		content += "\n"
+	if updated == content {
+		return nil // nothing changed
 	}
-	content += fmt.Sprintf("\n[mcp_servers.argus-kb]\nurl = %q\n", url)
 
 	// Atomic write: write to temp file then rename to avoid partial reads.
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".argus-codex-*.tmp")
@@ -75,7 +82,7 @@ func injectCodexTOML(path string, port int) error {
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName) //nolint:errcheck — cleanup on failure
-	if _, err := tmp.WriteString(content); err != nil {
+	if _, err := tmp.WriteString(updated); err != nil {
 		tmp.Close()
 		return fmt.Errorf("inject codex: write temp: %w", err)
 	}
@@ -83,6 +90,51 @@ func injectCodexTOML(path string, port int) error {
 		return fmt.Errorf("inject codex: close temp: %w", err)
 	}
 	return os.Rename(tmpName, path)
+}
+
+// ensureTopLevel ensures a key=value line exists at the TOML top level
+// (before the first [section] header). If the key exists only inside a
+// section, it is removed and re-inserted at the top level.
+func ensureTopLevel(content, key, line string) string {
+	// Determine where the top-level (pre-section) area ends.
+	// Handle files that start directly with a section header (no top-level area).
+	firstSection := strings.Index(content, "\n[")
+	topLevel := content
+	if strings.HasPrefix(content, "[") {
+		topLevel = ""
+		firstSection = 0 // entire content is sections
+	} else if firstSection != -1 {
+		topLevel = content[:firstSection]
+	}
+	if strings.Contains(topLevel, key) {
+		return content // already at top level
+	}
+	// Remove from wrong section if present.
+	content = removeLine(content, key)
+	// Insert at top level (before first section header).
+	if strings.HasPrefix(content, "[") {
+		return line + "\n" + content
+	}
+	firstSection = strings.Index(content, "\n[")
+	if firstSection == -1 {
+		if content != "" && !strings.HasSuffix(content, "\n") {
+			content += "\n"
+		}
+		return content + line + "\n"
+	}
+	return content[:firstSection+1] + line + "\n" + content[firstSection+1:]
+}
+
+// removeLine removes all lines containing substr (substring match) from content.
+func removeLine(content, substr string) string {
+	lines := strings.Split(content, "\n")
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if !strings.Contains(l, substr) {
+			out = append(out, l)
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 // removeSection removes a TOML section header and its key-value lines.
