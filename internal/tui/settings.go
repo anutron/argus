@@ -186,7 +186,11 @@ func (sv *SettingsView) Refresh() {
 	}
 
 	// Projects.
-	projMap, _ := sv.database.Projects()
+	// Show empty on error — settings view degrades gracefully to an empty list.
+	projMap, err := sv.database.Projects()
+	if err != nil {
+		uxlog.Log("[settings] failed to load projects: %v", err)
+	}
 	sv.projects = nil
 	projNames := make([]string, 0, len(projMap))
 	for name := range projMap {
@@ -242,8 +246,11 @@ func (sv *SettingsView) Refresh() {
 	// Review prompt.
 	sv.reviewPrompt = cfg.Defaults.ReviewPrompt
 
-	// Task counts.
-	tasks, _ := sv.database.Tasks()
+	// Task counts — show empty on error (same graceful degradation as projects).
+	tasks, err := sv.database.Tasks()
+	if err != nil {
+		uxlog.Log("[settings] failed to load tasks: %v", err)
+	}
 	sv.setTasks(tasks)
 
 	sv.rebuildRows()

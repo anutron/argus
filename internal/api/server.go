@@ -68,8 +68,10 @@ func (s *Server) ListenAndServe(port int) (int, error) {
 	srv := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		// NOTE: WriteTimeout is intentionally omitted. Setting it would kill
+		// long-lived SSE streams (handleStreamOutput) after the timeout.
+		// Non-streaming handlers all complete well within ReadHeaderTimeout.
 	}
 	s.httpSrv = srv
 	go func() {
