@@ -609,6 +609,108 @@ func TestNewTaskForm_Autocomplete(t *testing.T) {
 	}
 }
 
+func TestNewTaskForm_ACTabAccepts(t *testing.T) {
+	f := NewNewTaskForm(
+		map[string]config.Project{"p": {}}, "p",
+		map[string]config.Backend{"b": {Command: "claude"}}, "b",
+	)
+	f.skills = []skills.SkillItem{
+		{Name: "commit", Description: "Create a commit"},
+	}
+	// Pin focus to prompt so the test is robust to changes in the default
+	// focused field of NewNewTaskForm.
+	f.focused = ntFieldPrompt
+	handler := f.InputHandler()
+
+	for _, r := range "/co" {
+		handler(tcell.NewEventKey(tcell.KeyRune, r, 0), func(p tview.Primitive) {})
+	}
+	if !f.acOpen {
+		t.Fatal("autocomplete should be open after /co")
+	}
+
+	// Tab should accept the skill and NOT advance focus
+	handler(tcell.NewEventKey(tcell.KeyTab, 0, 0), func(p tview.Primitive) {})
+	if f.acOpen {
+		t.Error("tab should close autocomplete")
+	}
+	if got := string(f.prompt); got != "/commit " {
+		t.Errorf("prompt = %q, want %q", got, "/commit ")
+	}
+	if f.focused != ntFieldPrompt {
+		t.Errorf("tab should not change focus when accepting AC: focused = %d, want %d", f.focused, ntFieldPrompt)
+	}
+	if f.Done() {
+		t.Error("tab accept should not submit form")
+	}
+}
+
+func TestNewTaskForm_ACBacktabAccepts(t *testing.T) {
+	f := NewNewTaskForm(
+		map[string]config.Project{"p": {}}, "p",
+		map[string]config.Backend{"b": {Command: "claude"}}, "b",
+	)
+	f.skills = []skills.SkillItem{
+		{Name: "commit", Description: "Create a commit"},
+	}
+	f.focused = ntFieldPrompt
+	handler := f.InputHandler()
+
+	for _, r := range "/co" {
+		handler(tcell.NewEventKey(tcell.KeyRune, r, 0), func(p tview.Primitive) {})
+	}
+	if !f.acOpen {
+		t.Fatal("autocomplete should be open after /co")
+	}
+
+	// Shift-Tab should accept the skill and NOT change focus (mirrors Tab).
+	handler(tcell.NewEventKey(tcell.KeyBacktab, 0, 0), func(p tview.Primitive) {})
+	if f.acOpen {
+		t.Error("backtab should close autocomplete")
+	}
+	if got := string(f.prompt); got != "/commit " {
+		t.Errorf("prompt = %q, want %q", got, "/commit ")
+	}
+	if f.focused != ntFieldPrompt {
+		t.Errorf("backtab should not change focus when accepting AC: focused = %d, want %d", f.focused, ntFieldPrompt)
+	}
+}
+
+func TestNewTaskForm_ACMidPromptTrigger(t *testing.T) {
+	f := NewNewTaskForm(
+		map[string]config.Project{"p": {}}, "p",
+		map[string]config.Backend{"b": {Command: "claude"}}, "b",
+	)
+	f.skills = []skills.SkillItem{
+		{Name: "commit", Description: "Create a commit"},
+		{Name: "review", Description: "Review PR"},
+	}
+	handler := f.InputHandler()
+
+	// Type some text, a space, then trigger a skill
+	for _, r := range "fix bug /co" {
+		handler(tcell.NewEventKey(tcell.KeyRune, r, 0), func(p tview.Primitive) {})
+	}
+	if !f.acOpen {
+		t.Fatal("autocomplete should open when trigger follows non-initial text")
+	}
+	if len(f.acMatches) != 1 || f.acMatches[0].Name != "commit" {
+		t.Errorf("matches = %+v, want [commit]", f.acMatches)
+	}
+
+	// Enter accepts: replaces only the /co token, preserving preceding text
+	handler(tcell.NewEventKey(tcell.KeyEnter, 0, 0), func(p tview.Primitive) {})
+	if got := string(f.prompt); got != "fix bug /commit " {
+		t.Errorf("prompt = %q, want %q", got, "fix bug /commit ")
+	}
+	if f.acOpen {
+		t.Error("AC should close after accept")
+	}
+	if f.Done() {
+		t.Error("accept should not submit form")
+	}
+}
+
 func TestNewTaskForm_ACEscCloses(t *testing.T) {
 	f := NewNewTaskForm(
 		map[string]config.Project{"p": {}}, "p",
