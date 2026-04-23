@@ -82,13 +82,14 @@ type InnerRect struct {
 // bordered panels should use this to guarantee consistent chrome.
 //
 // The interior is blanked with (' ', tcell.StyleDefault) before the border
-// is drawn so that partial redraws (e.g., when the caller's Draw only paints
-// occupied rows and lazyScreen has suppressed the screen-wide Clear) don't
-// leak stale cells from the previous frame. The fill style is hardcoded to
-// tcell.StyleDefault because every current caller wants a transparent
-// interior — if a future bordered panel ever lives on top of a tinted layer
-// (e.g., a modal overlay with a coloured background), this helper will need
-// a fillStyle parameter.
+// is drawn. tview's screen.Clear() already does this screen-wide each
+// frame, so the fill is defense-in-depth: if a future optimization ever
+// bypasses Clear for partial redraws, widgets that only paint their
+// occupied rows would otherwise leak stale cells from the previous frame.
+// The fill style is hardcoded to tcell.StyleDefault because every current
+// caller wants a transparent interior — if a future bordered panel ever
+// lives on top of a tinted layer (e.g., a modal overlay with a coloured
+// background), this helper will need a fillStyle parameter.
 //
 // When w or h is below the 2x2 minimum required for a border, the returned
 // InnerRect is the zero value so callers can short-circuit on
