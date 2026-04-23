@@ -17,7 +17,7 @@ func TestLazyScreen_ClearDelegates(t *testing.T) {
 	ls := &lazyScreen{Screen: sim}
 
 	// Write a character, then Clear — must erase it. lazyScreen is a pure
-	// passthrough; any skip behavior is a regression of the ghosting fix.
+	// passthrough; any skip behavior would re-introduce the ghosting bug.
 	sim.SetContent(0, 0, 'X', nil, tcell.StyleDefault)
 	ls.Clear()
 	str, _, _ := sim.Get(0, 0)

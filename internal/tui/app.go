@@ -166,7 +166,9 @@ type App struct {
 	// Overridden in tests to avoid scanning real worktrees.
 	wtRoot string
 
-	// Screen wrapper for skipping Clear() on PTY-forwarded keystrokes.
+	// Screen wrapper. lazyScreen is a passthrough today (see its doc for
+	// history); the named type is retained so smoke tests can inject a
+	// SimulationScreen through the same indirection production uses.
 	screen *lazyScreen
 }
 
@@ -353,8 +355,9 @@ func (a *App) buildUI() {
 
 // Run starts the application event loop.
 func (a *App) Run() error {
-	// Create a tcell screen wrapped in lazyScreen so that PTY-forwarded
-	// keystrokes can skip Clear() and avoid a full terminal repaint.
+	// Wrap the tcell screen in lazyScreen. The wrapper is a passthrough
+	// today; keeping the indirection lets smoke tests inject a
+	// SimulationScreen through the same path production uses.
 	rawScreen, err := tcell.NewScreen()
 	if err != nil {
 		return err
