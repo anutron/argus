@@ -166,7 +166,9 @@ type App struct {
 	// Overridden in tests to avoid scanning real worktrees.
 	wtRoot string
 
-	// Screen wrapper for skipping Clear() on PTY-forwarded keystrokes.
+	// Screen wrapper. lazyScreen is a passthrough today (see its doc for
+	// history); the named type is retained so smoke tests can inject a
+	// SimulationScreen through the same indirection production uses.
 	screen *lazyScreen
 }
 
@@ -353,8 +355,9 @@ func (a *App) buildUI() {
 
 // Run starts the application event loop.
 func (a *App) Run() error {
-	// Create a tcell screen wrapped in lazyScreen so that PTY-forwarded
-	// keystrokes can skip Clear() and avoid a full terminal repaint.
+	// Wrap the tcell screen in lazyScreen. The wrapper is a passthrough
+	// today; keeping the indirection lets smoke tests inject a
+	// SimulationScreen through the same path production uses.
 	rawScreen, err := tcell.NewScreen()
 	if err != nil {
 		return err
@@ -1368,20 +1371,10 @@ func (a *App) handleAgentKey(event *tcell.EventKey) *tcell.EventKey {
 			if _, err := sess.WriteInput(b); err != nil {
 				uxlog.Log("[tui] write to PTY failed: %v", err)
 			}
-			// No UI state changed — tell lazyScreen to skip tview's
-			// screen.Clear() on the draw that follows returning nil.
-			// Without this, every keystroke triggers a full terminal
-			// repaint (~10K cells) even though nothing visual changed.
-			if a.screen != nil {
-				a.screen.skipClear = true
-			}
 			// Schedule a fast follow-up redraw to paint the PTY echo.
 			// The immediate tview draw (from returning nil) fires before
 			// the echo arrives (~1-5ms). Without this, the echo waits
 			// up to 200ms for the redraw loop poll — visible as typing lag.
-			// Only trigger the draw if new output actually arrived —
-			// otherwise we'd run Clear() without skipClear, causing the
-			// same full ~10K cell repaint that lazyScreen prevents.
 			tw := sess.TotalWritten()
 			go func() {
 				time.Sleep(16 * time.Millisecond)
