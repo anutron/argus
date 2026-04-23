@@ -22,7 +22,17 @@ const (
 	rowTask rowKind = iota
 	rowProject
 	rowArchiveHeader
+	rowWaitingReviewHeader
 	rowSeparator
+)
+
+// rowSection identifies which section a row belongs to.
+type rowSection int
+
+const (
+	sectionActive rowSection = iota
+	sectionWaitingReview
+	sectionArchive
 )
 
 // taskRow is a flattened display row in the task list.
@@ -44,11 +54,13 @@ type TaskListView struct {
 	idleUnvisited map[string]bool // task IDs idle since user last viewed the agent view
 	animFrame     int             // current spinner frame (time-based, updated in Draw)
 
-	cursor          int
-	offset          int    // scroll offset
-	expanded        string // currently expanded project
-	archiveExpanded bool
-	archiveProject  string // expanded project within archive
+	cursor                int
+	offset                int    // scroll offset
+	expanded              string // currently expanded project
+	archiveExpanded       bool
+	archiveProject        string // expanded project within archive
+	waitingReviewExpanded bool
+	waitingReviewProject  string // expanded project within waiting-for-review
 
 	// Filter state: `/` activates filter input, typing narrows visible tasks.
 	filtering bool   // true while the filter input is focused
@@ -64,6 +76,8 @@ type TaskListView struct {
 	OnStatusChange func(task *model.Task)
 	// Callback when user toggles archive on a task via 'a' key.
 	OnArchive func(task *model.Task)
+	// Callback when user toggles waiting-for-review on a task via 'w' key.
+	OnWaitingReview func(task *model.Task)
 	// Callback when user presses 'p' to open PR URL.
 	OnOpenPR func(task *model.Task)
 	// Callback when user presses 'r' to rename a task.
@@ -88,10 +102,10 @@ func (tl *TaskListView) SetTasks(tasks []*model.Task) {
 	// Remember current cursor target so we can restore after rebuild.
 	hasPrev := tl.cursor >= 0 && tl.cursor < len(tl.rows)
 	var prev taskRow
-	inArchive := false
+	sec := sectionActive
 	if hasPrev {
 		prev = tl.rows[tl.cursor]
-		inArchive = tl.isInArchive(tl.cursor)
+		sec = tl.sectionAt(tl.cursor)
 	}
 
 	tl.tasks = tasks
@@ -99,7 +113,7 @@ func (tl *TaskListView) SetTasks(tasks []*model.Task) {
 
 	// Try to restore cursor to the same task/project.
 	if hasPrev {
-		tl.restoreCursor(prev, inArchive)
+		tl.restoreCursor(prev, sec)
 	}
 	tl.clampCursor()
 }
@@ -190,15 +204,19 @@ func (tl *TaskListView) matchesFilter(t *model.Task) bool {
 func (tl *TaskListView) buildRows() {
 	tl.rows = nil
 
-	// Separate active and archived tasks, applying filter.
-	var active, archived []*model.Task
+	// Separate active, waiting-for-review, and archived tasks, applying filter.
+	// Archive takes precedence if both flags are set.
+	var active, waitingReview, archived []*model.Task
 	for _, t := range tl.tasks {
 		if !tl.matchesFilter(t) {
 			continue
 		}
-		if t.Archived {
+		switch {
+		case t.Archived:
 			archived = append(archived, t)
-		} else {
+		case t.WaitingReview:
+			waitingReview = append(waitingReview, t)
+		default:
 			active = append(active, t)
 		}
 	}
@@ -217,6 +235,26 @@ func (tl *TaskListView) buildRows() {
 		if filterActive || proj == tl.expanded {
 			for _, t := range projectTasks[proj] {
 				tl.rows = append(tl.rows, taskRow{kind: rowTask, task: t, project: proj})
+			}
+		}
+	}
+
+	// Waiting-for-review section (between active and archive). A section's
+	// separator+header pair is only emitted when that section has tasks, so
+	// downward navigation never sees a "separator, next-section-header"
+	// sequence without an intervening section header of its own.
+	if len(waitingReview) > 0 {
+		tl.rows = append(tl.rows, taskRow{kind: rowSeparator})
+		tl.rows = append(tl.rows, taskRow{kind: rowWaitingReviewHeader})
+		if filterActive || tl.waitingReviewExpanded {
+			wrOrder, wrTasks := groupByProject(waitingReview)
+			for _, proj := range wrOrder {
+				tl.rows = append(tl.rows, taskRow{kind: rowProject, project: proj})
+				if filterActive || proj == tl.waitingReviewProject {
+					for _, t := range wrTasks[proj] {
+						tl.rows = append(tl.rows, taskRow{kind: rowTask, task: t, project: proj})
+					}
+				}
 			}
 		}
 	}
@@ -358,9 +396,9 @@ func (tl *TaskListView) moveCursor(dir int) {
 		c = tl.cursor
 	}
 
-	// On the archive header — skip it like a project header.
-	if tl.rows[c].kind == rowArchiveHeader {
-		// Auto-expand archive before skipping, so rows exist below the header.
+	// On a section header (archive or waiting-for-review) — skip it like a project header.
+	if tl.rows[c].kind == rowArchiveHeader || tl.rows[c].kind == rowWaitingReviewHeader {
+		// Auto-expand section before skipping, so rows exist below the header.
 		tl.autoExpand()
 		c = tl.cursor
 		if dir > 0 {
@@ -368,7 +406,7 @@ func (tl *TaskListView) moveCursor(dir int) {
 				tl.cursor++
 				tl.autoExpand()
 				c = tl.cursor
-				// May have landed on a project header within archive — skip that too.
+				// May have landed on a project header within the section — skip that too.
 				if c >= 0 && c < len(tl.rows) && tl.rows[c].kind == rowProject {
 					if c+1 < len(tl.rows) && tl.rows[c+1].kind == rowTask {
 						tl.cursor++
@@ -397,61 +435,32 @@ func (tl *TaskListView) moveCursor(dir int) {
 	}
 }
 
-// skipUpPastHeader moves the cursor up past a header row (project or archive),
-// landing on the last task of the previous expanded project. If it lands on
-// another header (e.g., archive header above a project header), it chains
-// through one additional header. Falls back to prev if no task is reachable.
+// skipUpPastHeader moves the cursor up past header/separator rows (project,
+// archive, waiting-for-review), landing on the last task of the previous
+// expanded project. With three sections the cursor may need to chain through
+// multiple headers when moving out of a lower section through a collapsed one.
+// Falls back to prev if no task is reachable.
 func (tl *TaskListView) skipUpPastHeader(prev int) {
-	tl.cursor--
-	if tl.cursor < 0 {
-		tl.cursor = prev
-		return
-	}
-	tl.autoExpand()
-	c := tl.cursor
-
-	if c >= 0 && c < len(tl.rows) && tl.rows[c].kind == rowProject {
-		tl.landOnLastTask(c, prev)
-		return
-	}
-
-	// Landed on separator — skip it too.
-	if c >= 0 && c < len(tl.rows) && tl.rows[c].kind == rowSeparator {
-		tl.cursor--
-		if tl.cursor < 0 {
-			tl.cursor = prev
-			return
-		}
-		c = tl.cursor
-	}
-
-	// Landed on archive header after skipping a project header — skip it too.
-	if c >= 0 && c < len(tl.rows) && tl.rows[c].kind == rowArchiveHeader {
+	for {
 		tl.cursor--
 		if tl.cursor < 0 {
 			tl.cursor = prev
 			return
 		}
 		tl.autoExpand()
-		c = tl.cursor
-		// May land on separator before archive header.
-		if c >= 0 && c < len(tl.rows) && tl.rows[c].kind == rowSeparator {
-			tl.cursor--
-			if tl.cursor < 0 {
-				tl.cursor = prev
-				return
-			}
-			c = tl.cursor
+		c := tl.cursor
+		if c < 0 || c >= len(tl.rows) {
+			tl.cursor = prev
+			return
 		}
-		if c >= 0 && c < len(tl.rows) && tl.rows[c].kind == rowProject {
+		switch tl.rows[c].kind {
+		case rowTask:
+			return
+		case rowProject:
 			tl.landOnLastTask(c, prev)
 			return
 		}
-	}
-
-	// Couldn't find a task — revert.
-	if c < 0 || c >= len(tl.rows) || tl.rows[c].kind != rowTask {
-		tl.cursor = prev
+		// Separator, archive header, or waiting-for-review header — keep going up.
 	}
 }
 
@@ -476,9 +485,10 @@ func (tl *TaskListView) notifyCursorChange() {
 	}
 }
 
-// autoExpand checks if the cursor moved to a different project and rebuilds
-// the row list with that project expanded. Also auto-expands the archive
-// section when the cursor enters it and auto-collapses when the cursor leaves.
+// autoExpand checks if the cursor moved to a different project or section and
+// rebuilds the row list so exactly one project is expanded in the cursor's
+// section, and exactly the cursor's section is expanded among archive /
+// waiting-for-review.
 func (tl *TaskListView) autoExpand() {
 	if len(tl.rows) == 0 {
 		return
@@ -488,73 +498,107 @@ func (tl *TaskListView) autoExpand() {
 		return
 	}
 	r := tl.rows[c]
+	sec := tl.sectionAt(c)
 
-	// Determine if cursor is in the archive section.
-	inArchive := tl.isInArchive(c)
+	wantArchiveExpanded := sec == sectionArchive
+	wantWaitingReviewExpanded := sec == sectionWaitingReview
 
-	// Auto-expand/collapse archive section based on cursor position.
-	if inArchive && !tl.archiveExpanded {
-		tl.archiveExpanded = true
+	if tl.archiveExpanded != wantArchiveExpanded || tl.waitingReviewExpanded != wantWaitingReviewExpanded {
+		tl.archiveExpanded = wantArchiveExpanded
+		tl.waitingReviewExpanded = wantWaitingReviewExpanded
 		tl.buildRows()
-		// Cursor stays valid — archive rows are appended after current position.
+		tl.restoreCursor(r, sec)
 		c = tl.cursor
-		if c >= 0 && c < len(tl.rows) {
-			r = tl.rows[c]
+		if c < 0 || c >= len(tl.rows) {
+			return
 		}
-	} else if !inArchive && tl.archiveExpanded {
-		tl.archiveExpanded = false
-		tl.buildRows()
-		// Cursor is above archive section — rows above haven't changed.
+		r = tl.rows[c]
+		sec = tl.sectionAt(c)
 	}
 
-	// Archive header and separator — don't change project expansion.
-	if r.kind == rowArchiveHeader || r.kind == rowSeparator {
+	// Section header or separator — don't change project expansion.
+	if r.kind == rowArchiveHeader || r.kind == rowWaitingReviewHeader || r.kind == rowSeparator {
 		return
 	}
 
-	if inArchive {
-		// Expand the project within the archive section.
+	switch sec {
+	case sectionArchive:
 		if r.project != tl.archiveProject {
-			currentRow := tl.rows[c]
 			tl.archiveProject = r.project
 			tl.buildRows()
-			tl.restoreCursor(currentRow, true)
+			tl.restoreCursor(r, sec)
 		}
-	} else {
-		// Expand the project in the active section.
+	case sectionWaitingReview:
+		if r.project != tl.waitingReviewProject {
+			tl.waitingReviewProject = r.project
+			tl.buildRows()
+			tl.restoreCursor(r, sec)
+		}
+	case sectionActive:
 		if r.project != tl.expanded {
-			currentRow := tl.rows[c]
 			tl.expanded = r.project
 			tl.buildRows()
-			tl.restoreCursor(currentRow, false)
+			tl.restoreCursor(r, sec)
 		}
 	}
 }
 
-// isInArchive checks if the row at idx is within the archive section.
-func (tl *TaskListView) isInArchive(idx int) bool {
+// taskSection returns which section a task would appear in, using the same
+// precedence as buildRows (archive wins over waiting-for-review).
+func taskSection(t *model.Task) rowSection {
+	switch {
+	case t.Archived:
+		return sectionArchive
+	case t.WaitingReview:
+		return sectionWaitingReview
+	default:
+		return sectionActive
+	}
+}
+
+// sectionAt returns which section the row at idx belongs to. It scans upward
+// and returns the first section header encountered; rows above the first
+// section header belong to the active section.
+func (tl *TaskListView) sectionAt(idx int) rowSection {
 	for i := idx; i >= 0; i-- {
-		if tl.rows[i].kind == rowArchiveHeader {
-			return true
+		switch tl.rows[i].kind {
+		case rowArchiveHeader:
+			return sectionArchive
+		case rowWaitingReviewHeader:
+			return sectionWaitingReview
 		}
 	}
-	return false
+	return sectionActive
 }
 
 // restoreCursor finds the row matching target in the rebuilt rows slice
-// and positions the cursor there. inArchive restricts the search to the
-// archive section (or main section), preventing a project that exists in both
-// sections from matching the wrong header.
-func (tl *TaskListView) restoreCursor(target taskRow, inArchive bool) {
+// and positions the cursor there. sec restricts the search to a single
+// section, preventing a project that exists in multiple sections from
+// matching the wrong one.
+func (tl *TaskListView) restoreCursor(target taskRow, sec rowSection) {
 	for i, r := range tl.rows {
-		if r.kind == target.kind && r.project == target.project {
-			if tl.isInArchive(i) != inArchive {
-				continue
-			}
-			if r.kind == rowProject || (r.task != nil && target.task != nil && r.task.ID == target.task.ID) {
+		if r.kind != target.kind {
+			continue
+		}
+		if tl.sectionAt(i) != sec {
+			continue
+		}
+		switch r.kind {
+		case rowTask:
+			if target.task != nil && r.task != nil && r.task.ID == target.task.ID {
 				tl.cursor = i
 				return
 			}
+		case rowProject:
+			if r.project == target.project {
+				tl.cursor = i
+				return
+			}
+		case rowArchiveHeader, rowWaitingReviewHeader, rowSeparator:
+			// Headers and section separators are unique within a section —
+			// take the first match in the desired section.
+			tl.cursor = i
+			return
 		}
 	}
 	tl.clampCursor()
@@ -691,8 +735,21 @@ func (tl *TaskListView) InputHandler() func(event *tcell.EventKey, setFocus func
 			case 'a':
 				if t := tl.SelectedTask(); t != nil {
 					t.Archived = !t.Archived
+					if t.Archived {
+						t.WaitingReview = false
+					}
 					if tl.OnArchive != nil {
 						tl.OnArchive(t)
+					}
+				}
+			case 'w':
+				if t := tl.SelectedTask(); t != nil {
+					t.WaitingReview = !t.WaitingReview
+					if t.WaitingReview {
+						t.Archived = false
+					}
+					if tl.OnWaitingReview != nil {
+						tl.OnWaitingReview(t)
 					}
 				}
 			case 'p':
@@ -793,11 +850,13 @@ func (tl *TaskListView) Draw(screen tcell.Screen) {
 
 		switch row.kind {
 		case rowProject:
-			tl.drawProjectRow(screen, inner.X, inner.Y+i, inner.W, row.project)
+			tl.drawProjectRow(screen, inner.X, inner.Y+i, inner.W, row.project, tl.sectionAt(idx))
 		case rowSeparator:
 			tl.drawSeparator(screen, inner.X, inner.Y+i, inner.W)
 		case rowArchiveHeader:
 			tl.drawArchiveHeader(screen, inner.X, inner.Y+i, inner.W)
+		case rowWaitingReviewHeader:
+			tl.drawWaitingReviewHeader(screen, inner.X, inner.Y+i, inner.W)
 		case rowTask:
 			tl.drawTaskRow(screen, inner.X, inner.Y+i, inner.W, row.task, isCursor)
 		}
@@ -860,10 +919,15 @@ func (tl *TaskListView) projectStatusIcon(tasks []*model.Task) (rune, tcell.Styl
 	}
 }
 
-func (tl *TaskListView) drawProjectRow(screen tcell.Screen, x, y, w int, proj string) {
-	// Find tasks for this project to compute the aggregated status icon.
+func (tl *TaskListView) drawProjectRow(screen tcell.Screen, x, y, w int, proj string, sec rowSection) {
+	// Find tasks for this project within the row's section. Aggregating across
+	// all sections would leak status (and expansion state) from a same-named
+	// project in a different section into this header.
 	var projTasks []*model.Task
 	for _, t := range tl.tasks {
+		if taskSection(t) != sec {
+			continue
+		}
 		p := t.Project
 		if p == "" {
 			p = "(no project)"
@@ -885,10 +949,21 @@ func (tl *TaskListView) drawProjectRow(screen tcell.Screen, x, y, w int, proj st
 		col += 2
 	}
 
-	// Chevron
+	// Chevron — match only the expansion that corresponds to the row's section.
 	chevron := '▸'
-	if proj == tl.expanded || proj == tl.archiveProject {
-		chevron = '▾'
+	switch sec {
+	case sectionActive:
+		if proj == tl.expanded {
+			chevron = '▾'
+		}
+	case sectionWaitingReview:
+		if proj == tl.waitingReviewProject {
+			chevron = '▾'
+		}
+	case sectionArchive:
+		if proj == tl.archiveProject {
+			chevron = '▾'
+		}
 	}
 	screen.SetContent(col, y, chevron, nil, tcell.StyleDefault.Foreground(theme.ColorDimmed))
 	col += 2
@@ -919,6 +994,16 @@ func (tl *TaskListView) drawArchiveHeader(screen tcell.Screen, x, y, w int) {
 		indicator = "▾"
 	}
 	text := fmt.Sprintf("  %s Archive", indicator)
+	widget.DrawText(screen, x, y, w, text, style)
+}
+
+func (tl *TaskListView) drawWaitingReviewHeader(screen tcell.Screen, x, y, w int) {
+	style := tcell.StyleDefault.Foreground(theme.ColorInReview).Bold(true)
+	indicator := "▸"
+	if tl.waitingReviewExpanded {
+		indicator = "▾"
+	}
+	text := fmt.Sprintf("  %s Waiting for Review", indicator)
 	widget.DrawText(screen, x, y, w, text, style)
 }
 
@@ -1039,10 +1124,14 @@ func (tl *TaskListView) SelectByID(id string) {
 	// Find the task to get its project, then expand it so the row exists.
 	for _, t := range tl.tasks {
 		if t.ID == id {
-			if t.Archived {
+			switch {
+			case t.Archived:
 				tl.archiveExpanded = true
 				tl.archiveProject = t.Project
-			} else {
+			case t.WaitingReview:
+				tl.waitingReviewExpanded = true
+				tl.waitingReviewProject = t.Project
+			default:
 				tl.expanded = t.Project
 			}
 			tl.buildRows()
