@@ -1101,6 +1101,15 @@ func (a *App) handleGlobalKey(event *tcell.EventKey) *tcell.EventKey {
 		}
 		a.tapp.Stop()
 		return nil
+	case tcell.KeyCtrlL:
+		// Manual refresh — force a full screen re-emit to wipe ghost
+		// cells that the diff-based Show() failed to overwrite. Only
+		// active outside agent view; in agent mode we fall through so
+		// handleAgentKey's Ctrl+L → link-picker binding runs instead.
+		if a.mode != modeAgent {
+			a.forceRedraw("ctrl+l")
+			return nil
+		}
 	case tcell.KeyCtrlQ:
 		if a.mode == modeAgent {
 			// 3-level exit: diff → files panel → agent view
@@ -1670,7 +1679,8 @@ func (a *App) switchTab(t widget.Tab) {
 	case widget.TabTasks:
 		if a.mode == modeAgent {
 			// exitAgentView is a complete "return to tasks" primitive:
-			// resets mode, tab state, page, and focus. No extra work needed.
+			// resets mode, tab state, page, focus, and forces a redraw.
+			// Early return avoids a second forceRedraw call below.
 			a.exitAgentView()
 			return
 		}
@@ -1695,6 +1705,18 @@ func (a *App) switchTab(t widget.Tab) {
 		a.pages.SwitchToPage("settings")
 		a.tapp.SetFocus(a.settingsPage)
 	}
+	a.forceRedraw("tab switch")
+}
+
+// forceRedraw queues a tcell Sync on tview's update channel; it fires on the
+// next event cycle after any in-flight Draw completes. Use at layout-changing
+// transitions (tab switch, agent view enter/exit) where the diff-based
+// `Show()` has been observed to leak stale cells from the previous layout.
+// `Sync()` invalidates tcell's dirty-cell tracking so every cell is re-emitted,
+// which overwrites ghost content that `Show` considered up-to-date.
+func (a *App) forceRedraw(reason string) {
+	uxlog.Log("[tui] force redraw: %s", reason)
+	a.tapp.Sync()
 }
 
 // onTaskCursorChange updates the preview, git status, and detail panels when the task list cursor moves.
@@ -1846,6 +1868,7 @@ func (a *App) enterPendingAgentView(task *model.Task) {
 	a.root.ResizeItem(a.header, 0, 0)
 	a.pages.SwitchToPage("agent")
 	a.tapp.SetFocus(a.agentPane)
+	a.forceRedraw("enter agent view (launch)")
 }
 
 // onTaskSelect handles Enter on a task — enters the agent view.
@@ -1888,6 +1911,7 @@ func (a *App) onTaskSelect(task *model.Task, autoStart bool) {
 	a.root.ResizeItem(a.header, 0, 0)
 	a.pages.SwitchToPage("agent")
 	a.tapp.SetFocus(a.agentPane)
+	a.forceRedraw("enter agent view")
 
 	// Kick off initial git status
 	if a.worktreeDir != "" {
@@ -3336,4 +3360,5 @@ func (a *App) exitAgentView() {
 	a.pages.SwitchToPage("tasks")
 	a.tapp.SetFocus(a.tasklist)
 	a.statusbar.ClearError()
+	a.forceRedraw("exit agent view")
 }

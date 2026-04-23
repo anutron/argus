@@ -122,6 +122,7 @@ argus
 | `ctrl+r` | Prune completed tasks |
 | `j` / `k` | Navigate up/down |
 | `1` / `2` / `3` / `4` | Switch tabs (Tasks / To Dos / Reviews / Settings) |
+| `ctrl+l` | Refresh screen (wipe ghost cells; works in every non-agent tab) |
 | `q` | Quit |
 
 #### Agent View
