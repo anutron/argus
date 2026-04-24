@@ -1916,6 +1916,10 @@ func (a *App) onTaskSelect(task *model.Task, autoStart bool) {
 	a.root.ResizeItem(a.header, 0, 0)
 	a.pages.SwitchToPage("agent")
 	a.tapp.SetFocus(a.agentPane)
+	// Reconcile PTY size on entry so a session whose PTY is stuck at a stale
+	// width (dropped SIGWINCH, started in a smaller window, etc.) gets resized
+	// to the current panel dimensions on the next Draw.
+	a.agentPane.ForceResyncPTY()
 	a.forceRedraw("enter agent view")
 
 	// Kick off initial git status
@@ -2165,6 +2169,11 @@ func (a *App) startSession(task *model.Task) {
 	// pane isn't visible — onTaskSelect will attach when the user returns.
 	if a.mode == modeAgent && a.agentState.TaskID == task.ID {
 		a.agentPane.SetSession(sess)
+		// Force a PTY resize repost on the next Draw. Covers the auto-start
+		// path (pending view → session starts while user is watching) where
+		// onTaskSelect isn't called and the PTY could otherwise be stuck at
+		// its launch size.
+		a.agentPane.ForceResyncPTY()
 		a.startAgentRedrawLoop(task.ID, sess)
 	}
 }
