@@ -8,9 +8,17 @@ import (
 	"path/filepath"
 )
 
-// InjectGlobal reads ~/.claude.json, adds/updates the argus-kb MCP server entry,
+// mcpServerName is the key used for Argus in Claude Code's mcpServers map.
+// Previously "argus-kb"; renamed to "argus" now that the server exposes both
+// KB and task tools. The legacy key is cleaned up on inject.
+const mcpServerName = "argus"
+
+// legacyMcpServerName is the old pre-rename key, removed on the next inject.
+const legacyMcpServerName = "argus-kb"
+
+// InjectGlobal reads ~/.claude.json, adds/updates the argus MCP server entry,
 // and writes the file back. Idempotent — only writes if the entry is absent or
-// the port has changed.
+// the port has changed. Also removes the legacy "argus-kb" entry if present.
 func InjectGlobal(port int) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -20,8 +28,9 @@ func InjectGlobal(port int) error {
 	return injectClaudeJSON(path, port)
 }
 
-// injectClaudeJSON mutates only the mcpServers.argus-kb key in the given JSON file.
-// All other keys are preserved verbatim.
+// injectClaudeJSON mutates only the mcpServers.argus key in the given JSON
+// file, and removes the legacy mcpServers.argus-kb key if present. All other
+// keys are preserved verbatim.
 func injectClaudeJSON(path string, port int) error {
 	var data map[string]interface{}
 
@@ -43,20 +52,25 @@ func injectClaudeJSON(path string, port int) error {
 
 	url := fmt.Sprintf("http://localhost:%d/mcp", port)
 
-	// Check if already correct.
-	if existing, ok := mcpServers["argus-kb"].(map[string]interface{}); ok {
+	_, hasLegacy := mcpServers[legacyMcpServerName]
+
+	// Check if already correct (and no legacy cleanup pending).
+	if existing, ok := mcpServers[mcpServerName].(map[string]interface{}); ok && !hasLegacy {
 		if existing["url"] == url && existing["type"] == "http" {
 			return nil // already correct
 		}
 	}
 
-	mcpServers["argus-kb"] = map[string]interface{}{"type": "http", "url": url}
+	mcpServers[mcpServerName] = map[string]interface{}{"type": "http", "url": url}
+	delete(mcpServers, legacyMcpServerName)
 	data["mcpServers"] = mcpServers
 
 	return writeJSON(path, data)
 }
 
 // writeJSON marshals data as indented JSON and writes it to path atomically.
+// Uses os.CreateTemp for a unique tempfile name so concurrent writers do not
+// clobber each other before the rename.
 func writeJSON(path string, data map[string]interface{}) error {
 	out, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
@@ -64,13 +78,23 @@ func writeJSON(path string, data map[string]interface{}) error {
 	}
 	out = append(out, '\n')
 
-	// Atomic write via temp file.
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0644); err != nil {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".argus-inject-*.tmp")
+	if err != nil {
+		return fmt.Errorf("inject: create temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(out); err != nil {
+		tmp.Close() //nolint:errcheck
+		os.Remove(tmpName) //nolint:errcheck
 		return fmt.Errorf("inject: write temp: %w", err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp) //nolint:errcheck
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName) //nolint:errcheck
+		return fmt.Errorf("inject: close temp: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName) //nolint:errcheck
 		return fmt.Errorf("inject: rename: %w", err)
 	}
 	return nil
