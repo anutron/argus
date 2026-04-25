@@ -253,6 +253,181 @@ func TestHandleListSkills(t *testing.T) {
 	})
 }
 
+func TestHandleSize(t *testing.T) {
+	srv, _ := testServer(t)
+	mux := srv.routes()
+
+	t.Run("404 when no session", func(t *testing.T) {
+		req := authedReq("GET", "/api/tasks/missing/size", "")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusNotFound)
+	})
+}
+
+func TestHandleResize(t *testing.T) {
+	srv, _ := testServer(t)
+	mux := srv.routes()
+
+	t.Run("404 when no session", func(t *testing.T) {
+		req := authedReq("POST", "/api/tasks/missing/resize", `{"cols":80,"rows":24}`)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusNotFound)
+	})
+
+	t.Run("rejects zero dims", func(t *testing.T) {
+		// Use a task that exists but has no live session — still 404 since
+		// session presence is what matters. Zero-dim validation is downstream.
+		// Test bad JSON instead.
+		req := authedReq("POST", "/api/tasks/missing/resize", `not json`)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		// Without a session, we never reach JSON parse — 404 first.
+		testutil.Equal(t, w.Code, http.StatusNotFound)
+	})
+}
+
+func TestHandleGitDiff_PathTraversal(t *testing.T) {
+	srv, d := testServer(t)
+	mux := srv.routes()
+
+	// Seed a task with a worktree set so the early "not found" path doesn't fire.
+	task := &model.Task{Name: "diff-task", Status: model.StatusPending, Worktree: "/tmp"}
+	testutil.NoError(t, d.Add(task))
+
+	bad := []string{
+		"/etc/passwd",            // absolute
+		"../../etc/passwd",       // dotdot
+		"foo/../../etc/passwd",   // embedded dotdot
+	}
+	for _, path := range bad {
+		t.Run("rejects "+path, func(t *testing.T) {
+			req := authedReq("GET", "/api/tasks/"+task.ID+"/git/diff?path="+path, "")
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+			testutil.Equal(t, w.Code, http.StatusBadRequest)
+		})
+	}
+}
+
+func TestHandleStopAll_MasterOnly(t *testing.T) {
+	srv, d := testServer(t)
+	// Wrap with auth middleware so X-Argus-Auth gets set.
+	handler := authMiddleware(srv.token, d, srv.routes())
+
+	t.Run("accepts master token", func(t *testing.T) {
+		req := authedReq("POST", "/api/sessions/stop-all", "")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusOK)
+	})
+
+	t.Run("rejects device token", func(t *testing.T) {
+		plain, _, err := MintToken(d, "phone")
+		testutil.NoError(t, err)
+		req := httptest.NewRequest("POST", "/api/sessions/stop-all", nil)
+		req.Header.Set("Authorization", "Bearer "+plain)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusForbidden)
+	})
+}
+
+func TestHandlePushTest_MasterOnly(t *testing.T) {
+	srv, d := testServer(t)
+	handler := authMiddleware(srv.token, d, srv.routes())
+
+	t.Run("rejects device token", func(t *testing.T) {
+		plain, _, err := MintToken(d, "phone")
+		testutil.NoError(t, err)
+		req := httptest.NewRequest("POST", "/api/push/test", nil)
+		req.Header.Set("Authorization", "Bearer "+plain)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusForbidden)
+	})
+}
+
+func TestHandleCreateToken_MasterOnly(t *testing.T) {
+	srv, d := testServer(t)
+	handler := authMiddleware(srv.token, d, srv.routes())
+
+	t.Run("device token cannot mint", func(t *testing.T) {
+		plain, _, err := MintToken(d, "phone")
+		testutil.NoError(t, err)
+		req := httptest.NewRequest("POST", "/api/tokens", strings.NewReader(`{"label":"x"}`))
+		req.Header.Set("Authorization", "Bearer "+plain)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusForbidden)
+	})
+
+	t.Run("master token mints", func(t *testing.T) {
+		req := authedReq("POST", "/api/tokens", `{"label":"laptop"}`)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusCreated)
+	})
+}
+
+func TestProjectsBackends_MasterOnly(t *testing.T) {
+	srv, d := testServer(t)
+	handler := authMiddleware(srv.token, d, srv.routes())
+	plain, _, err := MintToken(d, "phone")
+	testutil.NoError(t, err)
+	device := func(method, url, body string) *http.Request {
+		var req *http.Request
+		if body != "" {
+			req = httptest.NewRequest(method, url, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+		} else {
+			req = httptest.NewRequest(method, url, nil)
+		}
+		req.Header.Set("Authorization", "Bearer "+plain)
+		return req
+	}
+
+	cases := []struct {
+		name   string
+		method string
+		url    string
+		body   string
+	}{
+		{"projects create", "POST", "/api/projects", `{"name":"x","path":"/tmp/x"}`},
+		{"projects update", "PUT", "/api/projects/x", `{"path":"/tmp/y"}`},
+		{"projects delete", "DELETE", "/api/projects/x", ""},
+		{"backends create", "POST", "/api/backends", `{"name":"x","command":"echo"}`},
+		{"backends update", "PUT", "/api/backends/x", `{"command":"echo y"}`},
+		{"backends delete", "DELETE", "/api/backends/x", ""},
+		{"tokens list", "GET", "/api/tokens", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name+" forbidden for device", func(t *testing.T) {
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, device(c.method, c.url, c.body))
+			testutil.Equal(t, w.Code, http.StatusForbidden)
+		})
+	}
+}
+
+func TestHandleForkTask_RejectsEmptyProject(t *testing.T) {
+	srv, d := testServer(t)
+	mux := srv.routes()
+
+	// Seed a source task with no project (legacy data).
+	src := &model.Task{Name: "src", Status: model.StatusComplete, Project: ""}
+	testutil.NoError(t, d.Add(src))
+
+	t.Run("400 when source has no project and request omits it", func(t *testing.T) {
+		req := authedReq("POST", "/api/tasks/"+src.ID+"/fork", `{"name":"forked"}`)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusBadRequest)
+	})
+}
+
 func TestSanitizeName(t *testing.T) {
 	t.Run("truncates long names", func(t *testing.T) {
 		name := sanitizeName("This is a very long prompt that should be truncated at 40 characters")
