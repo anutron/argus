@@ -15,6 +15,7 @@ make test                   # go test -race -count=1 ./...
 make test-pkg PKG=./internal/db/  # single package, verbose
 make test-cover             # coverage profile + summary
 make test-watch             # gotestsum --watch (install: go install gotest.tools/gotestsum@latest)
+make lint-pr                # golangci-lint --new-from-rev=origin/master (matches CI; run before pushing)
 go build -o argus ./cmd/argus/    # build binary
 ```
 
