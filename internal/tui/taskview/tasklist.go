@@ -2,6 +2,8 @@ package taskview
 
 import (
 	"fmt"
+	"hash/fnv"
+	"io"
 	"sort"
 	"strings"
 	"time"
@@ -15,8 +17,10 @@ import (
 	"github.com/rivo/tview"
 )
 
-// rowKind identifies what kind of row is displayed.
-type rowKind int
+// rowKind identifies what kind of row is displayed. Underlying type is
+// uint8 (not int) so `rowsSignature` can mix it directly into the FNV
+// hash without a gosec G115 overflow check; there are only ~5 values.
+type rowKind uint8
 
 const (
 	rowTask rowKind = iota
@@ -84,6 +88,16 @@ type TaskListView struct {
 	OnRename func(task *model.Task)
 	// Callback when user presses 'c' to copy task prompt.
 	OnCopyPrompt func(task *model.Task)
+	// Callback fired after buildRows when the row composition changes.
+	// Used by App to force a tcell Sync — rows shifting under tview's
+	// diff-based emit is a known source of bleed-through in tmux.
+	OnLayoutChange func()
+
+	// Signature of the last buildRows output. Used to suppress
+	// OnLayoutChange when the rebuild produced the same rows.
+	// Initialized to ^uint64(0) so the very first build always fires,
+	// even on the (astronomically unlikely) chance the first hash is 0.
+	lastRowsSig uint64
 }
 
 // NewTaskListView creates a task list view.
@@ -93,6 +107,7 @@ func NewTaskListView() *TaskListView {
 		running:       make(map[string]bool),
 		idle:          make(map[string]bool),
 		idleUnvisited: make(map[string]bool),
+		lastRowsSig:   ^uint64(0), // sentinel — first build always fires OnLayoutChange
 	}
 	return tl
 }
@@ -275,6 +290,36 @@ func (tl *TaskListView) buildRows() {
 			}
 		}
 	}
+
+	// Notify on row composition change so the App can force a tcell Sync.
+	// Rows shifting under tview's diff-based emit causes bleed-through in
+	// tmux/Alacritty — see gotchas/ui-threading.md.
+	sig := tl.rowsSignature()
+	if sig != tl.lastRowsSig {
+		tl.lastRowsSig = sig
+		if tl.OnLayoutChange != nil {
+			tl.OnLayoutChange()
+		}
+	}
+}
+
+// rowsSignature returns a 64-bit FNV-1a hash of the current row composition
+// (kind + project + task ID per row). Cheap to compute and stable across
+// rebuilds that produce the same logical layout. Casting `r.kind` directly
+// through a byte avoids a switch and keeps any future rowKind value
+// distinct without code changes here.
+func (tl *TaskListView) rowsSignature() uint64 {
+	h := fnv.New64a()
+	for _, r := range tl.rows {
+		_, _ = h.Write([]byte{byte(r.kind), 0})
+		_, _ = io.WriteString(h, r.project)
+		_, _ = h.Write([]byte{0})
+		if r.task != nil {
+			_, _ = io.WriteString(h, r.task.ID)
+		}
+		_, _ = h.Write([]byte{0})
+	}
+	return h.Sum64()
 }
 
 // groupByProject groups tasks by project name, sorted alphabetically.

@@ -508,6 +508,84 @@ func TestTaskListView_SetTasksPreservesCursor(t *testing.T) {
 	}
 }
 
+func TestTaskListView_OnLayoutChange(t *testing.T) {
+	tl := NewTaskListView()
+	var calls int
+	tl.OnLayoutChange = func() { calls++ }
+
+	// First SetTasks → layout established → callback fires.
+	tl.SetTasks([]*model.Task{
+		{ID: "1", Name: "a", Project: "alpha"},
+		{ID: "2", Name: "b", Project: "alpha"},
+	})
+	if calls != 1 {
+		t.Fatalf("expected 1 call after first SetTasks, got %d", calls)
+	}
+
+	// Same tasks → no layout change → callback should NOT fire (Sync is
+	// expensive; only fire when rows actually shift).
+	tl.SetTasks([]*model.Task{
+		{ID: "1", Name: "a", Project: "alpha"},
+		{ID: "2", Name: "b", Project: "alpha"},
+	})
+	if calls != 1 {
+		t.Errorf("expected callback suppressed on identical rebuild, got %d calls", calls)
+	}
+
+	// Adding a task in a different project changes composition → fire.
+	tl.SetTasks([]*model.Task{
+		{ID: "1", Name: "a", Project: "alpha"},
+		{ID: "2", Name: "b", Project: "alpha"},
+		{ID: "3", Name: "c", Project: "beta"},
+	})
+	if calls != 2 {
+		t.Errorf("expected callback after composition change, got %d calls", calls)
+	}
+
+	// Toggling archive flag moves a task between sections → fire.
+	tl.SetTasks([]*model.Task{
+		{ID: "1", Name: "a", Project: "alpha"},
+		{ID: "2", Name: "b", Project: "alpha", Archived: true},
+		{ID: "3", Name: "c", Project: "beta"},
+	})
+	if calls != 3 {
+		t.Errorf("expected callback after archive toggle, got %d calls", calls)
+	}
+}
+
+// TestTaskListView_OnLayoutChange_CursorCrossesSection covers the
+// autoExpand → buildRows → OnLayoutChange path that fires when cursor
+// movement crosses a section boundary. The SetTasks-driven path is
+// covered by TestTaskListView_OnLayoutChange above; this exercises
+// the InputHandler-driven path.
+func TestTaskListView_OnLayoutChange_CursorCrossesSection(t *testing.T) {
+	tl := NewTaskListView()
+	tl.SetTasks([]*model.Task{
+		{ID: "1", Name: "active", Project: "proj", Status: model.StatusPending},
+		{ID: "2", Name: "waiting", Project: "proj", Status: model.StatusInReview, WaitingReview: true},
+	})
+
+	// Wire callback after initial SetTasks so we count only cursor-driven fires.
+	var calls int
+	tl.OnLayoutChange = func() { calls++ }
+
+	// Cursor starts on task 1 in the active section. Drive it down until
+	// it lands on task 2 in waiting-for-review — autoExpand toggles the
+	// WR section open, which calls buildRows and shifts rows.
+	for i := 0; i < 10; i++ {
+		tl.CursorDown()
+	}
+	if sel := tl.SelectedTask(); sel == nil || sel.ID != "2" {
+		t.Fatalf("expected to land on waiting task id=2, got %+v", sel)
+	}
+	if !tl.waitingReviewExpanded {
+		t.Fatal("waiting-for-review should be auto-expanded after cursor crossing")
+	}
+	if calls == 0 {
+		t.Error("expected OnLayoutChange to fire on section crossing, got 0 calls")
+	}
+}
+
 func TestTaskListView_AdjacentTask(t *testing.T) {
 	tl := NewTaskListView()
 	tl.SetTasks([]*model.Task{
