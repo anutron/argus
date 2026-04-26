@@ -77,6 +77,42 @@ test.describe('terminal', () => {
     expect(body.rows).toBeGreaterThan(0);
   });
 
+  test('detail view layout fits within phone viewport', async ({ page, viewport }) => {
+    // Phone-only: at desktop widths the fixed #detail-view is trivially within
+    // the viewport (left:0; right:0), so the assertions would pass vacuously.
+    test.skip((viewport?.width ?? 0) > 500, 'phone-viewport regression only');
+    await login(page);
+    await page.locator('.task-item').first().click();
+    await expect(page.locator('#term-wrap')).toBeVisible();
+    await expect(page.locator('.term-status.live')).toBeVisible({ timeout: 5000 });
+
+    // The detail view is position:fixed; the term flex chain must shrink to
+    // viewport on phones. Verify the key boxes don't claim more layout width
+    // than the viewport, and the document itself isn't horizontally scrollable
+    // (catches stray width:100vw / overflow rules on the body).
+    const layout = await page.evaluate(() => {
+      const vw = window.innerWidth;
+      // -1 sentinel on a missing node produces a readable assertion failure
+      // ("-1 <= vw+1" passes; we'd never see a -1 in practice for real boxes)
+      // instead of a TypeError from a non-null assertion.
+      const right = (id: string) =>
+        document.getElementById(id)?.getBoundingClientRect().right ?? -1;
+      return {
+        vw,
+        detailView: right('detail-view'),
+        termWrap: right('term-wrap'),
+        term: right('term'),
+        docScrollWidth: document.documentElement.scrollWidth,
+        docClientWidth: document.documentElement.clientWidth,
+      };
+    });
+    // +1 px tolerance for subpixel rounding at devicePixelRatio > 1.
+    expect(layout.detailView).toBeLessThanOrEqual(layout.vw + 1);
+    expect(layout.termWrap).toBeLessThanOrEqual(layout.vw + 1);
+    expect(layout.term).toBeLessThanOrEqual(layout.vw + 1);
+    expect(layout.docScrollWidth).toBeLessThanOrEqual(layout.docClientWidth + 1);
+  });
+
   test('back button cleans up stream and term', async ({ page }) => {
     await login(page);
     await page.locator('.task-item').first().click();
