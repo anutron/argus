@@ -163,7 +163,56 @@ test.describe('terminal', () => {
     expect(drained.chunks).toBe(0);
     expect(drained.bytes).toBe(0);
 
-    // Buffered markers should now be in the terminal buffer.
+    // Buffered markers should now be in the terminal buffer. xterm.write
+    // queues bytes asynchronously, so poll instead of asserting on a
+    // single snapshot — the markers land within a few rAFs of flushPending.
+    await expect.poll(async () =>
+      page.evaluate(() => {
+        const buf = (window as any).term.buffer.active;
+        let s = '';
+        for (let y = 0; y < buf.length; y++) {
+          const line = buf.getLine(y);
+          if (line) s += line.translateToString(true) + '\n';
+        }
+        return s;
+      }),
+    { timeout: 3000 }).toMatch(/LIVE_MARKER_AAA[\s\S]*LIVE_MARKER_BBB/);
+  });
+
+  test('buffers SSE writes while finger is on the term (iOS momentum guard)', async ({ page }) => {
+    await login(page);
+    await page.locator('.task-item').first().click();
+    await expect(page.locator('.term-status.live')).toBeVisible({ timeout: 5000 });
+
+    // Synthesize a touchstart on #term. The production handler reads no
+    // TouchEvent fields (just toggles `termTouching`), so a plain Event
+    // exercises the same code path without relying on Playwright's touch
+    // emulation, which differs between desktop/iphone profiles.
+    await page.evaluate(() => {
+      document.getElementById('term')!.dispatchEvent(new Event('touchstart'));
+    });
+    const touchState = await page.evaluate(() => (window as any).argusTouchState());
+    expect(touchState.touching).toBe(true);
+
+    // Live SSE chunk arriving mid-touch must be buffered, not written —
+    // termIsAtBottom() is still true here (no scroll yet), so the touch
+    // gate is what catches this.
+    await page.evaluate(() => {
+      const enc = new TextEncoder();
+      (window as any).bufferOrWrite(enc.encode('TOUCH_BUFFERED_AAA\r\n'));
+    });
+    const duringTouch = await page.evaluate(() => (window as any).argusPending());
+    expect(duringTouch.chunks).toBe(1);
+
+    // touchend without a scroll-up leaves us at the bottom — the settle
+    // timer should auto-flush within SETTLE_MS.
+    await page.evaluate(() => {
+      document.getElementById('term')!.dispatchEvent(new Event('touchend'));
+    });
+    await expect.poll(async () =>
+      page.evaluate(() => (window as any).argusPending().chunks)
+    , { timeout: 2000 }).toBe(0);
+
     const dump = await page.evaluate(() => {
       const buf = (window as any).term.buffer.active;
       let s = '';
@@ -173,8 +222,7 @@ test.describe('terminal', () => {
       }
       return s;
     });
-    expect(dump).toContain('LIVE_MARKER_AAA');
-    expect(dump).toContain('LIVE_MARKER_BBB');
+    expect(dump).toContain('TOUCH_BUFFERED_AAA');
   });
 
   test('back button cleans up stream and term', async ({ page }) => {
