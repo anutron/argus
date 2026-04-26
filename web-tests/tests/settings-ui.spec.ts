@@ -51,6 +51,7 @@ test.describe('list toolbar', () => {
     // Click the seed task → archive it.
     await page.locator('.task-item').first().click();
     page.on('dialog', d => d.accept());
+    await page.locator('#btn-overflow').click();
     await page.locator('#btn-archive').click();
     await expect(page.locator('#tasks-view')).toBeVisible();
     // Active list is empty.
@@ -66,6 +67,7 @@ test.describe('detail-view actions', () => {
     await login(page);
     await page.locator('.task-item').first().click();
     page.on('dialog', d => d.accept('renamed-via-ui'));
+    await page.locator('#btn-overflow').click();
     await page.locator('#btn-rename').click();
     await expect(page.locator('#detail-title')).toHaveText('renamed-via-ui', { timeout: 3000 });
   });
@@ -74,7 +76,30 @@ test.describe('detail-view actions', () => {
     await login(page);
     await page.locator('.task-item').first().click();
     page.on('dialog', d => d.accept('forked-via-ui'));
+    await page.locator('#btn-overflow').click();
     await page.locator('#btn-fork').click();
     await expect(page.locator('#detail-title')).toHaveText('forked-via-ui', { timeout: 5000 });
+  });
+
+  test('overflow menu closes when navigating Back', async ({ page }) => {
+    await login(page);
+    await page.locator('.task-item').first().click();
+    await page.locator('#btn-overflow').click();
+    await expect(page.locator('#overflow-menu')).toHaveClass(/open/);
+    await page.locator('.detail-back').click();
+    // After back, detail-view is dismissed and overflow-menu is gone from DOM
+    // (innerHTML rebuild on next openDetail), or at minimum no longer .open.
+    await expect(page.locator('#tasks-view')).toBeVisible();
+    await expect(page.locator('#overflow-menu.open')).toHaveCount(0);
+  });
+
+  test('overflow menu closes when switching tabs', async ({ page }) => {
+    await login(page);
+    await page.locator('.task-item').first().click();
+    await page.locator('#btn-overflow').click();
+    await expect(page.locator('#overflow-menu')).toHaveClass(/open/);
+    await page.locator('.tab[data-tab="settings"]').click();
+    await expect(page.locator('#settings-view')).toBeVisible();
+    await expect(page.locator('#overflow-menu.open')).toHaveCount(0);
   });
 });
