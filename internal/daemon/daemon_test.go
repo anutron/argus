@@ -61,6 +61,22 @@ func dialStream(t *testing.T, sockPath string, taskID string) net.Conn {
 	return conn
 }
 
+func TestDaemon_UpdateSelfEmpty(t *testing.T) {
+	d, sockPath := testDaemon(t)
+	go d.Serve(sockPath) //nolint:errcheck
+	t.Cleanup(func() { d.Shutdown() })
+	waitForSocket(t, sockPath)
+
+	client := dialRPC(t, sockPath)
+	var resp UpdateSelfResp
+	if err := client.Call("Daemon.UpdateSelf", &Empty{}, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Error == "" {
+		t.Error("expected error when source path is unset")
+	}
+}
+
 func TestDaemon_BootInfo(t *testing.T) {
 	d, sockPath := testDaemon(t)
 
