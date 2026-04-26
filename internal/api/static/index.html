@@ -232,6 +232,11 @@ button:disabled { opacity: 0.5; cursor: default; }
 }
 .jump-bottom-btn.shown { display: flex; }
 .jump-bottom-btn:active { background: var(--text); }
+.jump-bottom-btn.has-pending::after {
+  content: ''; position: absolute; top: 4px; right: 4px;
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--green); border: 2px solid var(--bg);
+}
 .read-only-output {
   flex: 1 1 auto; min-height: 0;
   background: #000; color: #ccc; font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
@@ -512,6 +517,16 @@ let ctrlArmed = false;
 let ctrlLocked = false;
 let termFontSize = parseInt(localStorage.getItem('argus-font-size') || '13', 10);
 
+// SSE chunks queued while the user is scrolled into history. iOS kills
+// momentum scroll when JS mutates the xterm viewport, so we hold writes
+// until the user returns to the bottom (or taps the jump-bottom button).
+// Cap matches the daemon's session ring buffer (256KB) — anything older
+// than that is already lost server-side, so the cap can't drop content
+// the user could otherwise have seen by reattaching.
+let pendingChunks = [];
+let pendingBytes = 0;
+const PENDING_MAX_BYTES = 256 * 1024;
+
 // --- Toast ---
 function showToast(msg, duration = 4000) {
   const existing = document.querySelector('.toast');
@@ -752,13 +767,20 @@ function setupTerm() {
   // Expose for tests / debugging.
   window.term = term;
   window.fitAddon = fitAddon;
+  window.bufferOrWrite = bufferOrWrite;
+  window.flushPending = flushPending;
+  window.argusPending = () => ({ chunks: pendingChunks.length, bytes: pendingBytes });
   // Force a layout pass before fit \u2014 addon reads computed sizes.
   requestAnimationFrame(() => {
     fit();
     term.focus();
   });
-  // Toggle the jump-to-input button when user scrolls up into scrollback.
-  term.onScroll(updateJumpButton);
+  // Toggle the jump-to-input button when user scrolls up into scrollback,
+  // and flush any buffered live output once we're back at the bottom.
+  term.onScroll(() => {
+    if (termIsAtBottom()) flushPending();
+    updateJumpButton();
+  });
   updateJumpButton();
 
   // Forward keystrokes to the agent. xterm gives us already-translated bytes
@@ -859,8 +881,50 @@ function destroyTerm() {
     window.term = null;
     window.fitAddon = null;
   }
+  // SSE onmessage is a macrotask that can't interleave with this synchronous
+  // teardown, so closeStream() before destroyTerm() is enough to guarantee
+  // no late writer mutates pendingChunks after we clear it.
+  pendingChunks = [];
+  pendingBytes = 0;
   const btn = document.getElementById('jump-bottom');
-  if (btn) btn.classList.remove('shown');
+  if (btn) { btn.classList.remove('shown'); btn.classList.remove('has-pending'); }
+}
+
+// Buffer SSE bytes when the user is scrolled into scrollback so that
+// term.write doesn't kill the active iOS momentum-scroll fling. Cap the
+// buffer to PENDING_MAX_BYTES; older chunks are dropped FIFO once full.
+// The `length > 1` guard always keeps at least one chunk so we never
+// silently drop everything — a single chunk larger than the cap is
+// kept whole rather than discarded (PTY-read chunks are ~4KB, so this
+// is a defensive corner, not a hot path).
+function bufferOrWrite(bytes) {
+  if (!term) return;
+  if (termIsAtBottom()) {
+    term.write(bytes);
+    return;
+  }
+  pendingChunks.push(bytes);
+  pendingBytes += bytes.length;
+  while (pendingBytes > PENDING_MAX_BYTES && pendingChunks.length > 1) {
+    pendingBytes -= pendingChunks[0].length;
+    pendingChunks.shift();
+  }
+  updateJumpButton();
+}
+
+// Swap-before-iterate so re-entrant calls (term.write fires onScroll
+// synchronously, which can re-enter flushPending if we're still at the
+// bottom) see an empty queue and exit early. The trailing
+// updateJumpButton() is the safety net for the case where xterm's last
+// write doesn't emit an onScroll event (e.g. pure-text bytes that don't
+// move the viewport).
+function flushPending() {
+  if (!term || pendingChunks.length === 0) return;
+  const chunks = pendingChunks;
+  pendingChunks = [];
+  pendingBytes = 0;
+  for (const chunk of chunks) term.write(chunk);
+  updateJumpButton();
 }
 
 function termIsAtBottom() {
@@ -875,11 +939,13 @@ function updateJumpButton() {
   const btn = document.getElementById('jump-bottom');
   if (!btn) return;
   btn.classList.toggle('shown', !!term && !termIsAtBottom());
+  btn.classList.toggle('has-pending', pendingChunks.length > 0);
 }
 
 document.getElementById('jump-bottom').addEventListener('click', () => {
   if (!term) return;
   term.scrollToBottom();
+  flushPending();
   term.focus();
   updateJumpButton();
 });
@@ -910,7 +976,7 @@ function openStream(id) {
     if (!term) return;
     try {
       const bytes = b64ToBytes(e.data);
-      term.write(bytes);
+      bufferOrWrite(bytes);
     } catch(err) {
       // Ignore malformed chunks.
     }
