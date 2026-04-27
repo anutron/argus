@@ -25,9 +25,9 @@ import (
 // --- Status ---
 
 type statusResponse struct {
-	OK       bool           `json:"ok"`
-	Sessions sessionCounts  `json:"sessions"`
-	Tasks    taskCounts     `json:"tasks"`
+	OK       bool          `json:"ok"`
+	Sessions sessionCounts `json:"sessions"`
+	Tasks    taskCounts    `json:"tasks"`
 }
 
 type sessionCounts struct {
@@ -76,10 +76,18 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 // --- List Tasks ---
 
+// taskJSON is the wire shape returned by /api/tasks*.
+//
+// Status is the persisted DB status. Idle is a runtime-derived flag that is
+// true only when Status == in_progress and the agent session is missing or
+// waiting for input. omitempty drops idle:false from the JSON; the SPA reads
+// missing fields as falsy, which matches the intended contract (no idle field
+// == not idle).
 type taskJSON struct {
 	ID           string `json:"id"`
 	Name         string `json:"name"`
 	Status       string `json:"status"`
+	Idle         bool   `json:"idle,omitempty"`
 	Project      string `json:"project"`
 	Branch       string `json:"branch,omitempty"`
 	Backend      string `json:"backend,omitempty"`
@@ -91,11 +99,19 @@ type taskJSON struct {
 	Prompt       string `json:"prompt,omitempty"`
 }
 
-func taskToJSON(t *model.Task) taskJSON {
+// taskRuntimeState carries non-persisted, derived-at-request-time fields used
+// to populate taskJSON. Group runtime flags here so the taskToJSON signature
+// doesn't grow into a positional bool chain when more flags are added.
+type taskRuntimeState struct {
+	Idle bool
+}
+
+func taskToJSON(t *model.Task, rt taskRuntimeState) taskJSON {
 	return taskJSON{
 		ID:           t.ID,
 		Name:         t.Name,
 		Status:       t.Status.String(),
+		Idle:         rt.Idle,
 		Project:      t.Project,
 		Branch:       t.Branch,
 		Backend:      t.Backend,
@@ -106,6 +122,30 @@ func taskToJSON(t *model.Task) taskJSON {
 		WorktreePath: t.Worktree,
 		Prompt:       t.Prompt,
 	}
+}
+
+// computeRuntimeState derives the per-request runtime state for a task.
+// Mirrors the TUI's drawTaskRow rule: an InProgress task is idle when it has
+// no live session (running map miss) or its session is waiting for input
+// (idle map hit). Non-InProgress tasks are never idle.
+func computeRuntimeState(t *model.Task, runningSet, idleSet map[string]bool) taskRuntimeState {
+	if t.Status != model.StatusInProgress {
+		return taskRuntimeState{}
+	}
+	return taskRuntimeState{Idle: !runningSet[t.ID] || idleSet[t.ID]}
+}
+
+func (s *Server) sessionStateMaps() (runningSet, idleSet map[string]bool) {
+	running, idle := s.runner.RunningAndIdle()
+	runningSet = make(map[string]bool, len(running))
+	for _, id := range running {
+		runningSet[id] = true
+	}
+	idleSet = make(map[string]bool, len(idle))
+	for _, id := range idle {
+		idleSet[id] = true
+	}
+	return runningSet, idleSet
 }
 
 func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
@@ -121,6 +161,8 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	// archived: "0" (default) excludes archived; "1" returns only archived;
 	// "all" returns both.
 	archivedFilter := r.URL.Query().Get("archived")
+
+	runningSet, idleSet := s.sessionStateMaps()
 
 	result := make([]taskJSON, 0)
 	for _, t := range tasks {
@@ -142,7 +184,7 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		if projectFilter != "" && t.Project != projectFilter {
 			continue
 		}
-		result = append(result, taskToJSON(t))
+		result = append(result, taskToJSON(t, computeRuntimeState(t, runningSet, idleSet)))
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"tasks": result})
@@ -157,7 +199,8 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "task not found"})
 		return
 	}
-	writeJSON(w, http.StatusOK, taskToJSON(task))
+	runningSet, idleSet := s.sessionStateMaps()
+	writeJSON(w, http.StatusOK, taskToJSON(task, computeRuntimeState(task, runningSet, idleSet)))
 }
 
 // --- Create Task ---
