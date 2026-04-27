@@ -169,6 +169,13 @@ type App struct {
 	startGen            atomic.Uint64        // double-bumped by startSession (before+after Start RPC); tick captures before its RPC and skips reconciliation on mismatch
 	recentStarts        map[string]time.Time // task ID → time of last startSession; grace period prevents false reconciliation
 
+	// pendingNarrowRestart marks tasks whose live session was killed by the
+	// auto-rerender path (started with a too-narrow PTY due to the
+	// computePTYSize bug). When `handleSessionExitUI` sees an entry in this
+	// map, it immediately restarts the session via `--session-id` so Claude
+	// re-renders the conversation history at the current (wider) PTY.
+	pendingNarrowRestart map[string]bool
+
 	// Worktree root for orphan sweep (default: ~/.argus/worktrees/).
 	// Overridden in tests to avoid scanning real worktrees.
 	wtRoot string
@@ -195,9 +202,10 @@ func New(database *db.DB, runner agent.SessionProvider, daemonConnected bool, da
 		daemonFreshStart: daemonFreshStart,
 		agentState:       agentview.New(),
 		tickDone:         make(chan struct{}),
-		recentStarts:     make(map[string]time.Time),
-		idleUnvisited:    make(map[string]bool),
-		viewedWhileAgent: make(map[string]bool),
+		recentStarts:         make(map[string]time.Time),
+		idleUnvisited:        make(map[string]bool),
+		viewedWhileAgent:     make(map[string]bool),
+		pendingNarrowRestart: make(map[string]bool),
 		wtRoot:           filepath.Join(db.DataDir(), "worktrees"),
 	}
 
@@ -886,6 +894,40 @@ func (a *App) handleSessionExitUI(taskID string, stopped bool) {
 				}
 			})
 		}(captureWorktree, captureTaskID)
+	}
+
+	// If maybeKickNarrowRerender flagged this task, immediately resume it
+	// at the current (wider) PTY before the user-visible "exited" state has
+	// a chance to render. The new session inherits SessionID, so Claude
+	// re-loads the conversation and renders history at the wider size. Skip
+	// the post-exit clearing/navigation below — startSession will reattach
+	// the agent pane in place.
+	//
+	// Only restart if the user is still viewing this task. If they navigated
+	// away after the kick, fall through to the normal exit path so the task
+	// settles at InReview and the user can resume it manually later.
+	if stopped && a.pendingNarrowRestart[taskID] {
+		delete(a.pendingNarrowRestart, taskID)
+		a.mu.Lock()
+		stillViewing := a.mode == modeAgent && a.agentState.TaskID == taskID
+		a.mu.Unlock()
+		if !stillViewing {
+			uxlog.Log("[tui] narrow-rerender: user navigated away from task=%s, skipping auto-restart", taskID)
+			a.statusbar.ClearInfo()
+		} else if t, err := a.db.Get(taskID); err == nil && t != nil {
+			uxlog.Log("[tui] narrow-rerender: restarting task=%s session=%s", t.ID, t.SessionID)
+			// Force the resumed task back into InProgress; handleSessionExitUI
+			// flipped it to InReview a moment ago.
+			t.SetStatus(model.StatusInProgress)
+			a.db.Update(t) //nolint:errcheck
+			a.startSession(t)
+			a.statusbar.ClearInfo()
+			a.refreshTasksAsync()
+			return
+		} else {
+			uxlog.Log("[tui] narrow-rerender: task %s vanished from DB, falling through", taskID)
+			a.statusbar.ClearInfo()
+		}
 	}
 
 	// If we're viewing this task's agent pane and it completed, navigate back
@@ -2049,8 +2091,16 @@ func (a *App) onTaskSelect(task *model.Task, autoStart bool) {
 	// Start continuous redraw loop for existing running sessions.
 	if sess != nil && sess.Alive() {
 		a.startAgentRedrawLoop(task.ID, sess)
+		// Detect narrow-stuck sessions (initial PTY too narrow to ever recover
+		// via SIGWINCH). If the session is idle, kill it so the deferred
+		// restart in handleSessionExitUI brings it back at the current wider
+		// PTY and Claude re-renders the conversation history.
+		a.maybeKickNarrowRerender(task, sess)
 		return
 	}
+	// No live session — clear any leaked pending-restart marker so a future
+	// re-entry isn't silently blocked from kicking again.
+	a.reapStaleNarrowRestart(task.ID, sess)
 
 	// Auto-start sessions when entering agent view for a non-running task.
 	// Covers both fresh tasks (no SessionID) and interrupted sessions
@@ -2066,6 +2116,125 @@ func (a *App) onTaskSelect(task *model.Task, autoStart bool) {
 		uxlog.Log("[tui] auto-starting session for task %s (sessionID=%s)", task.ID, sid)
 		a.startSession(task)
 	}
+}
+
+// narrowInitialPTYThreshold is the cutoff below which a session's initial
+// PTY size is considered "buggy small". The original `computePTYSize` bug
+// produced 20x8; a real laid-out agent pane on the smallest reasonable
+// terminal is wider. 60 leaves headroom while still excluding any plausible
+// real-world layout.
+const narrowInitialPTYThreshold = 60
+
+// narrowRerenderMargin is the minimum delta between current panel cols and
+// the session's initial cols required to bother restarting. Avoids ping-pong
+// when the session was started a hair too narrow.
+const narrowRerenderMargin = 30
+
+// narrowRerenderDecision is the outcome of shouldKickNarrowRerender — kept
+// separate so the gating logic is testable in isolation from the live RPCs.
+type narrowRerenderDecision int
+
+const (
+	narrowRerenderSkip narrowRerenderDecision = iota
+	narrowRerenderDeferBusy                   // criteria match but session is busy; retry next entry
+	narrowRerenderKick                        // stop the session; handleSessionExitUI will restart it
+)
+
+// shouldKickNarrowRerender decides whether the live session should be
+// stopped+resumed to re-render its scrollback at a wider PTY. Pure function
+// for testability — see maybeKickNarrowRerender for the wired version.
+//
+// initCols=0 means "unknown" (e.g., daemon predates the field) and is
+// treated as already-sane to avoid surprise restarts.
+func shouldKickNarrowRerender(hasSessionID bool, initCols, panelCols int, idle, alreadyPending bool) narrowRerenderDecision {
+	if !hasSessionID || alreadyPending {
+		return narrowRerenderSkip
+	}
+	if initCols <= 0 || initCols >= narrowInitialPTYThreshold {
+		return narrowRerenderSkip
+	}
+	if panelCols-initCols < narrowRerenderMargin {
+		return narrowRerenderSkip
+	}
+	if !idle {
+		return narrowRerenderDeferBusy
+	}
+	return narrowRerenderKick
+}
+
+// maybeKickNarrowRerender detects sessions whose initial PTY was so narrow
+// that Claude rendered the entire conversation history at narrow column
+// positions, and triggers a kill+resume cycle so the resumed session
+// re-renders at the current (wider) panel size. Stops the session when the
+// criteria match — the deferred restart fires in handleSessionExitUI via
+// pendingNarrowRestart. No-op for backends that can't resume (no SessionID),
+// for already-restarted tasks, or when the session is busy (don't kill mid
+// tool-call).
+//
+// The decision RPCs (`InitialPTYSize`, `IsIdle`) hit the daemon over the
+// Unix socket, so we do them on a background goroutine and dispatch the
+// kick back via QueueUpdateDraw — never block the tview main goroutine on
+// network I/O. The panel size and the session pointer are captured up front
+// on the main goroutine where it's safe to read them.
+func (a *App) maybeKickNarrowRerender(task *model.Task, sess agent.SessionHandle) {
+	if task == nil || sess == nil || !sess.Alive() {
+		return
+	}
+	if task.SessionID == "" {
+		return // backend doesn't support --session-id resume; nothing to do
+	}
+	if a.pendingNarrowRestart[task.ID] {
+		return // a kick is already in flight for this task
+	}
+	taskID := task.ID
+	_, panelCols := a.computePTYSize() // safe: GetInnerRect on the main goroutine
+
+	go func() {
+		// RPC calls — must NOT happen on the tview main goroutine.
+		initCols, _ := sess.InitialPTYSize()
+		idle := sess.IsIdle()
+		a.tapp.QueueUpdateDraw(func() {
+			// Re-check liveness and the pending flag — anything could have
+			// changed during the RPC round-trip.
+			if !sess.Alive() || a.pendingNarrowRestart[taskID] {
+				return
+			}
+			decision := shouldKickNarrowRerender(true, initCols, int(panelCols), idle, false)
+			switch decision {
+			case narrowRerenderSkip:
+				return
+			case narrowRerenderDeferBusy:
+				uxlog.Log("[tui] narrow-rerender deferred: task=%s busy (init=%d panel=%d)", taskID, initCols, panelCols)
+				return
+			case narrowRerenderKick:
+				uxlog.Log("[tui] narrow-rerender: stopping task=%s session=%s (init=%dx panel=%dx)", taskID, task.SessionID, initCols, panelCols)
+				a.statusbar.SetInfo("Re-rendering at full width…")
+				a.pendingNarrowRestart[taskID] = true
+				if err := sess.Stop(); err != nil {
+					uxlog.Log("[tui] narrow-rerender: stop failed task=%s err=%v", taskID, err)
+					delete(a.pendingNarrowRestart, taskID)
+					a.statusbar.ClearInfo()
+				}
+			}
+		})
+	}()
+}
+
+// reapStaleNarrowRestart clears a leaked pendingNarrowRestart entry when the
+// session it referred to has died without firing handleSessionExitUI (daemon
+// crash mid-stop, lost stream notification, etc.). Called from onTaskSelect
+// before maybeKickNarrowRerender so a stuck flag can't permanently block
+// recovery.
+func (a *App) reapStaleNarrowRestart(taskID string, sess agent.SessionHandle) {
+	if !a.pendingNarrowRestart[taskID] {
+		return
+	}
+	if sess != nil && sess.Alive() {
+		return // exit notification still pending; let it run
+	}
+	uxlog.Log("[tui] narrow-rerender: reaping stale pending flag for task=%s", taskID)
+	delete(a.pendingNarrowRestart, taskID)
+	a.statusbar.ClearInfo()
 }
 
 // onNewTask opens the new task form.
@@ -2194,37 +2363,71 @@ func (a *App) handleNewTaskKey(event *tcell.EventKey) {
 }
 
 // computePTYSize returns the best available PTY dimensions for the agent
-// terminal pane. Prefers the pane's actual inner rect (when tview has drawn);
-// falls back to the host terminal size via the 1:3:1 agent-page layout ratio;
-// finally defaults to 24x80.
+// terminal pane. Prefers the host terminal size with the 1:3:1 agent-page
+// layout ratio (always accurate when stdout is a TTY); falls back to the
+// pane's actual inner rect; finally defaults to 24x80.
+//
+// Host terminal is preferred over the pane rect because tview's Box returns
+// its default 15x10 rect before Flex has laid it out — and computePTYSize
+// runs synchronously after SwitchToPage("agent") on agent-view entry, before
+// the queued layout/Draw can settle. Reading that 15x10 default yielded a
+// 20x8 PTY, and Claude rendered the full conversation at narrow width with
+// cursor positions that no SIGWINCH-triggered redraw can re-flow.
 //
 // MUST be called on the tview main goroutine — GetInnerRect is not safe to
 // call concurrently with Draw.
 func (a *App) computePTYSize() (rows, cols uint16) {
-	rows, cols = 24, 80
-	_, _, pw, ph := a.agentPane.GetInnerRect()
-	if pw > 0 && ph > 0 {
-		// Border is drawn inside the box rect — content area is 2 smaller each dimension.
-		cols = uint16(max(pw-2, 20))
-		rows = uint16(max(ph-2, 5))
+	rows, cols = ptySizeFromHostTerm(term.GetSize(int(os.Stdout.Fd())))
+	if rows > 0 && cols > 0 {
 		return
 	}
-	if tw, th, err := term.GetSize(int(os.Stdout.Fd())); err == nil && tw > 0 && th > 0 {
-		// Agent page is a 1:3:1 flex — center panel gets 3/5 of width.
-		// Border is drawn inside, deduct 2 for border cells.
-		centerW := tw*3/5 - 2
-		if centerW < 20 {
-			centerW = 20
-		}
-		// Height minus header(1), agent header(1), statusbar(1), and border(2).
-		centerH := th - 5
-		if centerH < 5 {
-			centerH = 5
-		}
-		cols = uint16(centerW)
-		rows = uint16(centerH)
+	_, _, pw, ph := a.agentPane.GetInnerRect()
+	if r, c := ptySizeFromPaneRect(pw, ph); r > 0 && c > 0 {
+		return r, c
 	}
-	return
+	return 24, 80
+}
+
+// ptySizeFromHostTerm derives the agent PTY size from the host terminal,
+// applying the agent page's 1:3:1 column flex and the header/footer/border
+// row deductions. Returns 0,0 when the input is unusable.
+func ptySizeFromHostTerm(tw, th int, err error) (rows, cols uint16) {
+	if err != nil || tw <= 0 || th <= 0 {
+		return 0, 0
+	}
+	// Agent page column flex: 1 (gitPanel) + 3 (agentPane) + 1 (filePanel)
+	// → center gets 3/5 of width. Deduct 2 for the agent pane's border.
+	centerW := max(tw*3/5-2, 20)
+	// Row layout: tab header(1) is hidden in agent view, agent header(1),
+	// statusbar(1), and pane border(2) ⇒ 5 row deduction. The tab header is
+	// hidden by the time the session starts, but accounting for it would
+	// over-shoot when this runs from the new-task flow before the resize.
+	centerH := max(th-5, 5)
+	return uint16(centerH), uint16(centerW)
+}
+
+// ptySizeFromPaneRect derives the agent PTY size from the agent pane's full
+// box rect (as returned by GetInnerRect — the agent pane has no native tview
+// border, so its inner rect equals its outer rect). The pane draws its own
+// 1-cell border via widget.DrawBorderedPanel, so the visible content area is
+// pw-2 by ph-2.
+//
+// Rejects the tview Box default of 15x10 — that rect surfaces before Flex
+// has laid the pane out and would produce a 20x8 PTY (Claude renders narrow
+// forever).
+func ptySizeFromPaneRect(pw, ph int) (rows, cols uint16) {
+	if pw <= 0 || ph <= 0 {
+		return 0, 0
+	}
+	// tview's NewBox defaults to 15x10. Any laid-out agent pane is wider
+	// AND taller than those defaults on a usable terminal, so we treat
+	// anything ≤ either as the uninitialized default. 30x10 stays generous
+	// enough that even a tiny 50-col host fed via the fallback would not
+	// falsely match.
+	if pw <= 30 || ph <= 10 {
+		return 0, 0
+	}
+	return uint16(max(ph-2, 5)), uint16(max(pw-2, 20))
 }
 
 // startSession starts a session for an *existing* task (Enter-to-restart or
