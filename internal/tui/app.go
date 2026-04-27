@@ -443,14 +443,17 @@ func (a *App) Run() error {
 	go a.spinnerLoop()
 	defer close(a.tickDone)
 
-	// If main detected the daemon's binary differs from ours, queue the prompt
-	// for the event loop. QueueUpdateDraw enqueues on a buffered channel
-	// (cap 100) and returns immediately — the closure runs once tapp.Run()
-	// starts draining.
+	// If main detected the daemon's binary differs from ours, open the prompt
+	// directly. We can't use QueueUpdateDraw here: tview's QueueUpdate is
+	// synchronous (it sends on a buffered channel, then blocks on a per-call
+	// done channel until the event loop executes the closure). The event loop
+	// only starts inside tapp.Run() below, so queuing now would deadlock the
+	// TUI before any frame is painted. Setting modal state directly is safe
+	// because no Draw goroutine exists yet — Pages.AddPage / SwitchToPage
+	// don't take their own locks (only SetFocus does), so the safety comes
+	// from the absence of a concurrent reader, not internal synchronization.
 	if a.daemonStale {
-		a.tapp.QueueUpdateDraw(func() {
-			a.openRestartDaemonPrompt()
-		})
+		a.openRestartDaemonPrompt()
 	}
 
 	uxlog.Log("[tui] starting tcell/tview application")
