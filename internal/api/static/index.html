@@ -906,7 +906,22 @@ let settleTimer = null;
 // long; lower values let writes race the still-active momentum.
 const SETTLE_MS = 200;
 let termTouchEl = null;
-function onTermTouchStart() { termTouching = true; }
+// syncVisualViewport mutates `--app-height` on <html> and `transform` on
+// #detail-view — both ancestors of `.xterm-viewport`. iOS kills momentum on
+// any ancestor mutation, and visualViewport.resize fires mid-flick when the
+// URL bar collapses/expands. Defer the sync until momentum settles so the
+// flick survives.
+let pendingViewportSync = false;
+function isInMomentum() { return (Date.now() - lastTermScroll) < SETTLE_MS; }
+function onTermTouchStart() {
+  termTouching = true;
+  // Arm a settle pass on every touch — even a passive tap that fires no
+  // scroll events. Without this, a visualViewport.resize that landed
+  // immediately before the tap would leave pendingViewportSync queued
+  // forever. Tradeoff: every #term touch delays a pending sync by up to
+  // SETTLE_MS, which is acceptable vs. a stuck queue.
+  scheduleSettle();
+}
 function onTermTouchEnd() { termTouching = false; scheduleSettle(); }
 // scheduleSettle resets a debounce timer; the callback re-checks every
 // gate that bufferOrWrite uses (at-bottom, !touching, !in-momentum) so a
@@ -914,8 +929,13 @@ function onTermTouchEnd() { termTouching = false; scheduleSettle(); }
 function scheduleSettle() {
   clearTimeout(settleTimer);
   settleTimer = setTimeout(() => {
-    const inMomentum = (Date.now() - lastTermScroll) < SETTLE_MS;
-    if (!termTouching && !inMomentum && termIsAtBottom()) flushPending();
+    if (termTouching || isInMomentum()) return;
+    // Clear pendingViewportSync BEFORE calling syncVisualViewport so a
+    // re-entrant call from inside it (currently impossible — termTouching
+    // is false and inMomentum is false here — but cheap insurance against
+    // future gate changes) cannot re-queue and lose this flush.
+    if (pendingViewportSync) { pendingViewportSync = false; syncVisualViewport(); }
+    if (termIsAtBottom()) flushPending();
   }, SETTLE_MS);
 }
 
@@ -1257,7 +1277,7 @@ function setupTerm() {
   window.bufferOrWrite = bufferOrWrite;
   window.flushPending = flushPending;
   window.argusPending = () => ({ chunks: pendingChunks.length, bytes: pendingBytes });
-  window.argusTouchState = () => ({ touching: termTouching });
+  window.argusTouchState = () => ({ touching: termTouching, pendingViewportSync });
   // Force a layout pass before fit \u2014 addon reads computed sizes.
   requestAnimationFrame(() => {
     fit();
@@ -1336,6 +1356,7 @@ function destroyTerm() {
   }
   termTouching = false;
   lastTermScroll = 0;
+  pendingViewportSync = false;
   clearTimeout(settleTimer);
   settleTimer = null;
   const btn = document.getElementById('jump-bottom');
@@ -1351,8 +1372,7 @@ function destroyTerm() {
 // is a defensive corner, not a hot path).
 function bufferOrWrite(bytes) {
   if (!term) return;
-  const inMomentum = (Date.now() - lastTermScroll) < SETTLE_MS;
-  if (termIsAtBottom() && !termTouching && !inMomentum) {
+  if (termIsAtBottom() && !termTouching && !isInMomentum()) {
     term.write(bytes);
     return;
   }
@@ -1714,6 +1734,16 @@ window.addEventListener('orientationchange', () => {
 function syncVisualViewport() {
   const vv = window.visualViewport;
   if (!vv) return;
+  // Defer all DOM writes if the user is touching the term or momentum is
+  // still firing. iOS Safari fires visualViewport.resize when the URL bar
+  // collapses mid-flick on a fixed-positioned scrollable container; the
+  // resulting setProperty on <html> + style.transform on #detail-view
+  // mutate ancestors of .xterm-viewport, which kills the momentum scroll.
+  // The settle timer flushes pendingViewportSync once it's safe.
+  if (termTouching || isInMomentum()) {
+    pendingViewportSync = true;
+    return;
+  }
   document.documentElement.style.setProperty('--app-height', `${vv.height}px`);
   // Only translate when the detail view is actually displayed — avoids
   // applying a stale transform to a hidden element when the keyboard moves
