@@ -281,6 +281,56 @@ button:disabled { opacity: 0.5; cursor: default; }
 .term-status.error .dot { background: var(--red); }
 @keyframes pulse { 50% { opacity: 0.4; } }
 
+/* Compose bar: a real <textarea> below the terminal that the user types or
+   dictates into and submits via Send / Enter. Exists because xterm.js captures
+   keystrokes through a hidden, offscreen `.xterm-helper-textarea` (opacity:0,
+   left:-9999em) that iOS dictation, third-party keyboards, and tools like
+   Wispr Flow refuse to inject text into — they need a visible, on-screen,
+   system-recognised text field. Shown only on touch devices so desktop's
+   direct-into-xterm path is unchanged. font-size:16px is critical: iOS Safari
+   zooms the viewport when focusing an input <16px. */
+.compose-bar {
+  flex-shrink: 0;
+  display: flex;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--bg);
+  border-top: 1px solid var(--border);
+  align-items: flex-end;
+}
+#compose-input {
+  flex: 1 1 auto; min-width: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: var(--text);
+  font-size: 16px;
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  resize: none;
+  line-height: 1.4;
+  min-height: 40px;
+  /* 30vh cap keeps the agent terminal visible even mid-dictation on small
+     phones — past 30vh the user is composing more than they're reading and
+     internal textarea scroll takes over. */
+  max-height: 30vh;
+  field-sizing: content;
+}
+#compose-input:focus { outline: none; border-color: var(--accent); }
+#compose-send {
+  flex-shrink: 0;
+  width: 44px; height: 44px; min-width: 44px;
+  border-radius: 50%;
+  background: var(--accent); color: #000;
+  border: none;
+  font-size: 20px; font-weight: bold;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  display: flex; align-items: center; justify-content: center;
+}
+#compose-send:active { opacity: 0.7; }
+#compose-send:disabled { opacity: 0.3; cursor: not-allowed; }
+
 /* Font size controls inside the overflow menu — sit as a row at the top of
    the dropdown so taps don't require dismissing the menu between presses. */
 .overflow-font-row {
@@ -663,6 +713,13 @@ textarea.settings-input { min-height: 70px; resize: vertical; }
     <div class="term-wrap" id="term-wrap" style="display:none">
       <div id="term"></div>
       <button class="jump-bottom-btn" id="jump-bottom" aria-label="Scroll to input" type="button">↓</button>
+    </div>
+    <div class="compose-bar" id="compose-bar" style="display:none">
+      <textarea id="compose-input" rows="1"
+        placeholder="Type or dictate to agent…"
+        autocapitalize="off" autocorrect="off" spellcheck="false"
+        autocomplete="off" enterkeyhint="send"></textarea>
+      <button id="compose-send" type="button" aria-label="Send">↑</button>
     </div>
     <div class="read-only-output" id="output-box" style="display:none"></div>
   </div>
@@ -1156,7 +1213,21 @@ let fitAddon = null;
 let evtSource = null;
 let lastTerm = { cols: 0, rows: 0 };
 let resizeDebounce = null;
+// ResizeObserver on #term refits xterm whenever its rendered size changes —
+// covers the compose-bar auto-grow path that doesn't fire `window.resize` or
+// `visualViewport.resize`. Browsers without ResizeObserver (none we target)
+// fall back to keyboard / orientation events for refit.
+let termResizeObserver = null;
 let termFontSize = parseInt(localStorage.getItem('argus-font-size') || '13', 10);
+
+// Compose bar (mobile agent input) is gated on touch devices so desktop's
+// direct-into-xterm path is unchanged. Defined here near other terminal state
+// rather than next to its handlers further down so call sites in
+// attachTerminal / destroyTerm / closeDetail can find it without scrolling
+// 2000 lines. The handlers (setComposeVisible, sendCompose, wireCompose) live
+// at the bottom of the script, near the auto-complete wiring they're peers of.
+const IS_TOUCH = ('ontouchstart' in window)
+  || (window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
 
 // SSE chunks queued while the user is scrolled into history. iOS kills
 // momentum scroll when JS mutates the xterm viewport, so we hold writes
@@ -1667,12 +1738,15 @@ function attachTerminal(task) {
     document.getElementById('term-wrap').style.display = 'flex';
     document.getElementById('output-box').style.display = 'none';
     document.getElementById('term-status').style.display = 'flex';
+    setComposeVisible(true);
     setupTerm();
     openStream(task.id);
   } else {
     document.getElementById('term-wrap').style.display = 'none';
     document.getElementById('term-status').style.display = 'none';
     document.getElementById('output-box').style.display = 'block';
+    // destroyTerm() above already hid the compose bar — non-running tasks
+    // never re-show it.
     loadStaticOutput(task.id);
   }
 }
@@ -1758,6 +1832,20 @@ function setupTerm() {
     termTouchEl.addEventListener('touchstart', onTermTouchStart, { passive: true });
     termTouchEl.addEventListener('touchend', onTermTouchEnd, { passive: true });
     termTouchEl.addEventListener('touchcancel', onTermTouchCancel, { passive: true });
+  }
+
+  // Refit on size changes that bypass window.resize / visualViewport.resize —
+  // notably the compose textarea auto-growing as the user types or dictates
+  // multiple lines, which shrinks #term-wrap and would otherwise leave xterm
+  // rendering stale dimensions (bottom rows clipped by overflow:hidden) until
+  // the next keyboard / orientation event. fit() early-returns when cols/rows
+  // are unchanged, so a spurious initial fire is harmless.
+  if (window.ResizeObserver && termTouchEl) {
+    termResizeObserver = new ResizeObserver(() => {
+      clearTimeout(resizeDebounce);
+      resizeDebounce = setTimeout(fit, 100);
+    });
+    termResizeObserver.observe(termTouchEl);
   }
 
   // Forward keystrokes to the agent. xterm gives us already-translated bytes
@@ -1867,6 +1955,11 @@ function destroyTerm() {
     window.term = null;
     window.fitAddon = null;
   }
+  // Compose bar tracks term lifecycle — every teardown path (closeDetail,
+  // switchTab, showOffline, mid-attachTerminal swap) must hide it. Centralising
+  // here so callers can't forget. Re-shown by the next attachTerminal when the
+  // task is in_progress.
+  setComposeVisible(false);
   // SSE onmessage is a macrotask that can't interleave with this synchronous
   // teardown, so closeStream() before destroyTerm() is enough to guarantee
   // no late writer mutates pendingChunks after we clear it.
@@ -1875,6 +1968,10 @@ function destroyTerm() {
   // Detach touch + scroll listeners — setupTerm() reattaches them. Without
   // removal they'd accumulate across open/close cycles and stale handlers
   // would toggle termTouching/isTermScrolling for events on a disposed term.
+  if (termResizeObserver) {
+    termResizeObserver.disconnect();
+    termResizeObserver = null;
+  }
   if (termTouchEl) {
     termTouchEl.removeEventListener('touchstart', onTermTouchStart);
     termTouchEl.removeEventListener('touchend', onTermTouchEnd);
@@ -2303,6 +2400,10 @@ function closeDetail() {
   closeOverflowMenu();
   closeFilesView();
   closePromptModal();
+  // destroyTerm() hid the compose bar; here we additionally clear the textarea
+  // so the next opened task gets a fresh field.
+  const ci = document.getElementById('compose-input');
+  if (ci) ci.value = '';
   currentTask = null;
   window.currentTask = null;
   const dv = document.getElementById('detail-view');
@@ -3612,6 +3713,67 @@ acDrop.addEventListener('click', function(e) {
   const item = e.target.closest('.ac-item');
   if (item) selectAC(parseInt(item.dataset.idx, 10));
 });
+
+// --- Compose bar ---
+// xterm.js's hidden helper textarea is invisible to iOS dictation, third-party
+// keyboards, and Wispr Flow — they only inject into a focused, on-screen, real
+// text field. The compose bar is that field: type or dictate, then Send / Enter
+// forwards the text to the PTY via the same /input endpoint xterm uses. The
+// IS_TOUCH gate is hoisted up next to the terminal-state vars so the call
+// sites in destroyTerm / attachTerminal can read it without scrolling.
+
+function setComposeVisible(visible) {
+  const el = document.getElementById('compose-bar');
+  if (!el) return;
+  el.style.display = (visible && IS_TOUCH) ? 'flex' : 'none';
+}
+
+// Mirror the server-side `io.LimitReader(r.Body, 64*1024)` in handleWriteInput
+// so a giant paste fails fast with a toast instead of POSTing megabytes that
+// the daemon silently truncates and the user sees no error from.
+const COMPOSE_MAX_BYTES = 64 * 1024;
+
+function sendCompose() {
+  const ci = document.getElementById('compose-input');
+  if (!ci) return;
+  const v = ci.value;
+  if (!v) return;
+  // TextEncoder gives the actual UTF-8 byte length — `.length` would
+  // undercount multi-byte chars and let an over-cap value through.
+  const byteLen = new TextEncoder().encode(v).length;
+  if (byteLen > COMPOSE_MAX_BYTES) {
+    showToast(`Input too long (${byteLen} > ${COMPOSE_MAX_BYTES} bytes)`);
+    return;
+  }
+  // Match term.onData's gate: forward only on `in_progress` (which includes
+  // idle agents — they're still accepting input at a prompt). On a stopped or
+  // in_review task we keep the textarea contents so a Resume + send still
+  // works without retyping; closeDetail clears it on navigation away.
+  if (!currentTask || currentTask.status !== 'in_progress') {
+    showToast('Agent not running');
+    return;
+  }
+  sendInputBytes(v + '\n');
+  ci.value = '';
+  // field-sizing:content handles shrink-back on supporting browsers; explicit
+  // height reset is a no-op there and a fallback elsewhere.
+  ci.style.height = '';
+}
+
+(function wireCompose() {
+  const ci = document.getElementById('compose-input');
+  const cs = document.getElementById('compose-send');
+  if (!ci || !cs) return;
+  cs.addEventListener('click', sendCompose);
+  ci.addEventListener('keydown', e => {
+    // Enter sends; Shift+Enter inserts a newline. Hardware keyboards on iPad
+    // and Bluetooth-connected iPhone keyboards both pass the Shift modifier.
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      sendCompose();
+    }
+  });
+})();
 
 // --- Service Worker ---
 if ('serviceWorker' in navigator) {
