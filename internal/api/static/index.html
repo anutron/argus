@@ -497,6 +497,22 @@ textarea.settings-input { min-height: 70px; resize: vertical; }
 .modal .radio-row { display: flex; gap: 12px; font-size: 13px; }
 .modal .radio-row label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
 
+/* Prompt viewer modal — read-only, scrollable, monospace. The body is a
+   <pre> so newlines render verbatim; word-break keeps very long URLs from
+   overflowing horizontally on narrow phone screens. min-height keeps the
+   placeholder visible (and short prompts from looking like a sliver) without
+   forcing the modal taller than its content for typical prompts. */
+.prompt-body {
+  background: var(--bg); color: var(--text);
+  font-family: ui-monospace, Menlo, monospace; font-size: 12px; line-height: 1.5;
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 10px; margin: 0;
+  white-space: pre-wrap; word-break: break-word;
+  min-height: 3em; max-height: 60vh; overflow: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.prompt-body.empty { color: var(--text-dim); font-style: italic; }
+
 /* Logs viewer */
 .logs-pane {
   background: var(--bg); color: var(--text); font-family: ui-monospace, Menlo, monospace;
@@ -950,6 +966,18 @@ textarea.settings-input { min-height: 70px; resize: vertical; }
     </div>
   </div>
 
+  <!-- Original prompt viewer. Opened from the detail-view overflow menu;
+       read-only, so no Save action — just Close. -->
+  <div class="modal-overlay" id="prompt-modal">
+    <div class="modal">
+      <h3>Original prompt</h3>
+      <pre class="prompt-body" id="prompt-modal-body"></pre>
+      <div class="modal-actions">
+        <button class="primary" onclick="closePromptModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Create Task View -->
   <div id="create-view">
     <div style="padding:16px 12px 8px"><h2 style="font-size:18px">New Task</h2></div>
@@ -1372,6 +1400,7 @@ function showOffline() {
   closeStream();
   destroyTerm();
   closeOverflowMenu();
+  closePromptModal();
   const dv = document.getElementById('detail-view');
   if (dv) { dv.classList.remove('open'); dv.style.transform = ''; }
   currentTask = null;
@@ -1529,10 +1558,16 @@ function effectiveStatus(t) {
 async function openDetail(id) {
   currentTask = tasks.find(t => t.id === id);
   if (!currentTask) return;
+  // Test hook: top-level `let` doesn't auto-attach to window, but Playwright
+  // specs need to read/mutate the active task to drive paths like the empty
+  // prompt placeholder. Same pattern as window.term/window.fitAddon.
+  window.currentTask = currentTask;
 
   // Close any prior overlay so opening a new task (via fork, create, deep
-  // link, etc.) doesn't leave the previous task's files-view stacked on top.
+  // link, etc.) doesn't leave the previous task's files-view or prompt modal
+  // stacked on top.
   closeFilesView();
+  closePromptModal();
 
   document.getElementById('tasks-view').style.display = 'none';
   document.getElementById('detail-view').classList.add('open');
@@ -1991,6 +2026,7 @@ function renderOverflowMenu() {
   }
   items.push(
     { id: 'btn-files', label: 'Files & diff', fn: openFilesView },
+    { id: 'btn-prompt', label: 'View prompt', fn: openPromptModal },
     { id: 'btn-upload', label: 'Upload files', fn: triggerUpload },
     { id: 'btn-rename', label: 'Rename', fn: renameTask },
     { id: 'btn-fork', label: 'Fork', fn: forkTask },
@@ -2191,13 +2227,38 @@ function closeDetail() {
   destroyTerm();
   closeOverflowMenu();
   closeFilesView();
+  closePromptModal();
   currentTask = null;
+  window.currentTask = null;
   const dv = document.getElementById('detail-view');
   dv.classList.remove('open');
   dv.style.transform = '';
   const header = dv.querySelector('.detail-header');
   if (header) header.classList.remove('compact');
   document.getElementById('tasks-view').style.display = 'block';
+}
+
+// --- Original Prompt Modal ---
+// Read-only viewer for the prompt the task was created with. Reads from the
+// in-memory currentTask snapshot rather than re-fetching, so it works offline
+// once the detail view has loaded. textContent (not innerHTML) keeps the
+// prompt safe against any HTML in the user's input.
+function openPromptModal() {
+  if (!currentTask) return;
+  const body = document.getElementById('prompt-modal-body');
+  const p = currentTask.prompt || '';
+  if (p) {
+    body.textContent = p;
+    body.classList.remove('empty');
+  } else {
+    body.textContent = '(no prompt — task created by name only)';
+    body.classList.add('empty');
+  }
+  document.getElementById('prompt-modal').classList.add('open');
+}
+
+function closePromptModal() {
+  document.getElementById('prompt-modal').classList.remove('open');
 }
 
 // --- Files & Diff View ---
@@ -2594,6 +2655,7 @@ function switchTab(tab) {
   dv.querySelector('.detail-header')?.classList.remove('compact');
   closeOverflowMenu();
   closeFilesView();
+  closePromptModal();
   closeStream();
   destroyTerm();
   if (tab === 'tasks') refresh();
