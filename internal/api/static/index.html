@@ -1090,9 +1090,17 @@ function onTermTouchEnd() {
   // enough to commit to scroll. The "had to hold my finger in one spot
   // to start scrolling" symptom. Deferring focus to touchend with the
   // scroll-vs-tap discriminator removes the hesitation entirely.
+  //
+  // Additionally gate on termIsAtBottom(): tapping while the user is
+  // reading scrollback shouldn't pull up the soft keyboard. This also
+  // covers the iOS race where a flick scroll's first `scroll` event
+  // hasn't fired by the time `touchend` lands — isTermScrolling is
+  // still false, so the swipe would otherwise be misclassified as a
+  // tap and pop the keyboard. After any upward scroll the viewport
+  // is no longer at the bottom, so the bottom check rejects it.
   const wasTap = !isTermScrolling;
   if (wasTap) {
-    if (term) try { term.focus(); } catch(e) {}
+    if (term && termIsAtBottom()) try { term.focus(); } catch(e) {}
     // No scroll happened, so nothing else will trigger a drain — kick
     // it now so a pending viewport sync from earlier isn't stuck queued.
     drainIfSettled();
@@ -1547,7 +1555,11 @@ function setupTerm() {
   // Force a layout pass before fit \u2014 addon reads computed sizes.
   requestAnimationFrame(() => {
     fit();
-    term.focus();
+    // Same at-bottom gate as onTermTouchEnd: focusing pops the iOS soft
+    // keyboard, and we don't want that on re-mount when the user is in
+    // scrollback. On a fresh mount viewportY === baseY === 0, so this is
+    // a no-op for the normal path.
+    if (termIsAtBottom()) term.focus();
   });
   // Wire scroll/scrollend on `.xterm-viewport` directly (the actual scrollable
   // element) rather than xterm's `term.onScroll`. The native `scrollend` event
