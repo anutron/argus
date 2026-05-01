@@ -22,6 +22,7 @@ go build -o argus ./cmd/argus/    # build binary
 ## Test-Driven Development
 
 Follow Red-Green-Refactor as the default workflow:
+
 1. **Red** — Write a failing test first using `internal/testutil` assertions
 2. **Green** — Write the minimum code to make it pass
 3. **Refactor** — Clean up while keeping tests green
@@ -29,6 +30,7 @@ Follow Red-Green-Refactor as the default workflow:
 Use `make test-watch` for continuous feedback. Use `make test-pkg` for focused iteration on a single package.
 
 **Assertions** — use `internal/testutil` (not raw `if got != want`):
+
 ```go
 import "github.com/drn/argus/internal/testutil"
 
@@ -82,7 +84,6 @@ All table-driven tests must use `t.Run` subtests. Guard slow tests with `testing
 - `internal/gitutil/` — Git operations, diff parsing, changed files. Pure Go with no UI dependencies. Used by tui for git status, file diffs, and worktree management.
 - `internal/spinner/` — Reusable spinner animation definitions. Each `Spinner` has a `Style`, `Label`, `Frames` (rune slice), and `TickInterval`. Built-in styles: Progress (nerdfont ee06–ee0b, 100ms), Dots (braille dots, 100ms), Braille (braille pattern, 100ms), Classic (ASCII, 150ms). Configurable via `ui.spinner` setting. `model.SetActiveSpinner()` switches at runtime; `model.SpinnerFrame(tick)` delegates to the active spinner.
 - `internal/skills/` — Skill loading for autocomplete. Scans `~/.claude/skills/` and project-specific skill directories.
-- `internal/vault/` — Vault file watcher for auto-task creation. Uses fsnotify to watch the Argus vault directory for new `.md` files, auto-creates tasks via `HeadlessCreateTask`. Debounces iCloud sync. Wired into daemon lifecycle.
 - `internal/api/` — HTTP REST API + mobile PWA for remote control on port 7743. Binds `0.0.0.0` for Tailscale access. Port-probing pattern from MCP server. Surface area:
   - **Tasks**: list/create/get/stop/resume/delete/archive/unarchive/rename/fork/status, sessions stop-all
   - **Terminal**: `/output`, `/input`, SSE `/stream`, `/size`, `/resize` — feeds xterm.js in the SPA
@@ -94,7 +95,7 @@ All table-driven tests must use `t.Run` subtests. Guard slow tests with `testing
   - **PWA**: vendored xterm.js + addon-fit, `manifest.webmanifest`, service worker (cache-first shell, network-only `/api`), apple-touch-icon, icons 192/512
 - `internal/push/` — `Manager` wraps `webpush-go` with VAPID key persistence (DB `config` table), per-task throttling (`lastSent` map, pruned via `ForgetTask` from idleWatcher), expired-subscription auto-pruning on HTTP 410 from push service.
 - `cmd/argus-test-server/` — isolated API harness for Playwright. Sets `HOME=$tempdir`, seeds a `bash`-backed task that PTY-echoes input. Exposes `/test/reset` on `port+10` for between-spec state cleanup. Used by `web-tests/` Playwright project (43 specs).
-- `internal/daemon/headless.go` — Headless task creation (worktree + DB + session start) without TUI. Shared by vault watcher and HTTP API via `TaskCreator` function injection.
+- `internal/daemon/headless.go` — Headless task creation (worktree + DB + session start) without TUI. Shared by HTTP API and MCP via `TaskCreator` function injection.
 
 **Key pattern:** Sub-views are custom `tview.Box` widgets with `Draw(screen tcell.Screen)` methods. Async updates via `tapp.QueueUpdateDraw()` from the tick goroutine. Key routing via `tapp.SetInputCapture()`. **Every custom widget that accepts text input must implement `PasteHandler()`** — tview's bracket paste bypasses `InputCapture` entirely, so widgets without a `PasteHandler()` silently drop pasted text. For PTY-backed widgets, wrap the pasted text in bracket paste sequences (`\x1b[200~`/`\x1b[201~`).
 
@@ -104,7 +105,7 @@ All table-driven tests must use `t.Run` subtests. Guard slow tests with `testing
 
 **Daemon pattern:** The daemon (`argus daemon`) owns the Runner and PTY sessions. The TUI connects via Unix socket (`~/.argus/daemon.sock`). First byte on each connection selects the protocol: 'R' for JSON-RPC (request/response), 'S' for output streaming (raw bytes). The TUI's `Client` implements `SessionProvider` so the UI code is identical whether running in-process or via daemon. Sessions survive TUI restarts — the daemon keeps PTY fds alive until explicit stop or shutdown. The TUI auto-starts the daemon if none is running: `autoStartDaemon()` forks the current binary with `Setsid` for process group detachment, then polls the socket until ready (50ms intervals, 3s timeout). Falls back to in-process mode if auto-start fails, with a warning shown in the Settings tab.
 
-**Task/worktree lifecycle:** All fresh-task creation routes through `agent.CreateAndStart` (headless vault watcher + HTTP API + MCP via `daemon.HeadlessCreateTask`; TUI new-task form, launch-todo, reviews, fork directly). It runs in a single goroutine and is fully transactional: CreateWorktree → optional `OnWorktreeCreated` hook (fork context files) → `db.Add` → SessionID generation → `runner.Start` → flip to InProgress. Each side-effecting step registers a LIFO compensating cleanup, so any failure unwinds every prior step — no orphan worktrees, branches, or ghost DB rows. On name conflict, `CreateWorktree` auto-suffixes with `-1`, `-2`, etc. `startSession` in the TUI is reserved for *existing-task restart* (Enter-to-restart, auto-start on agent-view entry); on failure it reverts status but preserves the row, because the task already existed. On delete/destroy: stops agent → `agent.RemoveWorktreeAndBranch(path, branch, repoDir)` removes worktree (via `git worktree remove` from repoDir) → deletes local + remote branch → removes from DB.
+**Task/worktree lifecycle:** All fresh-task creation routes through `agent.CreateAndStart` (HTTP API + MCP via `daemon.HeadlessCreateTask`; TUI new-task form, reviews, fork directly). It runs in a single goroutine and is fully transactional: CreateWorktree → optional `OnWorktreeCreated` hook (fork context files) → `db.Add` → SessionID generation → `runner.Start` → flip to InProgress. Each side-effecting step registers a LIFO compensating cleanup, so any failure unwinds every prior step — no orphan worktrees, branches, or ghost DB rows. On name conflict, `CreateWorktree` auto-suffixes with `-1`, `-2`, etc. `startSession` in the TUI is reserved for _existing-task restart_ (Enter-to-restart, auto-start on agent-view entry); on failure it reverts status but preserves the row, because the task already existed. On delete/destroy: stops agent → `agent.RemoveWorktreeAndBranch(path, branch, repoDir)` removes worktree (via `git worktree remove` from repoDir) → deletes local + remote branch → removes from DB.
 
 **Git status pattern:** Git operations (worktree discovery, diff, status) must **never** run synchronously on the UI thread. Git commands run in background goroutines and deliver results via `QueueUpdateDraw` callbacks. Resolved paths are cached to avoid repeated lookups.
 
@@ -129,11 +130,13 @@ Non-obvious invariants and gotchas are in `context/knowledge/gotchas/`. **Read t
 ### Maintaining Key Learnings
 
 **What belongs in gotcha files:**
+
 - Invariants that caused bugs when violated (e.g., "must do X before Y or Z breaks")
 - Non-obvious ordering requirements, race conditions, platform quirks
 - Gotchas where the obvious approach silently fails
 
 **What does NOT belong:**
+
 - Architecture descriptions (what code does) — put in the Architecture section above
 - Feature descriptions (UI layout, key bindings, panel structure) — discoverable from code
 - Development rules (testing, logging, documentation) — put in dedicated sections of CLAUDE.md
@@ -166,7 +169,7 @@ Non-obvious invariants and gotchas are in `context/knowledge/gotchas/`. **Read t
 - **CRITICAL: Tests must NEVER connect to or affect the live argus daemon.** Use `agent.NewRunner(nil)` (not a real daemon client). Never dial the Unix socket (`~/.argus/daemon.sock`). Never send signals to the daemon PID.
 - **Any change to tview screen setup (SetScreen, EnablePaste, EnableMouse, screen wrapping) must include a SimulationScreen integration test** verifying the feature works end-to-end. See `internal/tui/smoke_test.go` for the pattern: `simApp(t)` creates a `lazyScreen`-wrapped SimulationScreen with correct Enable ordering; `wireApp(t, app)` wires a full `App` to a SimulationScreen for smoke tests; `runApp(t, app)` manages the event loop lifecycle.
 - **Major UI paths (tab switching, modal open/close, paste, agent view enter/exit) must have smoke tests** in `smoke_test.go` that exercise the real tview event loop. These catch setup-ordering bugs and event routing regressions that unit tests on individual handlers miss.
-- **Every page wrapper or layout container with non-interactive child panels must have a `MouseHandler` that guards `setFocus`.** tview's default `Box.MouseHandler()` steals focus on click. Non-interactive panels (no `InputHandler`) silently drop all keyboard input when focused. The fix is to wrap `setFocus` in the page's `MouseHandler` to always redirect to the interactive panel. See `TaskPage.MouseHandler()` and `ToDosView.MouseHandler()` for the pattern. **Any new page wrapper must include a `TestSmoke_Click*` test** that injects a mouse click on a non-interactive area and verifies focus stays on the intended widget.
+- **Every page wrapper or layout container with non-interactive child panels must have a `MouseHandler` that guards `setFocus`.** tview's default `Box.MouseHandler()` steals focus on click. Non-interactive panels (no `InputHandler`) silently drop all keyboard input when focused. The fix is to wrap `setFocus` in the page's `MouseHandler` to always redirect to the interactive panel. See `TaskPage.MouseHandler()` for the pattern. **Any new page wrapper must include a `TestSmoke_Click*` test** that injects a mouse click on a non-interactive area and verifies focus stays on the intended widget.
 
 ## Planned but Not Yet Implemented
 
