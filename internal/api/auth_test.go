@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -8,8 +9,12 @@ import (
 	"testing"
 
 	"github.com/drn/argus/internal/db"
+	"github.com/drn/argus/internal/push"
 	"github.com/drn/argus/internal/testutil"
 )
+
+// tlsState is a minimal placeholder used to flip r.TLS != nil in tests.
+var tlsState = tls.ConnectionState{}
 
 func TestGenerateToken(t *testing.T) {
 	t.Run("generates hex token", func(t *testing.T) {
@@ -63,7 +68,7 @@ func TestLoadOrCreateToken(t *testing.T) {
 
 func TestAuthMiddleware(t *testing.T) {
 	token := "test-secret-token"
-	handler := authMiddleware(token, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := authMiddleware(token, nil, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
 	}), "/public")
@@ -131,7 +136,7 @@ func TestAuthMiddleware(t *testing.T) {
 
 	t.Run("master token tags request with X-Argus-Auth=master", func(t *testing.T) {
 		var seenAuth string
-		h := authMiddleware(token, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := authMiddleware(token, nil, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			seenAuth = r.Header.Get("X-Argus-Auth")
 			w.WriteHeader(http.StatusOK)
 		}))
@@ -152,7 +157,7 @@ func TestAuthMiddleware_DeviceToken(t *testing.T) {
 	testutil.NoError(t, err)
 
 	var seenAuth string
-	handler := authMiddleware(master, d, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := authMiddleware(master, d, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seenAuth = r.Header.Get("X-Argus-Auth")
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -200,7 +205,7 @@ func TestAuthMiddleware_DeviceToken(t *testing.T) {
 	})
 
 	t.Run("master + nil DB still works", func(t *testing.T) {
-		h := authMiddleware(master, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := authMiddleware(master, nil, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 		}))
 		req := httptest.NewRequest("GET", "/api/status", nil)
@@ -208,5 +213,120 @@ func TestAuthMiddleware_DeviceToken(t *testing.T) {
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, req)
 		testutil.Equal(t, w.Code, http.StatusOK)
+	})
+}
+
+func TestVAPIDOriginFromRequest(t *testing.T) {
+	cases := []struct {
+		name       string
+		origin     string
+		host       string
+		xfp        string
+		remoteAddr string
+		tlsOK      bool
+		want       string
+	}{
+		{name: "https origin header", origin: "https://host.tailnet.ts.net", want: "https://host.tailnet.ts.net"},
+		{name: "https origin with path stripped", origin: "https://host.tailnet.ts.net/api/x", want: "https://host.tailnet.ts.net"},
+		{name: "https origin with userinfo stripped", origin: "https://user:pass@host.tailnet.ts.net/api", want: "https://host.tailnet.ts.net"},
+		{name: "http origin rejected", origin: "http://host.lan", want: ""},
+		{name: "xforwarded https from loopback accepted", host: "host.tailnet.ts.net", xfp: "https", remoteAddr: "127.0.0.1:51234", want: "https://host.tailnet.ts.net"},
+		{name: "xforwarded https from remote rejected", host: "host.lan", xfp: "https", remoteAddr: "192.168.1.5:51234", want: ""},
+		{name: "fallback to TLS", host: "host.tailnet.ts.net", tlsOK: true, want: "https://host.tailnet.ts.net"},
+		{name: "plain http rejected", host: "host.lan", want: ""},
+		{name: "no host", want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/api/x", nil)
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			if tc.host != "" {
+				req.Host = tc.host
+			} else {
+				req.Host = ""
+			}
+			if tc.xfp != "" {
+				req.Header.Set("X-Forwarded-Proto", tc.xfp)
+			}
+			if tc.remoteAddr != "" {
+				req.RemoteAddr = tc.remoteAddr
+			}
+			if tc.tlsOK {
+				req.TLS = &tlsState
+			}
+			testutil.Equal(t, vapidOriginFromRequest(req), tc.want)
+		})
+	}
+}
+
+func TestRecordVAPIDOrigin_UpdatesManager(t *testing.T) {
+	d, err := db.OpenInMemory()
+	testutil.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	pm, err := push.New(d)
+	testutil.NoError(t, err)
+
+	req := httptest.NewRequest("GET", "/api/x", nil)
+	req.Header.Set("Origin", "https://host.tailnet.ts.net")
+	recordVAPIDOrigin(pm, req)
+
+	testutil.Equal(t, pm.Subject(), "https://host.tailnet.ts.net")
+}
+
+func TestRecordVAPIDOrigin_NilManagerSafe(t *testing.T) {
+	req := httptest.NewRequest("GET", "/api/x", nil)
+	req.Header.Set("Origin", "https://host.tailnet.ts.net")
+	recordVAPIDOrigin(nil, req) // must not panic
+}
+
+// TestAuthMiddleware_SetsVAPIDSubject pins the wiring that makes the bug
+// fix work end-to-end: an authenticated request through the real
+// authMiddleware must update the push manager's subject. Without this,
+// re-ordering recordVAPIDOrigin out of the auth path (or above the auth
+// gate) would silently regress without a single existing test failing.
+func TestAuthMiddleware_SetsVAPIDSubject(t *testing.T) {
+	d, err := db.OpenInMemory()
+	testutil.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+	pm, err := push.New(d)
+	testutil.NoError(t, err)
+
+	const tok = "test-master-token"
+	handler := authMiddleware(tok, d, pm, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	t.Run("authed request sets subject", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/status", nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Origin", "https://host.tailnet.ts.net")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusOK)
+		testutil.Equal(t, pm.Subject(), "https://host.tailnet.ts.net")
+	})
+
+	t.Run("unauthed request does not set subject", func(t *testing.T) {
+		// Reset by setting a known sentinel via a successful authed call
+		// would just confirm the previous subtest's outcome. Easier: open a
+		// fresh manager on a fresh DB and confirm the unauthed path leaves
+		// it empty.
+		d2, err := db.OpenInMemory()
+		testutil.NoError(t, err)
+		t.Cleanup(func() { _ = d2.Close() })
+		pm2, err := push.New(d2)
+		testutil.NoError(t, err)
+		h := authMiddleware(tok, d2, pm2, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+
+		req := httptest.NewRequest("GET", "/api/status", nil)
+		req.Header.Set("Origin", "https://attacker.example") // no Authorization
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusUnauthorized)
+		testutil.Equal(t, pm2.Subject(), "")
 	})
 }
