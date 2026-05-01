@@ -27,7 +27,7 @@ test.describe('compose bar', () => {
     }
   });
 
-  test('Send button forwards value + newline to /input and clears textarea', async ({ page }, testInfo) => {
+  test('Send button forwards value + CR to /input and clears textarea', async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== 'iphone', 'compose bar is touch-gated');
     await login(page);
 
@@ -39,7 +39,9 @@ test.describe('compose bar', () => {
     );
     await page.locator('#compose-send').click();
     const req = await inputReq;
-    expect(req.postData()).toBe('hello world\n');
+    // \r (CR), not \n — raw-terminal Enter key. \n is interpreted as an
+    // embedded newline by Claude Code and would not submit the prompt.
+    expect(req.postData()).toBe('hello world\r');
 
     await expect(page.locator('#compose-input')).toHaveValue('');
   });
@@ -65,7 +67,7 @@ test.describe('compose bar', () => {
     );
     await page.keyboard.press('Enter');
     const req = await inputReq;
-    expect(req.postData()).toBe('one\ntwo\n');
+    expect(req.postData()).toBe('one\ntwo\r');
 
     await expect(ci).toHaveValue('');
   });
@@ -146,7 +148,7 @@ test.describe('compose bar', () => {
     );
     await ci.press('Enter');
     const req = await inputReq;
-    expect(req.postData()).toBe('hello\n');
+    expect(req.postData()).toBe('hello\r');
   });
 
   test('skill autocomplete: tapping a dropdown item inserts and closes', async ({ page }, testInfo) => {
@@ -205,6 +207,25 @@ test.describe('compose bar', () => {
     await expect(dd).not.toHaveClass(/open/);
     // Escape must not clear the typed prefix — the user can keep editing.
     await expect(ci).toHaveValue('/r');
+  });
+
+  test('tap on terminal focuses compose-input (not xterm helper textarea)', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'iphone', 'compose bar is touch-gated');
+    await login(page);
+
+    // Start with focus elsewhere so the assertion is meaningful — login leaves
+    // focus on the helper textarea (term.focus() runs in setupTerm's rAF).
+    await page.locator('body').evaluate((el: HTMLElement) => el.focus());
+
+    // Synthesize a tap (touchstart + touchend with no movement) on #term —
+    // a real click on iPhone fires touch events, not mouse events.
+    await page.locator('#term').dispatchEvent('touchstart', { touches: [{ clientX: 100, clientY: 100 }] });
+    await page.locator('#term').dispatchEvent('touchend', { changedTouches: [{ clientX: 100, clientY: 100 }] });
+
+    // After a tap, focus must land on the compose textarea so iOS dictation,
+    // third-party keyboards, and Wispr Flow have a real visible target.
+    const focusedId = await page.evaluate(() => document.activeElement?.id);
+    expect(focusedId).toBe('compose-input');
   });
 
   test('compose bar hidden after closing the detail view', async ({ page }, testInfo) => {
