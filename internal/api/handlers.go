@@ -737,6 +737,31 @@ func (s *Server) handleStreamOutput(w http.ResponseWriter, r *http.Request) {
 	sess.AddWriter(cw)
 	defer sess.RemoveWriter(cw)
 
+	// Subscribe to agent-staged clipboard updates for this task. Any change
+	// (set or clear) queues a `clipboard` SSE event. The subscriber callback
+	// runs on the goroutine that called Set/Clear — must not block, so a
+	// buffered channel + drop-on-full keeps the producer fast. text and
+	// present travel as a single struct so a partial drop can never desync
+	// the two halves (an earlier two-channel design could pair a fresh text
+	// with a stale present flag during bursty updates).
+	clipCh := make(chan clipEvent, 16)
+	var unsubClip func()
+	if s.clipboard != nil {
+		unsubClip = s.clipboard.Subscribe(id, func(text string) {
+			select {
+			case clipCh <- clipEvent{text: text, present: text != ""}:
+			default:
+			}
+		})
+		defer unsubClip()
+		// Emit current state on connect so a freshly-opened tab catches a
+		// payload that was staged before the SSE was established.
+		if text, ok := s.clipboard.Get(id); ok {
+			fmt.Fprintf(w, "event: clipboard\ndata: %s\n\n", encodeClipboardEvent(text, true)) //nolint:errcheck
+			flusher.Flush()
+		}
+	}
+
 	keepalive := time.NewTicker(30 * time.Second)
 	defer keepalive.Stop()
 
@@ -751,6 +776,9 @@ func (s *Server) handleStreamOutput(w http.ResponseWriter, r *http.Request) {
 			encoded := base64.StdEncoding.EncodeToString(data)
 			fmt.Fprintf(w, "data: %s\n\n", encoded)
 			flusher.Flush()
+		case ev := <-clipCh:
+			fmt.Fprintf(w, "event: clipboard\ndata: %s\n\n", encodeClipboardEvent(ev.text, ev.present)) //nolint:errcheck
+			flusher.Flush()
 		case <-keepalive.C:
 			fmt.Fprintf(w, ": ping\n\n")
 			flusher.Flush()
@@ -758,6 +786,26 @@ func (s *Server) handleStreamOutput(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// clipEvent bundles the text and presence flag for a clipboard SSE update so
+// they travel through a single channel and can never desync under burst load.
+type clipEvent struct {
+	text    string
+	present bool
+}
+
+// encodeClipboardEvent renders the JSON body of a clipboard SSE event.
+// `{"text":"…"}` when a payload is present, `{"cleared":true}` otherwise.
+func encodeClipboardEvent(text string, present bool) string {
+	if !present {
+		return `{"cleared":true}`
+	}
+	body, err := json.Marshal(map[string]string{"text": text})
+	if err != nil {
+		return `{"cleared":true}`
+	}
+	return string(body)
 }
 
 // channelWriter implements io.Writer by sending copies of written data to a
