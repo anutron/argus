@@ -1581,28 +1581,38 @@ function focusInputOrTerm() {
   if (term) try { term.focus(); } catch(e) {}
 }
 
-function onTermTouchStart() { termTouching = true; }
-function onTermTouchEnd() {
+// Touchstart coordinates, captured so onTermTouchEnd can distinguish a tap
+// (finger barely moved) from a swipe/flick (finger moved past the threshold).
+// This is more reliable than `!isTermScrolling` alone — on a flick scroll the
+// first `scroll` event sometimes hasn't dispatched by touchend (iOS scroll
+// throttling), so isTermScrolling stays false and the gesture would be
+// misclassified as a tap. The 10px threshold matches iOS's own tap tolerance.
+let touchStartX = 0;
+let touchStartY = 0;
+const TAP_MOVE_THRESHOLD_PX = 10;
+
+function onTermTouchStart(e) {
+  termTouching = true;
+  const t = e && e.touches && e.touches[0];
+  if (t) { touchStartX = t.clientX; touchStartY = t.clientY; }
+}
+function onTermTouchEnd(e) {
   termTouching = false;
-  // Tap-to-focus: only focus the term if NO scroll happened during this
-  // touch — i.e., the user tapped, didn't swipe. Focusing on touchstart
-  // (the previous approach) put iOS into "is this a tap on a focusable
-  // input?" mode, which delayed scroll engagement until the user either
-  // held still long enough for iOS to give up on the tap OR moved far
-  // enough to commit to scroll. The "had to hold my finger in one spot
-  // to start scrolling" symptom. Deferring focus to touchend with the
-  // scroll-vs-tap discriminator removes the hesitation entirely.
-  //
-  // Additionally gate on termIsAtBottom(): tapping while the user is
-  // reading scrollback shouldn't pull up the soft keyboard. This also
-  // covers the iOS race where a flick scroll's first `scroll` event
-  // hasn't fired by the time `touchend` lands — isTermScrolling is
-  // still false, so the swipe would otherwise be misclassified as a
-  // tap and pop the keyboard. After any upward scroll the viewport
-  // is no longer at the bottom, so the bottom check rejects it.
-  const wasTap = !isTermScrolling;
+  // Tap-to-focus requires BOTH `!isTermScrolling` AND coord-delta below the
+  // threshold. Either alone has a known failure mode (isTermScrolling lags on
+  // iOS flick scroll-event throttling; coord-delta misses long-hold gestures
+  // that scrolled), so we require both. No `termIsAtBottom()` gate — see the
+  // tap-to-focus entry in gotchas/web-remote.md for why.
+  let movedFar = false;
+  const t = e && e.changedTouches && e.changedTouches[0];
+  if (t) {
+    const dx = t.clientX - touchStartX;
+    const dy = t.clientY - touchStartY;
+    movedFar = (dx * dx + dy * dy) > (TAP_MOVE_THRESHOLD_PX * TAP_MOVE_THRESHOLD_PX);
+  }
+  const wasTap = !isTermScrolling && !movedFar;
   if (wasTap) {
-    if (termIsAtBottom()) focusInputOrTerm();
+    focusInputOrTerm();
     // No scroll happened, so nothing else will trigger a drain — kick
     // it now so a pending viewport sync from earlier isn't stuck queued.
     drainIfSettled();
@@ -1620,6 +1630,11 @@ function onTermTouchCancel() {
   // destroyTerm. Force the gate open so the queue can drain.
   termTouching = false;
   isTermScrolling = false;
+  // Zero touch coords too — if a fresh touch arrives without a usable
+  // `touches[0]`, onTermTouchEnd would otherwise diff against the
+  // cancelled gesture's start point.
+  touchStartX = 0;
+  touchStartY = 0;
   clearTimeout(scrollendFallbackTimer);
   scrollendFallbackTimer = null;
   drainIfSettled();
@@ -2537,7 +2552,8 @@ document.getElementById('jump-bottom').addEventListener('click', () => {
   if (!term) return;
   term.scrollToBottom();
   flushPending();
-  term.focus();
+  // Prefer compose-input on touch; see focusInputOrTerm.
+  focusInputOrTerm();
   updateJumpButton();
 });
 
