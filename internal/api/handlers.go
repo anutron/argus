@@ -354,11 +354,19 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// StartOrReattach handles the desync case where the daemon still owns a
+	// live PTY but the DB row drifted off in_progress (manual edit,
+	// post-reconcile state). Calling Start directly there would fail with
+	// "session already exists for task X". On reattach we re-sync the row
+	// to in_progress so the PWA can attach the terminal stream and other
+	// observers see consistent state.
 	cfg := s.db.Config()
 	resume := task.SessionID != ""
+	prevStatus := task.Status
 
-	sess, err := s.runner.Start(task, cfg, 24, 80, resume)
+	sess, reattached, err := s.runner.StartOrReattach(task, cfg, 24, 80, resume)
 	if err != nil {
+		uxlog.Log("[api] resume: start failed task=%s status=%s err=%v", id, prevStatus, err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -367,10 +375,20 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 	task.AgentPID = sess.PID()
 	s.db.Update(task) //nolint:errcheck
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	if reattached {
+		uxlog.Log("[api] resume: healed task=%s pre_status=%s pid=%d", id, prevStatus, task.AgentPID)
+	} else {
+		uxlog.Log("[api] resume: started task=%s pid=%d resume=%t", id, task.AgentPID, resume)
+	}
+
+	resp := map[string]any{
 		"status": "resumed",
 		"pid":    task.AgentPID,
-	})
+	}
+	if reattached {
+		resp["healed"] = true
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // --- Delete Task ---
