@@ -121,14 +121,16 @@ func (s *Server) handlePushTest(w http.ResponseWriter, r *http.Request) {
 // Pulled out as a struct so idleWatcherTick can be exercised in unit tests
 // without spinning up a real ticker.
 type idleWatcherState struct {
-	idleNow    map[string]bool // taskID -> last seen idle?
-	seenBefore map[string]bool // taskID -> have we observed this session on a prior tick?
+	idleNow    map[string]bool      // taskID -> last seen idle?
+	seenBefore map[string]bool      // taskID -> have we observed this session on a prior tick?
+	pushedAt   map[string]time.Time // taskID -> wall-clock time we last fired an idle push
 }
 
 func newIdleWatcherState() *idleWatcherState {
 	return &idleWatcherState{
 		idleNow:    make(map[string]bool),
 		seenBefore: make(map[string]bool),
+		pushedAt:   make(map[string]time.Time),
 	}
 }
 
@@ -159,16 +161,20 @@ func (s *Server) idleWatcher() {
 // returns whether the watcher should fire a push for an idle transition.
 // Deterministic and I/O-free (the only side effect is mutating the passed
 // state) so the firing logic can be unit-tested without wiring up a real
-// runner + session + db. It encodes two invariants:
+// runner + session + db. It encodes three invariants:
 //
 //   - First observation of a session never fires: prevents spurious push
 //     when an already-idle session enters the watcher's view (e.g. fresh
 //     idleWatcher start with running sessions present).
-//   - We deliberately do NOT clear the throttle on busy transition. Long-
-//     idle agents emit incidental output (cursor redraws, status updates)
-//     that flips IsIdle false→true, which would bypass the 5-min throttle
-//     and spam push for stale tasks the user already saw.
-func shouldFireIdlePush(state *idleWatcherState, id string, isIdle bool) bool {
+//   - Only busy→idle transitions fire (idle→idle and busy→busy are silent).
+//   - One push per work cycle: after a push, no further pushes fire for the
+//     same task until input arrives via WriteInput. lastInputAt is the
+//     session's input timestamp; a push is suppressed if a previous push
+//     already covered this idle period (no input since). This is the
+//     primary defence against repeat pushes for a stale long-idle agent
+//     whose incidental output (heartbeats, cursor redraws) keeps flipping
+//     IsIdle false→true.
+func shouldFireIdlePush(state *idleWatcherState, id string, isIdle bool, lastInputAt time.Time, now time.Time) bool {
 	if !state.seenBefore[id] {
 		state.seenBefore[id] = true
 		state.idleNow[id] = isIdle
@@ -176,7 +182,16 @@ func shouldFireIdlePush(state *idleWatcherState, id string, isIdle bool) bool {
 	}
 	wasIdle := state.idleNow[id]
 	state.idleNow[id] = isIdle
-	return isIdle && !wasIdle
+	if !isIdle || wasIdle {
+		return false
+	}
+	if pushedAt, ok := state.pushedAt[id]; ok && !lastInputAt.After(pushedAt) {
+		// Already pushed for this work cycle and no input has arrived since.
+		// The transition is just an output blip on a stale idle session.
+		return false
+	}
+	state.pushedAt[id] = now
+	return true
 }
 
 // idleWatcherTick runs one iteration of the idle-watch loop. Extracted from
@@ -191,13 +206,24 @@ func (s *Server) idleWatcherTick(state *idleWatcherState) {
 		idleSet[id] = true
 	}
 
+	now := time.Now()
 	for _, id := range running {
 		seen[id] = true
-		// Use the snapshot from RunningAndIdle so we don't re-acquire the
-		// runner lock per session — and so the (running, idle) view stays
-		// internally consistent. A second IsIdle() call here would open a
-		// TOCTOU window between the snapshot and the per-task check.
-		if !shouldFireIdlePush(state, id, idleSet[id]) {
+		// Idle bit comes from the RunningAndIdle snapshot above so the
+		// (running, idle) view stays internally consistent within this tick.
+		// LastInput needs a fresh runner.Get because it isn't in the snapshot
+		// — that's a small TOCTOU window: the session can exit between the
+		// snapshot and Get. Get returns nil on exit, lastInput stays the
+		// zero time, and the session-exited cleanup below prunes the
+		// watcher state on the next tick. Net effect: zero lastInput on a
+		// dying session can't satisfy the re-arm condition (it's never
+		// strictly after a recorded pushedAt), so the worst case is one
+		// suppressed push for a session about to vanish.
+		var lastInput time.Time
+		if sess := s.runner.Get(id); sess != nil {
+			lastInput = sess.LastInput()
+		}
+		if !shouldFireIdlePush(state, id, idleSet[id], lastInput, now) {
 			continue
 		}
 		task, err := s.db.Get(id)
@@ -213,16 +239,18 @@ func (s *Server) idleWatcherTick(state *idleWatcherState) {
 			body = "Ready for review"
 		}
 		uxlog.Log("[push] idle transition task=%s name=%q", id, name)
-		s.push.Notify("idle:"+id, name, body, id)
+		// Empty throttle key: shouldFireIdlePush is the sole gate. See
+		// context/knowledge/gotchas/web-remote.md (Web Push / VAPID) for
+		// why the old "idle:<id>" 5-min throttle was removed.
+		s.push.Notify("", name, body, id)
 	}
 
-	// Drop entries for sessions that exited; also tell the push manager
-	// to forget throttle entries for them so the lastSent map doesn't grow.
+	// Drop entries for sessions that exited.
 	for id := range state.idleNow {
 		if !seen[id] {
 			delete(state.idleNow, id)
 			delete(state.seenBefore, id)
-			s.push.ForgetTask(id)
+			delete(state.pushedAt, id)
 		}
 	}
 }

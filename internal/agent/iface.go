@@ -2,6 +2,7 @@ package agent
 
 import (
 	"io"
+	"time"
 
 	"github.com/drn/argus/internal/app/agentview"
 	"github.com/drn/argus/internal/config"
@@ -48,6 +49,18 @@ type SessionHandle interface {
 	RecentOutputTail(n int) []byte
 	TotalWritten() uint64
 	IsIdle() bool
+	// LastInput is the wall-clock time of the most recent WriteInput call,
+	// or zero if no input has ever been written. Used by the idle-push watcher
+	// to gate "task done" notifications: a busy→idle transition only fires a
+	// push if input has arrived since the last push, so stale long-idle
+	// sessions emitting incidental output do not re-notify.
+	//
+	// Process-boundary note: the watcher runs inside the daemon process and
+	// reads this off the in-process *agent.Session. RemoteSession (the
+	// daemon-client implementation in TUI processes) tracks its own local
+	// timestamp so the interface contract holds, but no watcher ever reads
+	// that value — it exists only to satisfy SessionHandle.
+	LastInput() time.Time
 	Alive() bool
 	PTYSize() (cols, rows int)
 	// InitialPTYSize returns the PTY dimensions the session was started with,
