@@ -119,6 +119,37 @@ test.describe('key bar', () => {
     await expect(ci).toHaveValue('hello');
   });
 
+  // `.click()` synthesizes a mouse event and bypasses the touchstart handler.
+  // `.tap()` dispatches a real touchstart → touchend pair (the synthetic click
+  // is suppressed by our `preventDefault()` on touchend). Per the Touch Events
+  // spec, calling `preventDefault()` on touchstart ALSO suppresses the
+  // synthetic click, so any handler that relies on `click` after
+  // `touchstart.preventDefault()` is dead on real iOS. These specs lock in the
+  // touchend-driven path; if the action ever moves back to `click`, they fail.
+  test('TAP on toggle reveals key bar (real touch sequence)', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'iphone', 'key bar is touch-gated');
+    await login(page);
+    const bar = page.locator('#key-bar');
+    await expect(bar).not.toHaveClass(/show/);
+    await page.locator('#compose-keybar-toggle').tap();
+    await expect(bar).toHaveClass(/show/);
+  });
+
+  test('TAP on a key sends bytes (real touch sequence)', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'iphone', 'key bar is touch-gated');
+    await login(page);
+    await page.locator('#compose-keybar-toggle').tap();
+    await expect(page.locator('#key-bar')).toHaveClass(/show/);
+
+    const inputReq = page.waitForRequest(req =>
+      req.url().includes('/input') && req.method() === 'POST',
+      { timeout: 3000 }
+    );
+    await page.locator('#key-bar button[data-keybar="esc"]').tap();
+    const req = await inputReq;
+    expect(req.postData()).toBe('\x1b');
+  });
+
   test('stopped task: key tap toasts and does not POST', async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== 'iphone', 'key bar is touch-gated');
     await login(page);
@@ -135,6 +166,26 @@ test.describe('key bar', () => {
       if (req.url().includes('/input') && req.method() === 'POST') posted = true;
     });
     await page.locator('#key-bar button[data-keybar="esc"]').click();
+
+    await expect(page.locator('.toast')).toBeVisible();
+    await expect(page.locator('.toast')).toContainText('Agent not running');
+    expect(posted).toBe(false);
+  });
+
+  // The guard lives inside the shared `fn` closure, so click and touchend
+  // paths both go through it — but a `.tap()` variant locks that in. If the
+  // guard ever moves to a path-specific spot, this spec fails.
+  test('stopped task: key TAP also toasts and does not POST', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'iphone', 'key bar is touch-gated');
+    await login(page);
+    await page.locator('#compose-keybar-toggle').tap();
+    await page.evaluate(() => { (window as any).currentTask.status = 'complete'; });
+
+    let posted = false;
+    page.on('request', req => {
+      if (req.url().includes('/input') && req.method() === 'POST') posted = true;
+    });
+    await page.locator('#key-bar button[data-keybar="esc"]').tap();
 
     await expect(page.locator('.toast')).toBeVisible();
     await expect(page.locator('.toast')).toContainText('Agent not running');
