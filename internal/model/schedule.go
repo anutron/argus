@@ -8,13 +8,18 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
-// ScheduledTask defines a recurring task: at each cron firing the daemon
+// ScheduledTask defines a scheduled task that fires either on a recurring
+// cron expression OR once at a specific timestamp. At each fire the daemon
 // creates a fresh task in Project using Prompt (and optionally Backend), the
 // same way the new-task form or vault watcher does.
 //
 // Schedule is parsed by github.com/robfig/cron/v3 with ParseStandard
 // (5-field cron + descriptors @hourly/@daily/@weekly/@monthly/@yearly and
-// @every <duration>).
+// @every <duration>). One-shot rows leave Schedule empty and set RunOnceAt;
+// after firing, the scheduler sets Enabled=false so the row is preserved
+// for inspection but never fires again.
+//
+// Exactly one of Schedule and RunOnceAt must be set. Validate enforces this.
 type ScheduledTask struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
@@ -22,6 +27,7 @@ type ScheduledTask struct {
 	Prompt    string    `json:"prompt"`
 	Backend   string    `json:"backend,omitempty"`
 	Schedule  string    `json:"schedule"`
+	RunOnceAt time.Time `json:"run_once_at,omitempty"`
 	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 
@@ -30,6 +36,12 @@ type ScheduledTask struct {
 	NextRunAt  time.Time `json:"next_run_at,omitempty"`
 	LastTaskID string    `json:"last_task_id,omitempty"`
 	LastError  string    `json:"last_error,omitempty"`
+}
+
+// IsOneShot returns true if this row fires once at RunOnceAt rather than
+// on a recurring cron expression.
+func (s *ScheduledTask) IsOneShot() bool {
+	return !s.RunOnceAt.IsZero()
 }
 
 // scheduleParser is a package-global parser configured to accept the standard
@@ -50,8 +62,9 @@ func ParseSchedule(expr string) (cron.Schedule, error) {
 	return scheduleParser.Parse(expr)
 }
 
-// Validate returns nil if the schedule's required fields are set and Schedule
-// parses cleanly.
+// Validate returns nil if the schedule's required fields are set, exactly
+// one of Schedule and RunOnceAt is provided, and Schedule (when used) parses
+// cleanly.
 func (s *ScheduledTask) Validate() error {
 	if strings.TrimSpace(s.Name) == "" {
 		return errors.New("name is required")
@@ -62,15 +75,33 @@ func (s *ScheduledTask) Validate() error {
 	if strings.TrimSpace(s.Prompt) == "" {
 		return errors.New("prompt is required")
 	}
-	if _, err := ParseSchedule(s.Schedule); err != nil {
-		return err
+	hasCron := strings.TrimSpace(s.Schedule) != ""
+	hasOnce := !s.RunOnceAt.IsZero()
+	if hasCron && hasOnce {
+		return errors.New("specify either schedule (cron) or run_once_at, not both")
+	}
+	if !hasCron && !hasOnce {
+		return errors.New("schedule (cron) or run_once_at is required")
+	}
+	if hasCron {
+		if _, err := ParseSchedule(s.Schedule); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// NextFire returns the next time this schedule fires after `after`. Returns
-// the zero time when the schedule cannot be parsed.
+// NextFire returns the next time this schedule fires after `after`. For
+// recurring rows it consults the cron expression. For one-shot rows it
+// returns RunOnceAt itself when still in the future, else the zero time.
+// Returns the zero time when the schedule cannot be parsed.
 func (s *ScheduledTask) NextFire(after time.Time) time.Time {
+	if s.IsOneShot() {
+		if s.RunOnceAt.After(after) {
+			return s.RunOnceAt
+		}
+		return time.Time{}
+	}
 	sched, err := ParseSchedule(s.Schedule)
 	if err != nil {
 		return time.Time{}

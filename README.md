@@ -270,16 +270,16 @@ The MCP server exposes the following tools to connected agents:
 
 Task management tools enable an external agent (e.g. Claude Code running in another terminal) to programmatically launch and monitor Argus tasks via MCP. Sample skills at `.claude/skills/archive/SKILL.md` (calls `task_archive`, moves task to the Archive section) and `.claude/skills/argus-complete/SKILL.md` (calls `task_complete`, transitions status to "complete") let an agent finalize its own task at the end of a session via `cwd` resolution. The two are independent axes — completing a task does not archive it, and archiving does not change status.
 
-**Schedule Management** (recurring scheduled tasks):
+**Schedule Management** (recurring or one-shot scheduled tasks):
 | Tool | Description |
 |------|-------------|
 | `schedule_list` | List all schedules with name, project, cron expression, enabled state, and next/last fire timestamps |
-| `schedule_create` | Create a recurring schedule. Params: `name`, `project`, `prompt`, `schedule` (cron expression or `@every <duration>`); optional `backend`, `enabled` |
-| `schedule_update` | Partial update — pass `id` plus any fields to change. Useful for toggling `enabled` or rotating the prompt without rebuilding the schedule |
+| `schedule_create` | Create a schedule. Params: `name`, `project`, `prompt`, plus exactly one of `schedule` (cron expression or `@every <duration>`) or `run_once_at` (RFC3339 UTC timestamp for a single future run); optional `backend`, `enabled` |
+| `schedule_update` | Partial update — pass `id` plus any fields to change. Useful for toggling `enabled`, rotating the prompt, or converting between cron and one-shot (set the new field; the other clears automatically) |
 | `schedule_delete` | Remove a schedule by `id`. Tasks already created by previous fires are unaffected |
-| `schedule_run_now` | Fire a schedule immediately, out of cycle. Bookkeeping is updated so the next regular tick will not double-fire. Does NOT send a push notification — only cron-tick fires do |
+| `schedule_run_now` | Fire a schedule immediately, out of cycle. Bookkeeping is updated so the next regular tick will not double-fire. One-shot rows auto-disable after RunNow just as they would on natural-time fire. Does NOT send a push notification — only cron-tick fires do |
 
-Schedule tools mirror the HTTP `/api/schedules` surface so an agent can manage recurring tasks natively without going through curl. Project must match an existing Argus project; cron expressions accept the standard 5-field syntax, descriptors (`@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly`), and the `@every <duration>` shortcut. Minimum resolution is one minute.
+Schedule tools mirror the HTTP `/api/schedules` surface so an agent can manage recurring or one-shot tasks natively without going through curl. Project must match an existing Argus project. Cron expressions accept the standard 5-field syntax, descriptors (`@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly`), and the `@every <duration>` shortcut (minimum resolution: one minute). One-shot rows fire once at `run_once_at` then auto-disable — the row stays in the list with `enabled=false` for inspection; delete it manually when no longer needed.
 
 **Agent-Staged Clipboard:**
 | Tool | Description |

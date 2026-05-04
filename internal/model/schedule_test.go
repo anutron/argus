@@ -38,6 +38,11 @@ func TestScheduledTaskValidate(t *testing.T) {
 		t.Fatalf("good schedule rejected: %v", err)
 	}
 
+	goodOnce := &ScheduledTask{Name: "x", Project: "p", Prompt: "go", RunOnceAt: time.Now().Add(time.Hour)}
+	if err := goodOnce.Validate(); err != nil {
+		t.Fatalf("good one-shot rejected: %v", err)
+	}
+
 	cases := []struct {
 		name string
 		s    *ScheduledTask
@@ -47,6 +52,12 @@ func TestScheduledTaskValidate(t *testing.T) {
 		{"missing-project", &ScheduledTask{Name: "x", Prompt: "go", Schedule: "@daily"}, "project"},
 		{"missing-prompt", &ScheduledTask{Name: "x", Project: "p", Schedule: "@daily"}, "prompt"},
 		{"bad-schedule", &ScheduledTask{Name: "x", Project: "p", Prompt: "go", Schedule: "bogus"}, ""},
+		{"missing-cadence", &ScheduledTask{Name: "x", Project: "p", Prompt: "go"}, "schedule"},
+		{
+			"both-cadences",
+			&ScheduledTask{Name: "x", Project: "p", Prompt: "go", Schedule: "@daily", RunOnceAt: time.Now().Add(time.Hour)},
+			"either schedule",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -72,5 +83,35 @@ func TestNextFire(t *testing.T) {
 	bad := &ScheduledTask{Schedule: "garbage"}
 	if !bad.NextFire(now).IsZero() {
 		t.Fatal("expected zero time for bad schedule")
+	}
+
+	t.Run("one-shot future", func(t *testing.T) {
+		anchor := time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC)
+		fire := anchor.Add(2 * time.Hour)
+		s := &ScheduledTask{RunOnceAt: fire}
+		got := s.NextFire(anchor)
+		if !got.Equal(fire) {
+			t.Fatalf("expected %v, got %v", fire, got)
+		}
+	})
+
+	t.Run("one-shot past returns zero", func(t *testing.T) {
+		anchor := time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC)
+		fire := anchor.Add(-time.Hour)
+		s := &ScheduledTask{RunOnceAt: fire}
+		if !s.NextFire(anchor).IsZero() {
+			t.Fatal("expected zero for past one-shot")
+		}
+	})
+}
+
+func TestIsOneShot(t *testing.T) {
+	cron := &ScheduledTask{Schedule: "@daily"}
+	if cron.IsOneShot() {
+		t.Error("cron schedule should not be one-shot")
+	}
+	once := &ScheduledTask{RunOnceAt: time.Now().Add(time.Hour)}
+	if !once.IsOneShot() {
+		t.Error("non-zero RunOnceAt should be one-shot")
 	}
 }

@@ -379,3 +379,146 @@ func TestSchedulerRunNowWithBackendOverride(t *testing.T) {
 	}
 	testutil.Equal(t, rec.calls[0].Backend, "codex")
 }
+
+func TestOneShotFiresOnceThenAutoDisables(t *testing.T) {
+	s, d, rec, clk := newTestScheduler(t)
+	fireAt := clk.now.Add(5 * time.Minute)
+	sched := &model.ScheduledTask{
+		Name:      "once",
+		Project:   "p",
+		Prompt:    "do once",
+		RunOnceAt: fireAt,
+		Enabled:   true,
+	}
+	if err := d.AddSchedule(sched); err != nil {
+		t.Fatal(err)
+	}
+
+	// First tick: not yet due. NextRunAt is populated to mirror RunOnceAt.
+	s.tick()
+	testutil.Equal(t, len(rec.calls), 0)
+	got, _ := d.GetSchedule(sched.ID)
+	if !got.NextRunAt.Equal(fireAt) {
+		t.Fatalf("expected NextRunAt to mirror RunOnceAt before fire, got %v", got.NextRunAt)
+	}
+	testutil.Equal(t, got.Enabled, true)
+
+	// Advance past RunOnceAt and tick — fires exactly once.
+	clk.Advance(10 * time.Minute)
+	s.tick()
+	testutil.Equal(t, len(rec.calls), 1)
+
+	got, _ = d.GetSchedule(sched.ID)
+	testutil.Equal(t, got.Enabled, false)
+	if !got.NextRunAt.IsZero() {
+		t.Fatalf("expected NextRunAt cleared after one-shot fire, got %v", got.NextRunAt)
+	}
+	if got.LastTaskID == "" {
+		t.Error("expected LastTaskID set after fire")
+	}
+
+	// Subsequent ticks must not fire again — Enabled=false guards.
+	clk.Advance(time.Hour)
+	s.tick()
+	testutil.Equal(t, len(rec.calls), 1)
+}
+
+func TestOneShotDisabledDoesNotFire(t *testing.T) {
+	s, d, rec, clk := newTestScheduler(t)
+	sched := &model.ScheduledTask{
+		Name:      "once-off",
+		Project:   "p",
+		Prompt:    "do",
+		RunOnceAt: clk.now.Add(-time.Minute), // already in the past
+		Enabled:   false,
+	}
+	if err := d.AddSchedule(sched); err != nil {
+		t.Fatal(err)
+	}
+	s.tick()
+	testutil.Equal(t, len(rec.calls), 0)
+}
+
+func TestOneShotFireFailurePreservesEnabled(t *testing.T) {
+	s, d, rec, clk := newTestScheduler(t)
+	rec.failNext = errors.New("create failed")
+	sched := &model.ScheduledTask{
+		Name:      "once-fail",
+		Project:   "p",
+		Prompt:    "do",
+		RunOnceAt: clk.now.Add(-time.Minute), // already due
+		Enabled:   true,
+	}
+	if err := d.AddSchedule(sched); err != nil {
+		t.Fatal(err)
+	}
+	s.tick()
+	got, _ := d.GetSchedule(sched.ID)
+	// Failed fire: Enabled stays true so the user (or next tick) can retry.
+	// LastError is populated for visibility.
+	testutil.Equal(t, got.Enabled, true)
+	if got.LastError == "" {
+		t.Error("expected LastError populated after failed fire")
+	}
+	if got.NextRunAt.IsZero() {
+		t.Error("expected NextRunAt to remain populated after failed one-shot fire")
+	}
+}
+
+func TestOneShotReenabledDoesNotRefire(t *testing.T) {
+	s, d, rec, clk := newTestScheduler(t)
+	sched := &model.ScheduledTask{
+		Name:      "once",
+		Project:   "p",
+		Prompt:    "do",
+		RunOnceAt: clk.now.Add(time.Minute),
+		Enabled:   true,
+	}
+	if err := d.AddSchedule(sched); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fire it.
+	clk.Advance(2 * time.Minute)
+	s.tick()
+	testutil.Equal(t, len(rec.calls), 1)
+
+	// Manually re-enable. RunOnceAt is unchanged (still in the past).
+	got, _ := d.GetSchedule(sched.ID)
+	got.Enabled = true
+	if err := d.UpdateSchedule(got); err != nil {
+		t.Fatal(err)
+	}
+
+	// Subsequent ticks must not fire again — LastRunAt guards.
+	clk.Advance(time.Hour)
+	s.tick()
+	testutil.Equal(t, len(rec.calls), 1)
+
+	// And NextRunAt must stay cleared on the fired row.
+	got, _ = d.GetSchedule(sched.ID)
+	if !got.NextRunAt.IsZero() {
+		t.Fatalf("expected NextRunAt cleared on fired row, got %v", got.NextRunAt)
+	}
+}
+
+func TestOneShotRunNow(t *testing.T) {
+	s, d, rec, clk := newTestScheduler(t)
+	sched := &model.ScheduledTask{
+		Name:      "once-rn",
+		Project:   "p",
+		Prompt:    "do",
+		RunOnceAt: clk.now.Add(time.Hour), // future — RunNow bypasses
+		Enabled:   true,
+	}
+	if err := d.AddSchedule(sched); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RunNow(sched.ID); err != nil {
+		t.Fatal(err)
+	}
+	testutil.Equal(t, len(rec.calls), 1)
+
+	got, _ := d.GetSchedule(sched.ID)
+	testutil.Equal(t, got.Enabled, false) // auto-disabled even via RunNow
+}

@@ -165,7 +165,8 @@ func (d *DB) createTables() error {
 			project      TEXT NOT NULL,
 			prompt       TEXT NOT NULL,
 			backend      TEXT NOT NULL DEFAULT '',
-			schedule     TEXT NOT NULL,
+			schedule     TEXT NOT NULL DEFAULT '',
+			run_once_at  TEXT NOT NULL DEFAULT '',
 			enabled      INTEGER NOT NULL DEFAULT 1,
 			created_at   TEXT NOT NULL,
 			last_run_at  TEXT NOT NULL DEFAULT '',
@@ -176,6 +177,9 @@ func (d *DB) createTables() error {
 	`); err != nil {
 		return fmt.Errorf("creating scheduled_tasks table: %w", err)
 	}
+
+	// Add run_once_at column to existing scheduled_tasks tables. Idempotent.
+	d.conn.Exec(`ALTER TABLE scheduled_tasks ADD COLUMN run_once_at TEXT NOT NULL DEFAULT ''`) //nolint:errcheck
 
 	return nil
 }

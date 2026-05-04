@@ -107,11 +107,18 @@ func (s *Scheduler) Stop() {
 
 // RunNow fires the schedule with the given ID immediately, regardless of
 // when its next scheduled fire is. Bookkeeping is updated so the regular
-// tick won't fire again immediately afterwards.
+// tick won't fire again immediately afterwards. For one-shot rows, RunNow
+// also disables the row after firing — same auto-disable behaviour as the
+// natural-time fire path.
 func (s *Scheduler) RunNow(id string) (*model.Task, error) {
 	sched, err := s.db.GetSchedule(id)
 	if err != nil {
 		return nil, err
+	}
+	if sched.IsOneShot() {
+		s.fireMu.Lock()
+		defer s.fireMu.Unlock()
+		return s.fire(sched, nil, s.now())
 	}
 	parsed, perr := model.ParseSchedule(sched.Schedule)
 	if perr != nil {
@@ -143,7 +150,14 @@ func (s *Scheduler) tick() {
 
 // tickOne handles a single schedule: validate the cron expression, decide
 // whether to fire, fire if due, and persist next/last bookkeeping.
+//
+// One-shot rows (RunOnceAt set) take a separate path: they fire once when
+// now >= RunOnceAt, then auto-disable. They never recompute NextRunAt.
 func (s *Scheduler) tickOne(sched *model.ScheduledTask, now time.Time) {
+	if sched.IsOneShot() {
+		s.tickOneShot(sched, now)
+		return
+	}
 	parsed, err := model.ParseSchedule(sched.Schedule)
 	if err != nil {
 		// Persist the parse error and skip; a malformed schedule shouldn't
@@ -212,11 +226,66 @@ func (s *Scheduler) tickOne(sched *model.ScheduledTask, now time.Time) {
 	}
 }
 
+// tickOneShot handles a one-shot scheduled task. Fires when now >= RunOnceAt
+// and the row is enabled, then auto-disables so it cannot fire again.
+//
+// LastRunAt is the definitive "already fired" guard: once set, the row is
+// preserved for inspection and never fires again — even if the user toggles
+// Enabled back to true. Without this guard, re-enabling a row whose
+// RunOnceAt is in the past would silently produce a duplicate task on the
+// next tick.
+//
+// NextRunAt mirrors RunOnceAt for the UI until the row fires; afterwards it
+// stays cleared because we early-return before the populate path.
+func (s *Scheduler) tickOneShot(sched *model.ScheduledTask, now time.Time) {
+	// Already fired — preserved for inspection only.
+	if !sched.LastRunAt.IsZero() {
+		return
+	}
+	shouldFire := sched.Enabled && !now.Before(sched.RunOnceAt)
+
+	if shouldFire {
+		s.fireMu.Lock()
+		latest, gErr := s.db.GetSchedule(sched.ID)
+		if gErr == nil {
+			*sched = *latest
+		}
+		stillDue := sched.Enabled && sched.IsOneShot() && !now.Before(sched.RunOnceAt)
+		if !stillDue {
+			s.fireMu.Unlock()
+			return
+		}
+		task, fErr := s.fire(sched, nil, now)
+		s.fireMu.Unlock()
+		if fErr != nil {
+			return
+		}
+		if task != nil {
+			if cb := s.fireCallback(); cb != nil {
+				cb(task)
+			}
+		}
+		return
+	}
+
+	// Not firing — populate NextRunAt for the UI when still pending.
+	desired := sched.RunOnceAt
+	if !sched.NextRunAt.Equal(desired) || sched.LastError != "" {
+		sched.NextRunAt = desired
+		sched.LastError = ""
+		if err := s.db.UpdateSchedule(sched); err != nil {
+			uxlog.Log("[scheduler] persist one-shot next_run_at %s: %v", sched.ID, err)
+		}
+	}
+}
+
 // fire creates the task for the given schedule and updates bookkeeping.
 // The caller is responsible for honouring sched.Enabled — fire itself does
-// not consult Enabled because RunNow bypasses that check. Callers MUST
-// hold fireMu so concurrent invocations against the same row cannot
-// double-fire.
+// not consult Enabled because RunNow bypasses that check. For recurring
+// rows, callers pass the parsed cron schedule for NextRunAt computation;
+// for one-shot rows, parsed is nil and the row auto-disables on success.
+// Callers MUST hold fireMu so concurrent invocations against the same row
+// cannot double-fire.
 func (s *Scheduler) fire(sched *model.ScheduledTask, parsed cron.Schedule, now time.Time) (*model.Task, error) {
 	// Generate a unique-per-fire name so worktree creation can't collide
 	// with the previous fire still being open.
@@ -230,7 +299,13 @@ func (s *Scheduler) fire(sched *model.ScheduledTask, parsed cron.Schedule, now t
 	if err != nil {
 		sched.LastError = err.Error()
 		sched.LastRunAt = now
-		sched.NextRunAt = parsed.Next(now)
+		if parsed != nil {
+			sched.NextRunAt = parsed.Next(now)
+		} else {
+			// One-shot: keep RunOnceAt visible in the UI on failure so the
+			// user can see what was scheduled.
+			sched.NextRunAt = sched.RunOnceAt
+		}
 		if uErr := s.db.UpdateSchedule(sched); uErr != nil {
 			uxlog.Log("[scheduler] persist fire error %s: %v", sched.ID, uErr)
 		}
@@ -241,7 +316,14 @@ func (s *Scheduler) fire(sched *model.ScheduledTask, parsed cron.Schedule, now t
 	sched.LastRunAt = now
 	sched.LastTaskID = task.ID
 	sched.LastError = ""
-	sched.NextRunAt = parsed.Next(now)
+	if parsed != nil {
+		sched.NextRunAt = parsed.Next(now)
+	} else {
+		// One-shot fired successfully: disable so it cannot fire again, and
+		// clear NextRunAt so the UI shows no future run.
+		sched.Enabled = false
+		sched.NextRunAt = time.Time{}
+	}
 	if uErr := s.db.UpdateSchedule(sched); uErr != nil {
 		uxlog.Log("[scheduler] persist post-fire %s: %v", sched.ID, uErr)
 	}

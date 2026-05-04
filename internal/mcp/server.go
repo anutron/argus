@@ -479,33 +479,35 @@ var scheduleToolDefs = []Tool{
 	},
 	{
 		Name: "schedule_create",
-		Description: `Create a recurring scheduled task. The cron expression is parsed by robfig/cron/v3 ParseStandard: 5-field cron (e.g. "0 9 * * 1-5" for 9am weekdays), descriptors (@hourly, @daily, @weekly, @monthly, @yearly), or @every <duration> (e.g. "@every 1h"). Minimum resolution is one minute. Project must match an existing Argus project. New schedules default to enabled.`,
+		Description: `Create a scheduled task. Pass either ` + "`schedule`" + ` (cron expression for recurring runs) OR ` + "`run_once_at`" + ` (RFC3339 UTC timestamp for a single future run) — exactly one. The cron expression is parsed by robfig/cron/v3 ParseStandard: 5-field cron (e.g. "0 9 * * 1-5" for 9am weekdays UTC), descriptors (@hourly, @daily, @weekly, @monthly, @yearly), or @every <duration> (e.g. "@every 1h"). Minimum cron resolution is one minute. One-shot rows fire once at run_once_at then auto-disable (the row stays in the list with enabled=false for inspection). Project must match an existing Argus project. New schedules default to enabled.`,
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
-				"name":     map[string]interface{}{"type": "string", "description": "Display name. Each fire suffixes this with the UTC timestamp."},
-				"project":  map[string]interface{}{"type": "string", "description": "Project name (must exist in Argus config)."},
-				"prompt":   map[string]interface{}{"type": "string", "description": "Instructions delivered to the agent at each fire."},
-				"schedule": map[string]interface{}{"type": "string", "description": "Cron expression. See description for accepted formats."},
-				"backend":  map[string]interface{}{"type": "string", "description": "Optional backend override for this schedule (e.g. 'claude-haiku')."},
-				"enabled":  map[string]interface{}{"type": "boolean", "description": "Optional. Defaults to true."},
+				"name":         map[string]interface{}{"type": "string", "description": "Display name. Each fire suffixes this with the UTC timestamp."},
+				"project":      map[string]interface{}{"type": "string", "description": "Project name (must exist in Argus config)."},
+				"prompt":       map[string]interface{}{"type": "string", "description": "Instructions delivered to the agent at each fire."},
+				"schedule":     map[string]interface{}{"type": "string", "description": "Cron expression. Mutually exclusive with run_once_at."},
+				"run_once_at":  map[string]interface{}{"type": "string", "description": "RFC3339 UTC timestamp (e.g. \"2026-05-17T14:00:00Z\"). Must be in the future. Mutually exclusive with schedule."},
+				"backend":      map[string]interface{}{"type": "string", "description": "Optional backend override for this schedule (e.g. 'claude-haiku')."},
+				"enabled":      map[string]interface{}{"type": "boolean", "description": "Optional. Defaults to true."},
 			},
-			"required": []string{"name", "project", "prompt", "schedule"},
+			"required": []string{"name", "project", "prompt"},
 		},
 	},
 	{
 		Name: "schedule_update",
-		Description: `Partial update of a scheduled task. Only fields you pass are changed; omit a field to leave it as-is. Changing the schedule expression recomputes next_run_at. Useful for toggling enabled without resending the prompt.`,
+		Description: `Partial update of a scheduled task. Only fields you pass are changed; omit a field to leave it as-is. Changing the cadence (schedule or run_once_at) recomputes next_run_at. To convert between recurring and one-shot, set the new field — the other clears automatically. Passing both schedule and run_once_at non-empty in the same call is rejected with an error.`,
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
-				"id":       map[string]interface{}{"type": "string", "description": "Schedule ID (from schedule_list)."},
-				"name":     map[string]interface{}{"type": "string"},
-				"project":  map[string]interface{}{"type": "string"},
-				"prompt":   map[string]interface{}{"type": "string"},
-				"schedule": map[string]interface{}{"type": "string"},
-				"backend":  map[string]interface{}{"type": "string"},
-				"enabled":  map[string]interface{}{"type": "boolean"},
+				"id":          map[string]interface{}{"type": "string", "description": "Schedule ID (from schedule_list)."},
+				"name":        map[string]interface{}{"type": "string", "description": "Display name. Each fire suffixes this with the UTC timestamp."},
+				"project":     map[string]interface{}{"type": "string", "description": "Project name (must exist in Argus config)."},
+				"prompt":      map[string]interface{}{"type": "string", "description": "Instructions delivered to the agent at each fire."},
+				"schedule":    map[string]interface{}{"type": "string", "description": "Cron expression. Pass empty string to clear when switching to a one-shot."},
+				"run_once_at": map[string]interface{}{"type": "string", "description": "RFC3339 UTC timestamp. Pass empty string to clear when switching to a recurring schedule."},
+				"backend":     map[string]interface{}{"type": "string", "description": "Backend override (e.g. 'claude-haiku'). Empty string clears the override."},
+				"enabled":     map[string]interface{}{"type": "boolean", "description": "Toggle on/off without resending the prompt. Re-enabling a one-shot whose RunOnceAt is in the past does NOT cause it to fire again — LastRunAt is the definitive guard."},
 			},
 			"required": []string{"id"},
 		},
@@ -1175,12 +1177,13 @@ func (s *Server) toolScheduleCreate(id interface{}, args json.RawMessage) *Respo
 		return toolError(id, "schedule management not configured")
 	}
 	var p struct {
-		Name     string `json:"name"`
-		Project  string `json:"project"`
-		Prompt   string `json:"prompt"`
-		Schedule string `json:"schedule"`
-		Backend  string `json:"backend"`
-		Enabled  *bool  `json:"enabled"`
+		Name      string `json:"name"`
+		Project   string `json:"project"`
+		Prompt    string `json:"prompt"`
+		Schedule  string `json:"schedule"`
+		RunOnceAt string `json:"run_once_at"`
+		Backend   string `json:"backend"`
+		Enabled   *bool  `json:"enabled"`
 	}
 	json.Unmarshal(args, &p) //nolint:errcheck
 
@@ -1191,6 +1194,16 @@ func (s *Server) toolScheduleCreate(id interface{}, args json.RawMessage) *Respo
 		Schedule: strings.TrimSpace(p.Schedule),
 		Backend:  strings.TrimSpace(p.Backend),
 		Enabled:  true, // default
+	}
+	if raw := strings.TrimSpace(p.RunOnceAt); raw != "" {
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return toolError(id, fmt.Sprintf("run_once_at must be RFC3339 (e.g. 2026-05-17T14:00:00Z): %v", err))
+		}
+		if !t.After(time.Now()) {
+			return toolError(id, "run_once_at must be in the future")
+		}
+		sched.RunOnceAt = t
 	}
 	if p.Enabled != nil {
 		sched.Enabled = *p.Enabled
@@ -1204,9 +1217,13 @@ func (s *Server) toolScheduleCreate(id interface{}, args json.RawMessage) *Respo
 		log.Printf("[mcp] schedule_create failed: %v", err)
 		return toolError(id, fmt.Sprintf("Failed to create schedule: %v", err))
 	}
-	log.Printf("[mcp] schedule_create ok: id=%s name=%s schedule=%q", sched.ID, sched.Name, sched.Schedule)
-	return toolResult(id, fmt.Sprintf("Schedule created.\n\n- **ID**: %s\n- **Name**: %s\n- **Schedule**: %s\n- **Project**: %s\n- **Enabled**: %v\n- **Next run**: %s",
-		sched.ID, sched.Name, sched.Schedule, sched.Project, sched.Enabled, formatScheduleTime(sched.NextRunAt)))
+	cadence := sched.Schedule
+	if sched.IsOneShot() {
+		cadence = "once @ " + sched.RunOnceAt.UTC().Format(time.RFC3339)
+	}
+	log.Printf("[mcp] schedule_create ok: id=%s name=%s cadence=%q", sched.ID, sched.Name, cadence)
+	return toolResult(id, fmt.Sprintf("Schedule created.\n\n- **ID**: %s\n- **Name**: %s\n- **Cadence**: %s\n- **Project**: %s\n- **Enabled**: %v\n- **Next run**: %s",
+		sched.ID, sched.Name, cadence, sched.Project, sched.Enabled, formatScheduleTime(sched.NextRunAt)))
 }
 
 func (s *Server) toolScheduleUpdate(id interface{}, args json.RawMessage) *Response {
@@ -1214,13 +1231,14 @@ func (s *Server) toolScheduleUpdate(id interface{}, args json.RawMessage) *Respo
 		return toolError(id, "schedule management not configured")
 	}
 	var p struct {
-		ID       string  `json:"id"`
-		Name     *string `json:"name"`
-		Project  *string `json:"project"`
-		Prompt   *string `json:"prompt"`
-		Schedule *string `json:"schedule"`
-		Backend  *string `json:"backend"`
-		Enabled  *bool   `json:"enabled"`
+		ID        string  `json:"id"`
+		Name      *string `json:"name"`
+		Project   *string `json:"project"`
+		Prompt    *string `json:"prompt"`
+		Schedule  *string `json:"schedule"`
+		RunOnceAt *string `json:"run_once_at"`
+		Backend   *string `json:"backend"`
+		Enabled   *bool   `json:"enabled"`
 	}
 	json.Unmarshal(args, &p) //nolint:errcheck
 
@@ -1231,7 +1249,13 @@ func (s *Server) toolScheduleUpdate(id interface{}, args json.RawMessage) *Respo
 	if err != nil {
 		return toolError(id, fmt.Sprintf("schedule not found: %s", p.ID))
 	}
-	scheduleChanged := false
+	// Reject ambiguous "both cadences in one call" up front. Per-field
+	// auto-clear below would otherwise silently pick a winner by ordering.
+	if p.Schedule != nil && strings.TrimSpace(*p.Schedule) != "" &&
+		p.RunOnceAt != nil && strings.TrimSpace(*p.RunOnceAt) != "" {
+		return toolError(id, "specify either schedule (cron) or run_once_at, not both")
+	}
+	cadenceChanged := false
 	if p.Name != nil {
 		sched.Name = strings.TrimSpace(*p.Name)
 	}
@@ -1244,9 +1268,37 @@ func (s *Server) toolScheduleUpdate(id interface{}, args json.RawMessage) *Respo
 	if p.Schedule != nil {
 		newExpr := strings.TrimSpace(*p.Schedule)
 		if newExpr != sched.Schedule {
-			scheduleChanged = true
+			cadenceChanged = true
 		}
 		sched.Schedule = newExpr
+		// Setting a non-empty cron expression clears any one-shot anchor.
+		// The both-set guard above ensures this clear is never hiding an
+		// explicit user-supplied run_once_at.
+		if newExpr != "" {
+			sched.RunOnceAt = time.Time{}
+		}
+	}
+	if p.RunOnceAt != nil {
+		raw := strings.TrimSpace(*p.RunOnceAt)
+		var newAt time.Time
+		if raw != "" {
+			t, err := time.Parse(time.RFC3339, raw)
+			if err != nil {
+				return toolError(id, fmt.Sprintf("run_once_at must be RFC3339 (e.g. 2026-05-17T14:00:00Z): %v", err))
+			}
+			if !t.After(time.Now()) {
+				return toolError(id, "run_once_at must be in the future")
+			}
+			newAt = t
+		}
+		if !sched.RunOnceAt.Equal(newAt) {
+			cadenceChanged = true
+		}
+		sched.RunOnceAt = newAt
+		// Setting a non-zero one-shot anchor clears any cron expression.
+		if !newAt.IsZero() {
+			sched.Schedule = ""
+		}
 	}
 	if p.Backend != nil {
 		sched.Backend = strings.TrimSpace(*p.Backend)
@@ -1257,10 +1309,10 @@ func (s *Server) toolScheduleUpdate(id interface{}, args json.RawMessage) *Respo
 	if err := sched.Validate(); err != nil {
 		return toolError(id, err.Error())
 	}
-	if scheduleChanged {
+	if cadenceChanged {
 		// Anchor on LastRunAt when previously fired so an unchanged cadence
 		// preserves alignment; otherwise anchor on now. Mirrors the API's
-		// recompute path.
+		// recompute path. NextFire returns RunOnceAt directly for one-shots.
 		anchor := sched.LastRunAt
 		if anchor.IsZero() {
 			anchor = time.Now()
@@ -1272,9 +1324,13 @@ func (s *Server) toolScheduleUpdate(id interface{}, args json.RawMessage) *Respo
 		log.Printf("[mcp] schedule_update failed: id=%s err=%v", sched.ID, err)
 		return toolError(id, fmt.Sprintf("Failed to update schedule: %v", err))
 	}
-	log.Printf("[mcp] schedule_update ok: id=%s schedule=%q enabled=%v", sched.ID, sched.Schedule, sched.Enabled)
-	return toolResult(id, fmt.Sprintf("Schedule updated.\n\n- **ID**: %s\n- **Name**: %s\n- **Schedule**: %s\n- **Enabled**: %v\n- **Next run**: %s",
-		sched.ID, sched.Name, sched.Schedule, sched.Enabled, formatScheduleTime(sched.NextRunAt)))
+	cadence := sched.Schedule
+	if sched.IsOneShot() {
+		cadence = "once @ " + sched.RunOnceAt.UTC().Format(time.RFC3339)
+	}
+	log.Printf("[mcp] schedule_update ok: id=%s cadence=%q enabled=%v", sched.ID, cadence, sched.Enabled)
+	return toolResult(id, fmt.Sprintf("Schedule updated.\n\n- **ID**: %s\n- **Name**: %s\n- **Cadence**: %s\n- **Enabled**: %v\n- **Next run**: %s",
+		sched.ID, sched.Name, cadence, sched.Enabled, formatScheduleTime(sched.NextRunAt)))
 }
 
 func (s *Server) toolScheduleDelete(id interface{}, args json.RawMessage) *Response {

@@ -93,12 +93,17 @@ func TestScheduleHandlers_CreateValidates(t *testing.T) {
 	srv, _ := testServer(t)
 	handler := authMiddleware(srv.token, srv.db, nil, srv.routes())
 
+	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	past := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
 	cases := map[string]string{
-		"missing-name":     `{"project":"p","prompt":"go","schedule":"@daily"}`,
-		"missing-project":  `{"name":"x","prompt":"go","schedule":"@daily"}`,
-		"missing-prompt":   `{"name":"x","project":"p","schedule":"@daily"}`,
-		"missing-schedule": `{"name":"x","project":"p","prompt":"go"}`,
-		"bad-schedule":     `{"name":"x","project":"p","prompt":"go","schedule":"foo bar baz"}`,
+		"missing-name":      `{"project":"p","prompt":"go","schedule":"@daily"}`,
+		"missing-project":   `{"name":"x","prompt":"go","schedule":"@daily"}`,
+		"missing-prompt":    `{"name":"x","project":"p","schedule":"@daily"}`,
+		"missing-cadence":   `{"name":"x","project":"p","prompt":"go"}`,
+		"bad-schedule":      `{"name":"x","project":"p","prompt":"go","schedule":"foo bar baz"}`,
+		"run-once-past":     `{"name":"x","project":"p","prompt":"go","run_once_at":"` + past + `"}`,
+		"run-once-bad-fmt":  `{"name":"x","project":"p","prompt":"go","run_once_at":"tomorrow"}`,
+		"both-cadences-set": `{"name":"x","project":"p","prompt":"go","schedule":"@daily","run_once_at":"` + future + `"}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -108,6 +113,91 @@ func TestScheduleHandlers_CreateValidates(t *testing.T) {
 			testutil.Equal(t, w.Code, http.StatusBadRequest)
 		})
 	}
+}
+
+func TestScheduleHandlers_CreateOneShot(t *testing.T) {
+	srv, _ := testServer(t)
+	handler := authMiddleware(srv.token, srv.db, nil, srv.routes())
+
+	future := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	body := `{"name":"once","project":"argus","prompt":"go","run_once_at":"` + future + `"}`
+	req := authedReq("POST", "/api/schedules", body)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	testutil.Equal(t, w.Code, http.StatusCreated)
+
+	var created scheduleJSON
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	testutil.Equal(t, created.Schedule, "")
+	if created.RunOnceAt == "" {
+		t.Error("expected run_once_at echoed back")
+	}
+	if created.NextRunAt == "" {
+		t.Error("expected next_run_at populated for one-shot")
+	}
+
+	// Verify DB row matches.
+	stored, _ := srv.db.GetSchedule(created.ID)
+	if stored.RunOnceAt.IsZero() {
+		t.Fatal("expected RunOnceAt persisted to DB")
+	}
+	if !stored.IsOneShot() {
+		t.Fatal("expected IsOneShot=true after persist")
+	}
+}
+
+func TestScheduleHandlers_UpdateCadenceSwitch(t *testing.T) {
+	srv, _ := testServer(t)
+	handler := authMiddleware(srv.token, srv.db, nil, srv.routes())
+
+	// Seed a recurring schedule.
+	body := `{"name":"r","project":"argus","prompt":"go","schedule":"@daily"}`
+	req := authedReq("POST", "/api/schedules", body)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	var created scheduleJSON
+	_ = json.Unmarshal(w.Body.Bytes(), &created)
+
+	t.Run("recurring to one-shot clears schedule", func(t *testing.T) {
+		future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+		req := authedReq("PUT", "/api/schedules/"+created.ID, `{"run_once_at":"`+future+`"}`)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusOK)
+
+		stored, _ := srv.db.GetSchedule(created.ID)
+		testutil.Equal(t, stored.Schedule, "")
+		if !stored.IsOneShot() {
+			t.Fatal("expected one-shot after switch")
+		}
+	})
+
+	t.Run("one-shot to recurring clears run_once_at", func(t *testing.T) {
+		req := authedReq("PUT", "/api/schedules/"+created.ID, `{"schedule":"@hourly"}`)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusOK)
+
+		stored, _ := srv.db.GetSchedule(created.ID)
+		testutil.Equal(t, stored.Schedule, "@hourly")
+		if stored.IsOneShot() {
+			t.Fatal("expected one-shot anchor cleared after switch")
+		}
+	})
+
+	t.Run("update with both cadences rejected", func(t *testing.T) {
+		future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+		body := `{"schedule":"@daily","run_once_at":"` + future + `"}`
+		req := authedReq("PUT", "/api/schedules/"+created.ID, body)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusBadRequest)
+		if !strings.Contains(w.Body.String(), "either") {
+			t.Errorf("expected error mentioning 'either', got %s", w.Body.String())
+		}
+	})
 }
 
 // Regression: editing the schedule expression of a never-run schedule must

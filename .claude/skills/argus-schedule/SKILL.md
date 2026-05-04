@@ -1,6 +1,6 @@
 ---
 name: argus-schedule
-description: Manage recurring tasks in the local Argus daemon via its HTTP API. Use when the user wants to schedule a task locally in argus, create a cron-driven task, fire X every weekday/hour/morning, set up a recurring agent that needs local filesystem access (logs in ~/.argus, local databases, dotfiles), list or update existing argus schedules, or run an argus schedule now. Distinct from /schedule, which creates remote cloud routines without local access.
+description: Manage recurring or one-shot tasks in the local Argus daemon via its HTTP API. Use when the user wants to schedule a task locally in argus, create a cron-driven task, fire X every weekday/hour/morning, fire something once at a specific future time (one-shot via run_once_at), set up an agent that needs local filesystem access (logs in ~/.argus, local databases, dotfiles), list or update existing argus schedules, or run an argus schedule now. Distinct from /schedule, which creates remote cloud routines without local access.
 allowed-tools: Bash(curl *), Bash(cat *), Bash(jq *), Bash(test *), Bash(ls *)
 ---
 
@@ -63,13 +63,16 @@ Required from the user (ask one question collecting any missing pieces, do not i
 
 - **name** — short, human-readable. Will be suffixed with the fire timestamp on each run.
 - **project** — must match an existing argus project name from the projects list above. If the user gave a project that is not in the list, show the available names and stop.
-- **schedule** — cron expression. See the cron primer below.
+- **cadence** — exactly one of:
+  - **schedule** — cron expression for a recurring schedule. See the cron primer below.
+  - **run_once_at** — RFC3339 UTC timestamp (e.g. `2026-05-17T14:00:00Z`) for a single future run. Must be in the future. After firing, the row auto-disables — it stays in the list with `enabled=false` for inspection. The user can delete it once they have read the result.
 - **prompt** — what the agent should do at each fire. Multi-line is fine; pass it as a JSON string.
 - **backend** (optional) — overrides the default backend for this schedule. Only set if the user asked. Useful for forcing a cheaper model on a polling task.
 
 Build the JSON body with `jq` to handle quoting of multi-line prompts safely:
 
 ```
+# Recurring (cron):
 JSON=$(jq -n \
   --arg name "$NAME" \
   --arg project "$PROJECT" \
@@ -77,12 +80,22 @@ JSON=$(jq -n \
   --arg prompt "$PROMPT" \
   '{name:$name, project:$project, schedule:$schedule, prompt:$prompt, enabled:true}')
 
+# One-shot:
+JSON=$(jq -n \
+  --arg name "$NAME" \
+  --arg project "$PROJECT" \
+  --arg run_once_at "$WHEN_RFC3339" \
+  --arg prompt "$PROMPT" \
+  '{name:$name, project:$project, run_once_at:$run_once_at, prompt:$prompt, enabled:true}')
+
 curl -sS -X POST \
   -H "Authorization: Bearer $(cat ~/.argus/api-token)" \
   -H "Content-Type: application/json" \
   -d "$JSON" \
   http://localhost:7743/api/schedules | jq
 ```
+
+When the user gives a local time, convert to UTC RFC3339 before constructing `run_once_at`. Echo the converted UTC timestamp back for confirmation before posting.
 
 After the call, echo the returned `id`, `next_run_at`, and a one-line confirmation. Do not add `--data-raw` shortcuts that bypass jq — embedding raw user input into a shell-quoted JSON string is a quoting hazard.
 
