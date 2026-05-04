@@ -465,6 +465,43 @@ func TestOneShotFireFailurePreservesEnabled(t *testing.T) {
 	}
 }
 
+func TestOneShotReenabledDoesNotRefire(t *testing.T) {
+	s, d, rec, clk := newTestScheduler(t)
+	sched := &model.ScheduledTask{
+		Name:      "once",
+		Project:   "p",
+		Prompt:    "do",
+		RunOnceAt: clk.now.Add(time.Minute),
+		Enabled:   true,
+	}
+	if err := d.AddSchedule(sched); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fire it.
+	clk.Advance(2 * time.Minute)
+	s.tick()
+	testutil.Equal(t, len(rec.calls), 1)
+
+	// Manually re-enable. RunOnceAt is unchanged (still in the past).
+	got, _ := d.GetSchedule(sched.ID)
+	got.Enabled = true
+	if err := d.UpdateSchedule(got); err != nil {
+		t.Fatal(err)
+	}
+
+	// Subsequent ticks must not fire again — LastRunAt guards.
+	clk.Advance(time.Hour)
+	s.tick()
+	testutil.Equal(t, len(rec.calls), 1)
+
+	// And NextRunAt must stay cleared on the fired row.
+	got, _ = d.GetSchedule(sched.ID)
+	if !got.NextRunAt.IsZero() {
+		t.Fatalf("expected NextRunAt cleared on fired row, got %v", got.NextRunAt)
+	}
+}
+
 func TestOneShotRunNow(t *testing.T) {
 	s, d, rec, clk := newTestScheduler(t)
 	sched := &model.ScheduledTask{

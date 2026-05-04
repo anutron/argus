@@ -496,18 +496,18 @@ var scheduleToolDefs = []Tool{
 	},
 	{
 		Name: "schedule_update",
-		Description: `Partial update of a scheduled task. Only fields you pass are changed; omit a field to leave it as-is. Changing the schedule expression recomputes next_run_at. Useful for toggling enabled without resending the prompt. To convert between recurring and one-shot, set the new field and the old one will be cleared (passing both is rejected).`,
+		Description: `Partial update of a scheduled task. Only fields you pass are changed; omit a field to leave it as-is. Changing the cadence (schedule or run_once_at) recomputes next_run_at. To convert between recurring and one-shot, set the new field — the other clears automatically. Passing both schedule and run_once_at non-empty in the same call is rejected with an error.`,
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"id":          map[string]interface{}{"type": "string", "description": "Schedule ID (from schedule_list)."},
-				"name":        map[string]interface{}{"type": "string"},
-				"project":     map[string]interface{}{"type": "string"},
-				"prompt":      map[string]interface{}{"type": "string"},
+				"name":        map[string]interface{}{"type": "string", "description": "Display name. Each fire suffixes this with the UTC timestamp."},
+				"project":     map[string]interface{}{"type": "string", "description": "Project name (must exist in Argus config)."},
+				"prompt":      map[string]interface{}{"type": "string", "description": "Instructions delivered to the agent at each fire."},
 				"schedule":    map[string]interface{}{"type": "string", "description": "Cron expression. Pass empty string to clear when switching to a one-shot."},
 				"run_once_at": map[string]interface{}{"type": "string", "description": "RFC3339 UTC timestamp. Pass empty string to clear when switching to a recurring schedule."},
-				"backend":     map[string]interface{}{"type": "string"},
-				"enabled":     map[string]interface{}{"type": "boolean"},
+				"backend":     map[string]interface{}{"type": "string", "description": "Backend override (e.g. 'claude-haiku'). Empty string clears the override."},
+				"enabled":     map[string]interface{}{"type": "boolean", "description": "Toggle on/off without resending the prompt. Re-enabling a one-shot whose RunOnceAt is in the past does NOT cause it to fire again — LastRunAt is the definitive guard."},
 			},
 			"required": []string{"id"},
 		},
@@ -1249,6 +1249,12 @@ func (s *Server) toolScheduleUpdate(id interface{}, args json.RawMessage) *Respo
 	if err != nil {
 		return toolError(id, fmt.Sprintf("schedule not found: %s", p.ID))
 	}
+	// Reject ambiguous "both cadences in one call" up front. Per-field
+	// auto-clear below would otherwise silently pick a winner by ordering.
+	if p.Schedule != nil && strings.TrimSpace(*p.Schedule) != "" &&
+		p.RunOnceAt != nil && strings.TrimSpace(*p.RunOnceAt) != "" {
+		return toolError(id, "specify either schedule (cron) or run_once_at, not both")
+	}
 	cadenceChanged := false
 	if p.Name != nil {
 		sched.Name = strings.TrimSpace(*p.Name)
@@ -1265,8 +1271,9 @@ func (s *Server) toolScheduleUpdate(id interface{}, args json.RawMessage) *Respo
 			cadenceChanged = true
 		}
 		sched.Schedule = newExpr
-		// Setting a non-empty cron expression clears any one-shot anchor —
-		// Validate() rejects both being set, and we want a clean transition.
+		// Setting a non-empty cron expression clears any one-shot anchor.
+		// The both-set guard above ensures this clear is never hiding an
+		// explicit user-supplied run_once_at.
 		if newExpr != "" {
 			sched.RunOnceAt = time.Time{}
 		}

@@ -227,13 +227,21 @@ func (s *Scheduler) tickOne(sched *model.ScheduledTask, now time.Time) {
 }
 
 // tickOneShot handles a one-shot scheduled task. Fires when now >= RunOnceAt
-// and the row is enabled, then auto-disables so it cannot fire again. Already-
-// disabled rows are left untouched so the user can inspect a past one-shot
-// without it firing on next-tick if the system clock jumps backward.
+// and the row is enabled, then auto-disables so it cannot fire again.
+//
+// LastRunAt is the definitive "already fired" guard: once set, the row is
+// preserved for inspection and never fires again — even if the user toggles
+// Enabled back to true. Without this guard, re-enabling a row whose
+// RunOnceAt is in the past would silently produce a duplicate task on the
+// next tick.
 //
 // NextRunAt mirrors RunOnceAt for the UI until the row fires; afterwards it
-// is cleared so the "next run" column shows blank.
+// stays cleared because we early-return before the populate path.
 func (s *Scheduler) tickOneShot(sched *model.ScheduledTask, now time.Time) {
+	// Already fired — preserved for inspection only.
+	if !sched.LastRunAt.IsZero() {
+		return
+	}
 	shouldFire := sched.Enabled && !now.Before(sched.RunOnceAt)
 
 	if shouldFire {

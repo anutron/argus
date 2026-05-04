@@ -260,8 +260,13 @@ func (s *Server) handleRunSchedule(w http.ResponseWriter, r *http.Request) {
 
 // applyScheduleRequest copies non-nil request fields onto the schedule
 // in-place. Used by both create (where every field starts zero) and update
-// (where unset fields stay as-is). Returns an error only when run_once_at
-// is malformed or in the past — Validate covers everything else.
+// (where unset fields stay as-is). Returns an error when run_once_at is
+// malformed/past, or when the caller passes both schedule and run_once_at
+// non-empty in a single request — exactly one cadence per call. When only
+// one is set, the OTHER cadence anchor is cleared automatically so the
+// caller doesn't have to know whether the row was previously recurring or
+// one-shot. Any future run_once_at is accepted; the next fire happens at
+// most one tick interval later, regardless of how close to now.
 func applyScheduleRequest(sched *model.ScheduledTask, req scheduleRequest) error {
 	if req.Name != nil {
 		sched.Name = strings.TrimSpace(*req.Name)
@@ -275,10 +280,16 @@ func applyScheduleRequest(sched *model.ScheduledTask, req scheduleRequest) error
 	if req.Backend != nil {
 		sched.Backend = strings.TrimSpace(*req.Backend)
 	}
+	// Reject ambiguous "both cadences in one call" up front. Validate would
+	// not catch this because the per-field clear logic below silently picks
+	// a winner.
+	bothSet := req.Schedule != nil && strings.TrimSpace(*req.Schedule) != "" &&
+		req.RunOnceAt != nil && strings.TrimSpace(*req.RunOnceAt) != ""
+	if bothSet {
+		return errors.New("specify either schedule (cron) or run_once_at, not both")
+	}
 	if req.Schedule != nil {
 		sched.Schedule = strings.TrimSpace(*req.Schedule)
-		// Setting a non-empty cron clears any stale one-shot anchor so the
-		// caller doesn't have to send both fields to switch cadences.
 		if sched.Schedule != "" {
 			sched.RunOnceAt = time.Time{}
 		}
