@@ -1417,6 +1417,82 @@ func TestScheduleCreate(t *testing.T) {
 		}
 		testutil.Equal(t, found.Enabled, false)
 	})
+
+	t.Run("one-shot run_once_at", func(t *testing.T) {
+		future := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+		body := fmt.Sprintf(`{"name":"once","project":"myapp","prompt":"go","run_once_at":%q}`, future)
+		resp := doRequest(t, s, "tools/call", ToolCallParams{
+			Name:      "schedule_create",
+			Arguments: json.RawMessage(body),
+		})
+		testutil.NoError(t, respErr(resp))
+		cr := callResult(t, resp)
+		if cr.IsError {
+			t.Fatalf("unexpected error: %s", cr.Content[0].Text)
+		}
+		var found *model.ScheduledTask
+		for _, sch := range store.schedules {
+			if sch.Name == "once" {
+				found = sch
+				break
+			}
+		}
+		if found == nil {
+			t.Fatal("one-shot schedule not found")
+		}
+		if !found.IsOneShot() {
+			t.Error("expected IsOneShot=true")
+		}
+		testutil.Equal(t, found.Schedule, "")
+		if found.RunOnceAt.IsZero() {
+			t.Error("expected RunOnceAt populated")
+		}
+		testutil.Contains(t, cr.Content[0].Text, "once @")
+	})
+
+	t.Run("run_once_at in the past rejected", func(t *testing.T) {
+		past := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+		body := fmt.Sprintf(`{"name":"old","project":"myapp","prompt":"go","run_once_at":%q}`, past)
+		resp := doRequest(t, s, "tools/call", ToolCallParams{
+			Name:      "schedule_create",
+			Arguments: json.RawMessage(body),
+		})
+		cr := callResult(t, resp)
+		testutil.Equal(t, cr.IsError, true)
+		testutil.Contains(t, cr.Content[0].Text, "future")
+	})
+
+	t.Run("run_once_at malformed rejected", func(t *testing.T) {
+		resp := doRequest(t, s, "tools/call", ToolCallParams{
+			Name:      "schedule_create",
+			Arguments: json.RawMessage(`{"name":"bad","project":"myapp","prompt":"go","run_once_at":"tomorrow"}`),
+		})
+		cr := callResult(t, resp)
+		testutil.Equal(t, cr.IsError, true)
+		testutil.Contains(t, cr.Content[0].Text, "RFC3339")
+	})
+
+	t.Run("both schedule and run_once_at rejected", func(t *testing.T) {
+		future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+		body := fmt.Sprintf(`{"name":"both","project":"myapp","prompt":"go","schedule":"@daily","run_once_at":%q}`, future)
+		resp := doRequest(t, s, "tools/call", ToolCallParams{
+			Name:      "schedule_create",
+			Arguments: json.RawMessage(body),
+		})
+		cr := callResult(t, resp)
+		testutil.Equal(t, cr.IsError, true)
+		testutil.Contains(t, cr.Content[0].Text, "either")
+	})
+
+	t.Run("missing both cadences rejected", func(t *testing.T) {
+		resp := doRequest(t, s, "tools/call", ToolCallParams{
+			Name:      "schedule_create",
+			Arguments: json.RawMessage(`{"name":"x","project":"myapp","prompt":"go"}`),
+		})
+		cr := callResult(t, resp)
+		testutil.Equal(t, cr.IsError, true)
+		testutil.Contains(t, cr.Content[0].Text, "required")
+	})
 }
 
 func TestScheduleUpdate(t *testing.T) {
@@ -1477,6 +1553,64 @@ func TestScheduleUpdate(t *testing.T) {
 		cr := callResult(t, resp)
 		testutil.Equal(t, cr.IsError, true)
 		testutil.Contains(t, cr.Content[0].Text, "schedule not found")
+	})
+
+	t.Run("convert recurring to one-shot clears schedule", func(t *testing.T) {
+		future := time.Now().Add(3 * time.Hour).UTC().Format(time.RFC3339)
+		body := fmt.Sprintf(`{"id":"existing-1","run_once_at":%q}`, future)
+		resp := doRequest(t, s, "tools/call", ToolCallParams{
+			Name:      "schedule_update",
+			Arguments: json.RawMessage(body),
+		})
+		testutil.NoError(t, respErr(resp))
+		cr := callResult(t, resp)
+		if cr.IsError {
+			t.Fatalf("unexpected error: %s", cr.Content[0].Text)
+		}
+		got, _ := store.GetSchedule("existing-1")
+		testutil.Equal(t, got.Schedule, "")
+		if !got.IsOneShot() {
+			t.Error("expected IsOneShot=true after conversion")
+		}
+	})
+
+	t.Run("convert one-shot to recurring clears run_once_at", func(t *testing.T) {
+		// Seed a one-shot row to convert.
+		future := time.Now().Add(time.Hour)
+		store.schedules = append(store.schedules, &model.ScheduledTask{
+			ID:        "to-convert",
+			Name:      "to-convert",
+			Project:   "myapp",
+			Prompt:    "x",
+			RunOnceAt: future,
+			Enabled:   true,
+		})
+		resp := doRequest(t, s, "tools/call", ToolCallParams{
+			Name:      "schedule_update",
+			Arguments: json.RawMessage(`{"id":"to-convert","schedule":"@daily"}`),
+		})
+		testutil.NoError(t, respErr(resp))
+		cr := callResult(t, resp)
+		if cr.IsError {
+			t.Fatalf("unexpected error: %s", cr.Content[0].Text)
+		}
+		got, _ := store.GetSchedule("to-convert")
+		testutil.Equal(t, got.Schedule, "@daily")
+		if got.IsOneShot() {
+			t.Error("expected one-shot anchor cleared after conversion")
+		}
+	})
+
+	t.Run("run_once_at past rejected on update", func(t *testing.T) {
+		past := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+		body := fmt.Sprintf(`{"id":"existing-1","run_once_at":%q}`, past)
+		resp := doRequest(t, s, "tools/call", ToolCallParams{
+			Name:      "schedule_update",
+			Arguments: json.RawMessage(body),
+		})
+		cr := callResult(t, resp)
+		testutil.Equal(t, cr.IsError, true)
+		testutil.Contains(t, cr.Content[0].Text, "future")
 	})
 }
 
