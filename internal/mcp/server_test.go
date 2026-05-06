@@ -2,8 +2,10 @@ package mcp
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -394,15 +396,167 @@ func TestUnknownMethod(t *testing.T) {
 	}
 }
 
-func TestMethodNotAllowed(t *testing.T) {
+// withShortKeepalive shrinks sseKeepaliveInterval for the duration of a
+// test so the SSE handler emits its first comment frame within a few tens
+// of milliseconds. Tests assert on actual data flow rather than waiting
+// out a 30 s production interval, eliminating timing flakiness.
+func withShortKeepalive(t *testing.T) {
+	t.Helper()
+	prev := sseKeepaliveInterval
+	sseKeepaliveInterval = 25 * time.Millisecond
+	t.Cleanup(func() { sseKeepaliveInterval = prev })
+}
+
+// TestGET_SSEStaysOpen verifies the GET handler holds the SSE stream open
+// until the client disconnects. Closing it immediately on first response
+// is what tripped Codex rmcp with "Transport channel closed". The test is
+// timing-deterministic: it waits for an actual keepalive byte to confirm
+// the stream is live, then cancels the request context and confirms the
+// handler returns.
+func TestGET_SSEStaysOpen(t *testing.T) {
+	withShortKeepalive(t)
+
 	s := testServer()
-	req := httptest.NewRequest(http.MethodGet, "/mcp", nil)
+	srv := httptest.NewServer(s)
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/mcp", nil)
+	testutil.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	testutil.NoError(t, err)
+	defer resp.Body.Close() //nolint:errcheck
+
+	testutil.Equal(t, resp.StatusCode, http.StatusOK)
+	testutil.Equal(t, resp.Header.Get("Content-Type"), "text/event-stream")
+
+	// Block until at least one keepalive frame arrives. With a 25 ms
+	// interval this completes in well under a second on any CI; if it
+	// times out at 5 s the handler closed without ever streaming.
+	buf := make([]byte, 64)
+	readResult := make(chan readOutcome, 1)
+	go func() { readResult <- readOnce(resp.Body, buf) }()
+
+	select {
+	case got := <-readResult:
+		testutil.NoError(t, got.err)
+		if got.n == 0 {
+			t.Fatal("GET handler closed the SSE stream without streaming")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no keepalive frame arrived — handler may not be streaming")
+	}
+
+	// Cancel the client context; the server must observe it and return so
+	// subsequent reads error out.
+	cancel()
+	go func() { readResult <- readOnce(resp.Body, buf) }()
+	select {
+	case got := <-readResult:
+		if got.err == nil {
+			t.Fatal("expected read error after client disconnect")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("GET handler did not return after client disconnect")
+	}
+}
+
+// TestGET_SSEUnblocksOnShutdown verifies the contract that makes
+// httpSrv.Shutdown finish: Server.Shutdown cancels shutdownCtx, the GET
+// handler observes it via select, and returns. Uses httptest.NewServer so
+// s.httpSrv stays nil (we are testing the cancellation contract, not Go's
+// own http.Server.Shutdown). No private-field mutation, no race surface.
+func TestGET_SSEUnblocksOnShutdown(t *testing.T) {
+	withShortKeepalive(t)
+
+	s := testServer()
+	srv := httptest.NewServer(s)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/mcp") //nolint:gosec // loopback test URL
+	testutil.NoError(t, err)
+	defer resp.Body.Close() //nolint:errcheck
+
+	// Wait for a real keepalive so we know the handler is inside the
+	// select loop before we call Shutdown.
+	buf := make([]byte, 64)
+	readResult := make(chan readOutcome, 1)
+	go func() { readResult <- readOnce(resp.Body, buf) }()
+	select {
+	case got := <-readResult:
+		testutil.NoError(t, got.err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no keepalive arrived — handler not in select loop")
+	}
+
+	// Subsequent read must unblock once the handler returns.
+	go func() { readResult <- readOnce(resp.Body, buf) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	select {
+	case <-readResult:
+	case <-time.After(2 * time.Second):
+		t.Fatal("GET handler did not return after Shutdown")
+	}
+}
+
+type readOutcome struct {
+	n   int
+	err error
+}
+
+func readOnce(r io.Reader, buf []byte) readOutcome {
+	n, err := r.Read(buf)
+	return readOutcome{n: n, err: err}
+}
+
+// TestPOST_NotificationReturns202 verifies pure JSON-RPC notifications (no
+// "id" field) get HTTP 202 Accepted with an empty body, per the Streamable
+// HTTP spec. Returning a JSON-RPC response with `"id": null` is malformed
+// and rejected by strict clients like Codex rmcp.
+func TestPOST_NotificationReturns202(t *testing.T) {
+	s := testServer()
+
+	// Notification body: no "id" field.
+	body := `{"jsonrpc":"2.0","method":"notifications/initialized"}`
+	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	s.ServeHTTP(w, req)
-	// GET is allowed (returns SSE), check status.
-	if w.Code != http.StatusOK {
-		// Also allow 200 for SSE endpoint.
-		t.Logf("GET /mcp returned %d", w.Code)
+
+	testutil.Equal(t, w.Code, http.StatusAccepted)
+	testutil.Equal(t, w.Body.Len(), 0)
+}
+
+// TestPOST_RequestReturnsJSON verifies normal request/response (with id)
+// still returns a JSON-RPC response. Guards against the notification-202
+// path swallowing real requests.
+func TestPOST_RequestReturnsJSON(t *testing.T) {
+	s := testServer()
+
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`
+	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, req)
+
+	testutil.Equal(t, w.Code, http.StatusOK)
+	testutil.Equal(t, w.Header().Get("Content-Type"), "application/json")
+
+	var resp Response
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	testutil.Equal(t, resp.JSONRPC, "2.0")
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
 	}
 }
 
