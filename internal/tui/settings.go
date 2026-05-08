@@ -13,6 +13,7 @@ import (
 	"github.com/drn/argus/internal/agent"
 	"github.com/drn/argus/internal/config"
 	"github.com/drn/argus/internal/db"
+	"github.com/drn/argus/internal/launchagent"
 	"github.com/drn/argus/internal/model"
 	"github.com/drn/argus/internal/spinner"
 	"github.com/drn/argus/internal/tui/theme"
@@ -39,6 +40,7 @@ const (
 	srUpdateArgus
 	srSourcePath
 	srSchedule
+	srAutoStart
 )
 
 // Vault key constants used in settingsRow.key for vault path rows.
@@ -116,6 +118,11 @@ type SettingsView struct {
 	daemonConnected  bool
 	daemonRestarting bool
 
+	// Auto-start (LaunchAgent on macOS).
+	autoStartStatus  launchagent.Status
+	autoStartBusy    bool   // true while install/uninstall is in flight
+	autoStartMessage string // last result, shown in detail panel
+
 	// Self-update.
 	argusSourcePath string
 	editingSource   bool   // true while inline-editing the source path
@@ -125,9 +132,10 @@ type SettingsView struct {
 	updateOutput    string // last go-install output (for detail panel)
 
 	// Callbacks.
-	OnRestartDaemon  func()
-	OnUpdateArgus    func() // triggered by the "Update Argus" row
-	OnNewProject     func()
+	OnRestartDaemon    func()
+	OnUpdateArgus      func()                 // triggered by the "Update Argus" row
+	OnToggleAutoStart  func(currentlyInstalled bool) // dispatched off the UI thread by app.go
+	OnNewProject       func()
 	OnEditProject    func(name string, p config.Project)
 	OnDeleteProject  func(name string)
 	OnNewBackend     func()
@@ -248,6 +256,11 @@ func (sv *SettingsView) Refresh() {
 	// Argus self-update source path.
 	sv.argusSourcePath = cfg.Argus.SourcePath
 
+	// Auto-start LaunchAgent status. CurrentStatus shells out to launchctl
+	// (~5ms) so refreshing on every Refresh is fine — Refresh runs at most
+	// once per second and on user-triggered refreshes.
+	sv.autoStartStatus = launchagent.CurrentStatus()
+
 	// Task counts — show empty on error (same graceful degradation as projects).
 	tasks, err := sv.database.Tasks()
 	if err != nil {
@@ -325,6 +338,25 @@ func (sv *SettingsView) rebuildRows() {
 			updateLabel = "  Updating..."
 		}
 		sv.rows = append(sv.rows, settingsRow{kind: srUpdateArgus, label: updateLabel, key: "_argus_update"})
+	}
+
+	// Auto-start at login (LaunchAgent on macOS only).
+	// Intentionally NOT gated on daemonConnected: the LaunchAgent operates on
+	// launchd config and is meaningful even when the daemon is offline (in fact,
+	// "no daemon running" is exactly when a user wants to enable auto-start).
+	if launchagent.Available() {
+		autoLabel := "  Auto-start at login: disabled"
+		if sv.autoStartStatus.Installed {
+			if sv.autoStartStatus.Loaded {
+				autoLabel = "  Auto-start at login: enabled"
+			} else {
+				autoLabel = "  Auto-start at login: installed (not loaded)"
+			}
+		}
+		if sv.autoStartBusy {
+			autoLabel = "  Auto-start at login: working..."
+		}
+		sv.rows = append(sv.rows, settingsRow{kind: srAutoStart, label: autoLabel, key: "_autostart"})
 	}
 
 	// Sandbox section.
@@ -695,8 +727,35 @@ func (sv *SettingsView) handleEnter() bool {
 			sv.OnUpdateArgus()
 		}
 		return true
+	case srAutoStart:
+		sv.toggleAutoStart()
+		return true
 	}
 	return false
+}
+
+// toggleAutoStart marks the row busy and dispatches the actual install/uninstall
+// to app.go via OnToggleAutoStart, which runs the launchctl work in a goroutine
+// and reports back via SetAutoStartResult. Runs entirely on the tview goroutine
+// — never blocks on launchctl.
+func (sv *SettingsView) toggleAutoStart() {
+	if !launchagent.Available() || sv.autoStartBusy || sv.OnToggleAutoStart == nil {
+		return
+	}
+	sv.autoStartBusy = true
+	sv.autoStartMessage = ""
+	sv.rebuildRows()
+	sv.OnToggleAutoStart(sv.autoStartStatus.Installed)
+}
+
+// SetAutoStartResult is called from the app goroutine (via QueueUpdateDraw)
+// once the install/uninstall completes. Clears busy, refreshes status, and
+// stores a message for the detail panel.
+func (sv *SettingsView) SetAutoStartResult(message string, status launchagent.Status) {
+	sv.autoStartBusy = false
+	sv.autoStartMessage = message
+	sv.autoStartStatus = status
+	sv.rebuildRows()
 }
 
 func (sv *SettingsView) handleDeleteOrDefault() bool {
@@ -1134,6 +1193,57 @@ func (sv *SettingsView) renderDetail(screen tcell.Screen, x, y, w, h int) {
 		sv.renderUpdateArgusDetail(screen, innerX, innerY, innerW, innerH)
 	case srSchedule:
 		sv.renderScheduleDetail(screen, innerX, innerY, innerW, innerH)
+	case srAutoStart:
+		sv.renderAutoStartDetail(screen, innerX, innerY, innerW, innerH)
+	}
+}
+
+func (sv *SettingsView) renderAutoStartDetail(screen tcell.Screen, x, y, w, h int) {
+	widget.DrawText(screen, x, y, w, "Auto-start at login", theme.StyleTitle)
+	r := 2
+
+	statusLabel := "Disabled"
+	statusColor := theme.ColorError
+	switch {
+	case sv.autoStartStatus.Installed && sv.autoStartStatus.Loaded:
+		statusLabel = "Enabled (running)"
+		statusColor = theme.ColorComplete
+	case sv.autoStartStatus.Installed:
+		statusLabel = "Installed (not loaded)"
+		statusColor = theme.ColorInProgress
+	}
+	widget.DrawText(screen, x, y+r, w, "Status: "+statusLabel, tcell.StyleDefault.Foreground(statusColor))
+	r += 2
+
+	if sv.autoStartStatus.PlistPath != "" {
+		widget.DrawText(screen, x, y+r, w, "Plist:", tcell.StyleDefault.Foreground(theme.ColorTitle))
+		r++
+		widget.DrawText(screen, x, y+r, w, "  "+sv.autoStartStatus.PlistPath, theme.StyleDimmed)
+		r += 2
+	}
+
+	if sv.autoStartMessage != "" && r < h-1 {
+		widget.DrawText(screen, x, y+r, w, sv.autoStartMessage, theme.StyleDimmed)
+		r += 2
+	}
+
+	if r < h-1 {
+		widget.DrawText(screen, x, y+r, w, "Uses launchd. Restarts on crash;", theme.StyleDimmed)
+		r++
+		widget.DrawText(screen, x, y+r, w, "honors `argus daemon stop` (clean exit).", theme.StyleDimmed)
+	}
+
+	if h > 1 {
+		var hint string
+		switch {
+		case sv.autoStartBusy:
+			hint = "working..."
+		case sv.autoStartStatus.Installed:
+			hint = "[enter] disable"
+		default:
+			hint = "[enter] enable"
+		}
+		widget.DrawText(screen, x, y+h-1, w, hint, theme.StyleDimmed)
 	}
 }
 

@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -1203,4 +1204,62 @@ func TestSettingsView_ScrollClampOnResize(t *testing.T) {
 
 	// scrollOff must clamp to 0 since all rows fit.
 	testutil.Equal(t, sv.scrollOff, 0)
+}
+
+// TestSettingsView_AutoStartRow verifies the auto-start LaunchAgent row appears
+// in the Status section on macOS regardless of daemon-connection state. The
+// LaunchAgent operates on launchd config and is meaningful even when the
+// daemon is offline, so the row is intentionally NOT gated on daemonConnected.
+func TestSettingsView_AutoStartRow(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("LaunchAgent only available on darwin")
+	}
+	for _, daemonConnected := range []bool{true, false} {
+		t.Run(fmt.Sprintf("connected=%v", daemonConnected), func(t *testing.T) {
+			sv := testSettingsView(t)
+			sv.SetDaemonConnected(daemonConnected)
+
+			found := false
+			for _, row := range sv.rows {
+				if row.kind == srAutoStart {
+					found = true
+					if !strings.Contains(row.label, "Auto-start at login") {
+						t.Errorf("auto-start row label = %q, want to contain 'Auto-start at login'", row.label)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("expected auto-start row in Status section on darwin")
+			}
+		})
+	}
+}
+
+// TestSettingsView_AutoStartToggleDispatchesCallback confirms that pressing
+// Enter on the auto-start row marks the row busy and fires OnToggleAutoStart
+// without performing any launchctl work synchronously on the UI thread.
+func TestSettingsView_AutoStartToggleDispatchesCallback(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("LaunchAgent only available on darwin")
+	}
+	sv := testSettingsView(t)
+	var got struct {
+		called    bool
+		installed bool
+	}
+	sv.OnToggleAutoStart = func(installed bool) {
+		got.called = true
+		got.installed = installed
+	}
+
+	for i, row := range sv.rows {
+		if row.kind == srAutoStart {
+			sv.cursor = i
+			break
+		}
+	}
+	consumed := sv.HandleKey(tcell.NewEventKey(tcell.KeyEnter, 0, tcell.ModNone))
+	testutil.Equal(t, consumed, true)
+	testutil.Equal(t, got.called, true)
+	testutil.Equal(t, sv.autoStartBusy, true)
 }
