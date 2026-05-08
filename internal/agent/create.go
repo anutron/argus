@@ -32,6 +32,19 @@ type CreateInput struct {
 	PRURL      string // optional; set for review tasks
 	BaseBranch string // optional; overrides projCfg.Branch for this task
 
+	// Runtime selects local vs cloud (exe.dev) execution. Defaults to
+	// RuntimeLocal so existing call sites stay byte-identical.
+	Runtime model.Runtime
+	// RemoteHost names the configured exe.dev host when Runtime==RuntimeExeDev.
+	RemoteHost string
+	// CreateRemoteWorkspace bootstraps a per-task working directory on the
+	// remote host. Returns the absolute remote path that becomes Task.Worktree.
+	// Required when Runtime==RuntimeExeDev.
+	CreateRemoteWorkspace func(taskName, baseBranch string) (path string, err error)
+	// DestroyRemoteWorkspace removes the remote workspace. Used as the
+	// compensating cleanup for CreateRemoteWorkspace and on task delete.
+	DestroyRemoteWorkspace func(path string) error
+
 	// AutoName, when true, fires a fire-and-forget Haiku rename in a
 	// background goroutine after the task is fully created. The DB write
 	// is race-guarded: it only overwrites Name if the row's current Name
@@ -98,8 +111,23 @@ func CreateAndStart(database *db.DB, runner SessionProvider, input CreateInput) 
 	if !ok {
 		return nil, nil, fmt.Errorf("project %q not found in config", input.Project)
 	}
-	if projCfg.Path == "" {
+	// Local runtime requires a configured project path; remote runtime does
+	// its own bootstrap on the VM and tolerates an empty Path.
+	if input.Runtime == model.RuntimeLocal && projCfg.Path == "" {
 		return nil, nil, fmt.Errorf("project %q has no path configured", input.Project)
+	}
+	if input.Runtime == model.RuntimeExeDev {
+		if input.RemoteHost == "" {
+			return nil, nil, fmt.Errorf("exedev runtime requires RemoteHost")
+		}
+		if input.CreateRemoteWorkspace == nil || input.DestroyRemoteWorkspace == nil {
+			return nil, nil, fmt.Errorf("exedev runtime requires Create/DestroyRemoteWorkspace callbacks")
+		}
+		if len(input.Attachments) > 0 || input.OnWorktreeCreated != nil {
+			// Out of scope for the first cut — surface clearly instead of
+			// silently dropping attachments / fork-context files.
+			return nil, nil, fmt.Errorf("exedev runtime does not yet support attachments or worktree hooks")
+		}
 	}
 
 	// Compensating-action stack: each successful side effect appends an undo
@@ -125,36 +153,60 @@ func CreateAndStart(database *db.DB, runner SessionProvider, input CreateInput) 
 		}
 	}
 
-	// Step 1: create worktree. BaseBranch overrides projCfg.Branch when set —
-	// the new-task form lets the user pick a custom start point per task.
+	// Step 1: create worktree. Local runtime gets a real `git worktree add`;
+	// exedev runtime bootstraps a directory on the remote VM via the
+	// supplied callback. Either way, the unwind cleanup destroys the
+	// worktree if any later step fails.
 	baseBranch := input.BaseBranch
 	if baseBranch == "" {
 		baseBranch = projCfg.Branch
 	}
-	wtPath, finalName, branchName, err := CreateWorktree(projCfg.Path, input.Project, input.Name, baseBranch)
-	if err != nil {
-		return nil, nil, fmt.Errorf("worktree: %w", err)
+	var (
+		wtPath, finalName, branchName string
+		err                           error
+	)
+	if input.Runtime == model.RuntimeExeDev {
+		finalName = input.Name
+		wtPath, err = input.CreateRemoteWorkspace(input.Name, baseBranch)
+		if err != nil {
+			return nil, nil, fmt.Errorf("remote workspace: %w", err)
+		}
+		// branchName stays empty for remote tasks — the remote workspace
+		// has its own branch state and we don't track it locally.
+		destroyRemote := input.DestroyRemoteWorkspace
+		cleanups = append(cleanups, func(trigger string) {
+			slog.Info("CreateAndStart unwind: destroy remote workspace", "trigger", trigger, "path", wtPath)
+			if dErr := destroyRemote(wtPath); dErr != nil {
+				slog.Warn("destroy remote workspace failed", "trigger", trigger, "path", wtPath, "err", dErr)
+			}
+		})
+	} else {
+		wtPath, finalName, branchName, err = CreateWorktree(projCfg.Path, input.Project, input.Name, baseBranch)
+		if err != nil {
+			return nil, nil, fmt.Errorf("worktree: %w", err)
+		}
+		repoPath := projCfg.Path
+		cleanups = append(cleanups, func(trigger string) {
+			slog.Info("CreateAndStart unwind: remove worktree", "trigger", trigger, "path", wtPath, "branch", branchName)
+			RemoveWorktreeAndBranch(wtPath, branchName, repoPath)
+		})
 	}
-	repoPath := projCfg.Path
-	cleanups = append(cleanups, func(trigger string) {
-		slog.Info("CreateAndStart unwind: remove worktree", "trigger", trigger, "path", wtPath, "branch", branchName)
-		RemoveWorktreeAndBranch(wtPath, branchName, repoPath)
-	})
 
-	// Step 2a: write user-uploaded attachments into <worktree>/.context/.
-	// Done before OnWorktreeCreated so fork-context files (which write into
-	// the same dir) can't collide with attachment names by chance.
-	attachPaths, err := writeAttachments(wtPath, input.Attachments)
-	if err != nil {
-		unwind("attachments", err)
-		return nil, nil, fmt.Errorf("attachments: %w", err)
-	}
-
-	// Step 2b: optional per-worktree hook (e.g. fork context files).
-	if input.OnWorktreeCreated != nil {
-		if err := input.OnWorktreeCreated(wtPath); err != nil {
-			unwind("OnWorktreeCreated", err)
-			return nil, nil, fmt.Errorf("worktree hook: %w", err)
+	// Step 2a/b: attachments + per-worktree hook (local-only). Remote
+	// runtime is gated above to forbid these inputs, so this branch only
+	// runs for local tasks where the helpers expect a local filesystem.
+	var attachPaths []string
+	if input.Runtime == model.RuntimeLocal {
+		attachPaths, err = writeAttachments(wtPath, input.Attachments)
+		if err != nil {
+			unwind("attachments", err)
+			return nil, nil, fmt.Errorf("attachments: %w", err)
+		}
+		if input.OnWorktreeCreated != nil {
+			if err := input.OnWorktreeCreated(wtPath); err != nil {
+				unwind("OnWorktreeCreated", err)
+				return nil, nil, fmt.Errorf("worktree hook: %w", err)
+			}
 		}
 	}
 
@@ -172,18 +224,24 @@ func CreateAndStart(database *db.DB, runner SessionProvider, input CreateInput) 
 		backend = cfg.Defaults.Backend
 	}
 	task := &model.Task{
-		Name:     finalName,
-		Status:   model.StatusPending,
-		Project:  input.Project,
-		Prompt:   prompt,
-		Backend:  backend,
-		Worktree: wtPath,
-		Branch:   branchName,
-		PRURL:    input.PRURL,
+		Name:       finalName,
+		Status:     model.StatusPending,
+		Project:    input.Project,
+		Prompt:     prompt,
+		Backend:    backend,
+		Worktree:   wtPath,
+		Branch:     branchName,
+		PRURL:      input.PRURL,
+		Runtime:    input.Runtime,
+		RemoteHost: input.RemoteHost,
 	}
 	// Persist sandbox state at creation time so the display reflects the
 	// setting active when the task was launched, not the current setting.
-	task.Sandboxed = IsTaskSandboxed(task, cfg)
+	// Remote tasks don't apply the local sandbox profile — the VM is the
+	// sandbox — so the field stays zero for them.
+	if input.Runtime == model.RuntimeLocal {
+		task.Sandboxed = IsTaskSandboxed(task, cfg)
+	}
 
 	if err := database.Add(task); err != nil {
 		unwind("db.Add", err)

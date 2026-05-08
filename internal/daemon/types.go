@@ -12,17 +12,23 @@ type BootInfoResp struct {
 }
 
 // StartReq is the RPC request to start a new agent session.
+//
+// Runtime + RemoteHost select between the local Runner and the exe.dev
+// remote provider. Empty Runtime is treated as "local" so legacy clients
+// keep working unchanged.
 type StartReq struct {
-	TaskID    string
-	SessionID string
-	Prompt    string
-	Project   string
-	Backend   string
-	Worktree  string
-	Branch    string
-	Rows      uint16
-	Cols      uint16
-	Resume    bool
+	TaskID     string
+	SessionID  string
+	Prompt     string
+	Project    string
+	Backend    string
+	Worktree   string
+	Branch     string
+	Runtime    string
+	RemoteHost string
+	Rows       uint16
+	Cols       uint16
+	Resume     bool
 }
 
 // StartResp is the RPC response from starting a session.

@@ -1339,6 +1339,17 @@ textarea.settings-input { min-height: 70px; resize: vertical; }
       <select id="create-backend"></select>
     </div>
     <div class="form-group">
+      <label>Runtime</label>
+      <select id="create-runtime" onchange="onRuntimeChange()">
+        <option value="local">Local (this machine)</option>
+        <option value="exedev">exe.dev (cloud)</option>
+      </select>
+    </div>
+    <div class="form-group" id="create-host-group" style="display:none">
+      <label>exe.dev host</label>
+      <select id="create-host"></select>
+    </div>
+    <div class="form-group">
       <label>Name (optional)</label>
       <input type="text" id="create-name" placeholder="Auto-generated from prompt">
     </div>
@@ -3930,6 +3941,34 @@ function renderCreateFilesList() {
   });
 })();
 
+function onRuntimeChange() {
+  const r = document.getElementById('create-runtime').value;
+  const hostGroup = document.getElementById('create-host-group');
+  hostGroup.style.display = r === 'exedev' ? 'block' : 'none';
+  if (r === 'exedev') populateExeDevHosts();
+}
+
+async function populateExeDevHosts() {
+  // Fetched once per session and cached. Errors fall through to an empty
+  // <select> — the create POST will return a clear error when no host
+  // is configured.
+  if (window._exedevHostsLoaded) return;
+  window._exedevHostsLoaded = true;
+  try {
+    const r = await api('/api/exedev/hosts');
+    if (!r.ok) return;
+    const data = await r.json();
+    const sel = document.getElementById('create-host');
+    sel.innerHTML = '';
+    for (const name of (data.hosts || [])) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      sel.appendChild(opt);
+    }
+  } catch (e) { /* swallow — UI will surface the create error */ }
+}
+
 async function createTask() {
   const project = document.getElementById('create-project').value;
   const name = document.getElementById('create-name').value.trim();
@@ -3937,6 +3976,12 @@ async function createTask() {
   // Empty backend = let the server use the configured default. The dropdown
   // is a no-op until /api/backends loads, so we tolerate the empty case.
   const backend = document.getElementById('create-backend').value;
+  const runtime = document.getElementById('create-runtime').value || 'local';
+  const remoteHost = runtime === 'exedev' ? (document.getElementById('create-host').value || '') : '';
+  if (runtime === 'exedev' && !remoteHost) {
+    showToast('Select an exe.dev host (or configure one in Settings)');
+    return;
+  }
   if (!project) { showToast('Select a project'); return; }
   if (!prompt && !name && createFiles.length === 0) {
     showToast('Enter a name, prompt, or attach a file');
@@ -3960,7 +4005,7 @@ async function createTask() {
     } else {
       r = await api('/api/tasks', {
         method: 'POST',
-        body: JSON.stringify({ name, prompt, project, backend })
+        body: JSON.stringify({ name, prompt, project, backend, runtime, remote_host: remoteHost })
       });
     }
     const data = await r.json();

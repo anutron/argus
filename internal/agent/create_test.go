@@ -485,3 +485,148 @@ func TestCreateAndStart_StartedAtSetOnSuccess(t *testing.T) {
 	}
 	RemoveWorktreeAndBranch(task.Worktree, task.Branch, repo)
 }
+
+// --- exedev runtime tests ---
+
+func TestCreateAndStart_ExeDevSkipsLocalWorktree(t *testing.T) {
+	repo := initGitRepo(t)
+	d := createTestDB(t, repo)
+	fr := &fakeRunner{sessionPID: 7777}
+
+	var createCalls, destroyCalls int
+	createWS := func(name, _ string) (string, error) {
+		createCalls++
+		return "/remote/argus/" + name, nil
+	}
+	destroyWS := func(string) error {
+		destroyCalls++
+		return nil
+	}
+
+	task, sess, err := CreateAndStart(d, fr, CreateInput{
+		Name:                   "cloud-task",
+		Project:                "proj",
+		Backend:                "test",
+		Runtime:                model.RuntimeExeDev,
+		RemoteHost:             "primary",
+		CreateRemoteWorkspace:  createWS,
+		DestroyRemoteWorkspace: destroyWS,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sess == nil || task == nil {
+		t.Fatal("nil result on success")
+	}
+	if createCalls != 1 {
+		t.Fatalf("createCalls=%d, want 1", createCalls)
+	}
+	if destroyCalls != 0 {
+		t.Fatalf("destroyCalls=%d on success, want 0", destroyCalls)
+	}
+	if task.Worktree != "/remote/argus/cloud-task" {
+		t.Fatalf("task.Worktree=%q want /remote/argus/cloud-task", task.Worktree)
+	}
+	if task.Runtime != model.RuntimeExeDev {
+		t.Fatalf("task.Runtime=%v want RuntimeExeDev", task.Runtime)
+	}
+	if task.RemoteHost != "primary" {
+		t.Fatalf("task.RemoteHost=%q want primary", task.RemoteHost)
+	}
+	if task.Branch != "" {
+		t.Fatalf("task.Branch=%q want empty for remote", task.Branch)
+	}
+	if task.Sandboxed {
+		t.Fatal("task.Sandboxed should be false for remote runtime")
+	}
+}
+
+func TestCreateAndStart_ExeDevUnwindOnStartFailure(t *testing.T) {
+	repo := initGitRepo(t)
+	d := createTestDB(t, repo)
+	fr := &fakeRunner{startErr: errors.New("boom")}
+
+	var destroyCalls int
+	createWS := func(name, _ string) (string, error) {
+		return "/remote/argus/" + name, nil
+	}
+	destroyWS := func(string) error {
+		destroyCalls++
+		return nil
+	}
+
+	_, _, err := CreateAndStart(d, fr, CreateInput{
+		Name:                   "fail-task",
+		Project:                "proj",
+		Backend:                "test",
+		Runtime:                model.RuntimeExeDev,
+		RemoteHost:             "primary",
+		CreateRemoteWorkspace:  createWS,
+		DestroyRemoteWorkspace: destroyWS,
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if destroyCalls != 1 {
+		t.Fatalf("destroyCalls=%d, want 1 (compensating cleanup)", destroyCalls)
+	}
+	// DB row should also have been removed.
+	rows, _ := d.Tasks()
+	if len(rows) != 0 {
+		t.Fatalf("orphan task rows after unwind: %d", len(rows))
+	}
+}
+
+func TestCreateAndStart_ExeDevRejectsAttachments(t *testing.T) {
+	repo := initGitRepo(t)
+	d := createTestDB(t, repo)
+	fr := &fakeRunner{}
+
+	_, _, err := CreateAndStart(d, fr, CreateInput{
+		Name:                   "ax",
+		Project:                "proj",
+		Backend:                "test",
+		Runtime:                model.RuntimeExeDev,
+		RemoteHost:             "primary",
+		CreateRemoteWorkspace:  func(string, string) (string, error) { return "/x", nil },
+		DestroyRemoteWorkspace: func(string) error { return nil },
+		Attachments:            []Attachment{{Name: "x.txt", Data: []byte("y")}},
+	})
+	if err == nil {
+		t.Fatal("expected error for attachments + exedev")
+	}
+	if !strings.Contains(err.Error(), "attachments") {
+		t.Fatalf("error should mention attachments: %v", err)
+	}
+}
+
+func TestCreateAndStart_ExeDevRequiresHost(t *testing.T) {
+	repo := initGitRepo(t)
+	d := createTestDB(t, repo)
+	fr := &fakeRunner{}
+
+	_, _, err := CreateAndStart(d, fr, CreateInput{
+		Name:    "noh",
+		Project: "proj",
+		Runtime: model.RuntimeExeDev,
+	})
+	if err == nil || !strings.Contains(err.Error(), "RemoteHost") {
+		t.Fatalf("expected RemoteHost error, got %v", err)
+	}
+}
+
+func TestCreateAndStart_ExeDevRequiresCallbacks(t *testing.T) {
+	repo := initGitRepo(t)
+	d := createTestDB(t, repo)
+	fr := &fakeRunner{}
+
+	_, _, err := CreateAndStart(d, fr, CreateInput{
+		Name:       "noc",
+		Project:    "proj",
+		Runtime:    model.RuntimeExeDev,
+		RemoteHost: "primary",
+	})
+	if err == nil || !strings.Contains(err.Error(), "callback") {
+		t.Fatalf("expected callback error, got %v", err)
+	}
+}

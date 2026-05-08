@@ -35,21 +35,38 @@ func (s *RPCService) BootInfo(_ *Empty, resp *BootInfoResp) error {
 }
 
 // StartSession starts a new agent session.
+//
+// Runtime selection: req.Runtime ("" or "local" → local runner; "exedev" →
+// exe.dev provider, lazy-initialized on first use). req.RemoteHost names the
+// configured host when Runtime="exedev". Legacy clients that don't set
+// Runtime keep getting the local runner.
 func (s *RPCService) StartSession(req *StartReq, resp *StartResp) error {
-	slog.Info("rpc.StartSession", "task", req.TaskID, "session", req.SessionID, "project", req.Project, "resume", req.Resume, "cols", req.Cols, "rows", req.Rows, "worktree", req.Worktree)
+	slog.Info("rpc.StartSession", "task", req.TaskID, "session", req.SessionID, "project", req.Project, "resume", req.Resume, "cols", req.Cols, "rows", req.Rows, "worktree", req.Worktree, "runtime", req.Runtime, "host", req.RemoteHost)
+
+	runtime, err := model.ParseRuntime(req.Runtime)
+	if err != nil {
+		resp.Error = err.Error()
+		return nil
+	}
 
 	task := &model.Task{
-		ID:        req.TaskID,
-		SessionID: req.SessionID,
-		Prompt:    req.Prompt,
-		Project:   req.Project,
-		Backend:   req.Backend,
-		Worktree:  req.Worktree,
-		Branch:    req.Branch,
+		ID:         req.TaskID,
+		SessionID:  req.SessionID,
+		Prompt:     req.Prompt,
+		Project:    req.Project,
+		Backend:    req.Backend,
+		Worktree:   req.Worktree,
+		Branch:     req.Branch,
+		Runtime:    runtime,
+		RemoteHost: req.RemoteHost,
+	}
+
+	if runtime == model.RuntimeExeDev {
+		s.daemon.EnsureExeDevProvider()
 	}
 
 	cfg := s.daemon.db.Config()
-	sess, err := s.daemon.runner.Start(task, cfg, req.Rows, req.Cols, req.Resume)
+	sess, err := s.daemon.SessionProvider().Start(task, cfg, req.Rows, req.Cols, req.Resume)
 	if err != nil {
 		slog.Error("rpc.StartSession failed", "task", req.TaskID, "err", err)
 		resp.Error = err.Error()
@@ -63,7 +80,7 @@ func (s *RPCService) StartSession(req *StartReq, resp *StartResp) error {
 // StopSession stops a running session.
 func (s *RPCService) StopSession(req *TaskIDReq, resp *StatusResp) error {
 	slog.Info("rpc.StopSession", "task", req.TaskID)
-	if err := s.daemon.runner.Stop(req.TaskID); err != nil {
+	if err := s.daemon.SessionProvider().Stop(req.TaskID); err != nil {
 		slog.Error("rpc.StopSession failed", "task", req.TaskID, "err", err)
 		resp.Error = err.Error()
 		return nil
@@ -76,7 +93,7 @@ func (s *RPCService) StopSession(req *TaskIDReq, resp *StatusResp) error {
 // StopAll stops all running sessions.
 func (s *RPCService) StopAll(_ *Empty, resp *StatusResp) error {
 	slog.Info("rpc.StopAll")
-	s.daemon.runner.StopAll()
+	s.daemon.SessionProvider().StopAll()
 	slog.Info("rpc.StopAll ok")
 	resp.OK = true
 	return nil
@@ -84,7 +101,7 @@ func (s *RPCService) StopAll(_ *Empty, resp *StatusResp) error {
 
 // SessionStatus returns info about a single session.
 func (s *RPCService) SessionStatus(req *TaskIDReq, resp *SessionInfo) error {
-	sess := s.daemon.runner.Get(req.TaskID)
+	sess := s.daemon.SessionProvider().Get(req.TaskID)
 	if sess == nil {
 		resp.TaskID = req.TaskID
 		return nil
@@ -105,10 +122,20 @@ func (s *RPCService) SessionStatus(req *TaskIDReq, resp *SessionInfo) error {
 }
 
 // ListSessions returns info about all running sessions.
+//
+// Iterates the unified provider's running set so remote (exe.dev) tasks
+// surface alongside local ones. Each ID is then re-fetched through Get to
+// pull a typed handle — Running() doesn't return handles directly because
+// SessionProvider keeps the set & handle accessors separate.
 func (s *RPCService) ListSessions(_ *Empty, resp *ListResp) error {
-	sessions := s.daemon.runner.Sessions()
-	resp.Sessions = make([]SessionInfo, 0, len(sessions))
-	for id, sess := range sessions {
+	provider := s.daemon.SessionProvider()
+	ids := provider.Running()
+	resp.Sessions = make([]SessionInfo, 0, len(ids))
+	for _, id := range ids {
+		sess := provider.Get(id)
+		if sess == nil {
+			continue
+		}
 		cols, rows := sess.PTYSize()
 		initCols, initRows := sess.InitialPTYSize()
 		resp.Sessions = append(resp.Sessions, SessionInfo{
@@ -129,7 +156,7 @@ func (s *RPCService) ListSessions(_ *Empty, resp *ListResp) error {
 
 // WriteInput sends data to a session's PTY stdin.
 func (s *RPCService) WriteInput(req *WriteReq, resp *StatusResp) error {
-	sess := s.daemon.runner.Get(req.TaskID)
+	sess := s.daemon.SessionProvider().Get(req.TaskID)
 	if sess == nil {
 		resp.Error = "session not found"
 		return nil
@@ -144,7 +171,7 @@ func (s *RPCService) WriteInput(req *WriteReq, resp *StatusResp) error {
 
 // Resize changes a session's PTY dimensions.
 func (s *RPCService) Resize(req *ResizeReq, resp *StatusResp) error {
-	sess := s.daemon.runner.Get(req.TaskID)
+	sess := s.daemon.SessionProvider().Get(req.TaskID)
 	if sess == nil {
 		resp.Error = "session not found"
 		return nil

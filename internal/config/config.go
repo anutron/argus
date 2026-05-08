@@ -16,7 +16,37 @@ type Config struct {
 	KB          KBConfig           `toml:"kb"`
 	API         APIConfig          `toml:"api"`
 	Argus       ArgusConfig        `toml:"argus"`
+	ExeDev      ExeDevConfig       `toml:"exedev"`
 }
+
+// ExeDevConfig holds the list of remote exe.dev VMs available for cloud
+// runtime tasks. Persisted as JSON under config key "exedev.hosts".
+type ExeDevConfig struct {
+	Hosts map[string]ExeDevHost `toml:"hosts" json:"hosts"`
+}
+
+// ExeDevHost describes a single exe.dev VM. Name is the user-facing label
+// (matches Task.RemoteHost). Host/Port/User identify the SSH endpoint.
+// IdentityFile is the absolute path to a private key. WorkspaceRoot is the
+// remote directory where per-task workspaces are created.
+type ExeDevHost struct {
+	Host          string `toml:"host"           json:"host"`
+	Port          int    `toml:"port"           json:"port,omitempty"`
+	User          string `toml:"user"           json:"user"`
+	IdentityFile  string `toml:"identity_file"  json:"identity_file,omitempty"`
+	WorkspaceRoot string `toml:"workspace_root" json:"workspace_root,omitempty"`
+	// AgentCommand overrides cfg.Backends[task.Backend].Command for this host
+	// when set. Empty = use the configured backend command verbatim. Useful
+	// when the remote VM has a different binary path or wrapper.
+	AgentCommand string `toml:"agent_command" json:"agent_command,omitempty"`
+}
+
+// DefaultExeDevPort is the SSH port used when ExeDevHost.Port is unset.
+const DefaultExeDevPort = 22
+
+// DefaultExeDevWorkspaceRoot is the remote directory under which per-task
+// workspaces are created when ExeDevHost.WorkspaceRoot is unset.
+const DefaultExeDevWorkspaceRoot = "~/argus"
 
 // ArgusConfig holds settings for self-updating the Argus binary.
 type ArgusConfig struct {
@@ -134,7 +164,26 @@ func DefaultConfig() Config {
 		API: APIConfig{
 			HTTPPort: 7743,
 		},
+		ExeDev: ExeDevConfig{
+			Hosts: map[string]ExeDevHost{},
+		},
 	}
+}
+
+// ResolvedPort returns h.Port or DefaultExeDevPort.
+func (h ExeDevHost) ResolvedPort() int {
+	if h.Port == 0 {
+		return DefaultExeDevPort
+	}
+	return h.Port
+}
+
+// ResolvedWorkspaceRoot returns h.WorkspaceRoot or DefaultExeDevWorkspaceRoot.
+func (h ExeDevHost) ResolvedWorkspaceRoot() string {
+	if h.WorkspaceRoot == "" {
+		return DefaultExeDevWorkspaceRoot
+	}
+	return h.WorkspaceRoot
 }
 
 func DefaultKeybindings() Keybindings {

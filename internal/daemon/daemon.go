@@ -20,7 +20,9 @@ import (
 	"github.com/drn/argus/internal/agent"
 	"github.com/drn/argus/internal/api"
 	"github.com/drn/argus/internal/clipboard"
+	"github.com/drn/argus/internal/config"
 	"github.com/drn/argus/internal/db"
+	"github.com/drn/argus/internal/exedev"
 	"github.com/drn/argus/internal/inject"
 	injectcodex "github.com/drn/argus/internal/inject/codex"
 	"github.com/drn/argus/internal/kb"
@@ -53,6 +55,9 @@ type ExitInfo struct {
 type Daemon struct {
 	db        *db.DB
 	runner    *agent.Runner
+	exedevP   *exedev.Provider     // nil until first remote task is started; lazy init
+	router    *agent.RuntimeRouter // unified SessionProvider over runner + exedevP
+	onFinish  func(string, error, bool, []byte) // shared by both providers; reused at lazy-init
 	listener  net.Listener
 	streams   map[string][]net.Conn // taskID → connected stream clients
 	exitInfos map[string]ExitInfo    // taskID → cached exit info (brief)
@@ -100,9 +105,10 @@ func New(database *db.DB) *Daemon {
 		}
 	}
 
-	// Create runner with onFinish callback that caches exit info, flips
-	// the DB status, and notifies stream clients by closing their connections.
-	d.runner = agent.NewRunner(func(taskID string, err error, stopped bool, lastOutput []byte) {
+	// onFinish is shared by both the local runner and the lazy-init exe.dev
+	// provider — same exit semantics for both runtimes (cache exit info,
+	// flip DB status, notify stream clients, clear staged clipboard).
+	onFinish := func(taskID string, err error, stopped bool, lastOutput []byte) {
 		slog.Info("session exited", "task", taskID, "stopped", stopped, "err", err, "lastOutputBytes", len(lastOutput))
 
 		var errStr string
@@ -139,7 +145,16 @@ func New(database *db.DB) *Daemon {
 		// agent that staged it is gone, the user shouldn't see a stale
 		// copy button after the session ends.
 		d.clipboard.Clear(taskID)
-	})
+	}
+
+	d.runner = agent.NewRunner(onFinish)
+
+	// exe.dev provider is lazy: only instantiated once a task with
+	// RuntimeExeDev is actually started, so vanilla local-only deployments
+	// pay no cost. The router is created up-front with a nil remote so
+	// callers always go through the same dispatch surface.
+	d.router = agent.NewRuntimeRouter(d.runner, nil)
+	d.onFinish = onFinish
 
 	return d
 }
@@ -147,6 +162,30 @@ func New(database *db.DB) *Daemon {
 // Runner returns the underlying runner for direct access (e.g., AddWriter).
 func (d *Daemon) Runner() *agent.Runner {
 	return d.runner
+}
+
+// SessionProvider returns the unified provider that routes calls to the
+// local runner or exe.dev provider per task. RPC and HTTP API code should
+// use this instead of Runner() so cloud tasks aren't accidentally bypassed.
+func (d *Daemon) SessionProvider() agent.SessionProvider {
+	return d.router
+}
+
+// EnsureExeDevProvider returns the lazy-initialized exe.dev provider, dialing
+// it into existence on first use. Pulls the host map from the DB on every
+// Start so a config edit takes effect without restarting the daemon.
+func (d *Daemon) EnsureExeDevProvider() *exedev.Provider {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.exedevP != nil {
+		return d.exedevP
+	}
+	hostsFn := func() map[string]config.ExeDevHost {
+		return d.db.Config().ExeDev.Hosts
+	}
+	d.exedevP = exedev.NewProvider(hostsFn, d.onFinish)
+	d.router = agent.NewRuntimeRouter(d.runner, d.exedevP)
+	return d.exedevP
 }
 
 // transitionTaskOnExit flips an InProgress task to its terminal status when
@@ -325,6 +364,24 @@ func (d *Daemon) Serve(sockPath string) error {
 			apiSrv := api.New(d.db, d.runner, token, func(name, prompt, project, backend string, autoName bool) (*model.Task, error) {
 				return HeadlessCreateTask(d.db, d.runner, name, prompt, project, backend, autoName)
 			}, pushMgr)
+			apiSrv.SetRuntimeCreator(func(in api.RuntimeCreateInput) (*model.Task, error) {
+				runtime, err := model.ParseRuntime(in.Runtime)
+				if err != nil {
+					return nil, err
+				}
+				if runtime == model.RuntimeExeDev {
+					d.EnsureExeDevProvider()
+				}
+				return HeadlessCreateTaskWithRuntime(d.db, d.SessionProvider(), d.exedevP, HeadlessInput{
+					Name:       in.Name,
+					Prompt:     in.Prompt,
+					Project:    in.Project,
+					Backend:    in.Backend,
+					AutoName:   in.AutoName,
+					Runtime:    runtime,
+					RemoteHost: in.RemoteHost,
+				})
+			})
 			apiSrv.SetScheduler(sch)
 			apiSrv.SetClipboard(d.clipboard)
 			d.apiServer = apiSrv

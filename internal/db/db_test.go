@@ -1653,3 +1653,65 @@ func TestDB_TaskByPRURL(t *testing.T) {
 		}
 	})
 }
+
+// --- exedev hosts + Runtime tests ---
+
+func TestDB_SetExeDevHosts_RoundTrip(t *testing.T) {
+	d := testDB(t)
+
+	hosts := map[string]config.ExeDevHost{
+		"primary": {
+			Host:          "vm1.exe.dev",
+			Port:          22,
+			User:          "darren",
+			IdentityFile:  "/Users/darren/.ssh/id_ed25519",
+			WorkspaceRoot: "~/argus",
+		},
+		"secondary": {
+			Host: "vm2.exe.dev",
+			User: "darren",
+		},
+	}
+
+	if err := d.SetExeDevHosts(hosts); err != nil {
+		t.Fatal(err)
+	}
+	got := d.Config().ExeDev.Hosts
+	testutil.DeepEqual(t, got, hosts)
+}
+
+func TestDB_SetExeDevHosts_EmptyMap(t *testing.T) {
+	d := testDB(t)
+	if err := d.SetExeDevHosts(nil); err != nil {
+		t.Fatal(err)
+	}
+	got := d.Config().ExeDev.Hosts
+	testutil.DeepEqual(t, got, map[string]config.ExeDevHost{})
+}
+
+func TestDB_TaskRuntimeRoundTrip(t *testing.T) {
+	d := testDB(t)
+	task := &model.Task{
+		Name:       "cloud task",
+		Runtime:    model.RuntimeExeDev,
+		RemoteHost: "primary",
+	}
+	if err := d.Add(task); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.Get(task.ID)
+	testutil.NoError(t, err)
+	testutil.Equal(t, got.Runtime, model.RuntimeExeDev)
+	testutil.Equal(t, got.RemoteHost, "primary")
+}
+
+func TestDB_TaskRuntimeDefault(t *testing.T) {
+	d := testDB(t)
+	task := &model.Task{Name: "default"}
+	if err := d.Add(task); err != nil {
+		t.Fatal(err)
+	}
+	got, err := d.Get(task.ID)
+	testutil.NoError(t, err)
+	testutil.Equal(t, got.Runtime, model.RuntimeLocal)
+}

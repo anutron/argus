@@ -25,13 +25,32 @@ import (
 // rather than user-typed.
 type TaskCreator func(name, prompt, project, backend string, autoName bool) (*model.Task, error)
 
+// RuntimeTaskCreator is the runtime-aware sibling of TaskCreator. It accepts
+// the runtime + remote-host fields needed to dispatch a cloud (exe.dev) task.
+// Daemon wires it to HeadlessCreateTaskWithRuntime; tests can leave it nil to
+// keep the API local-only.
+type RuntimeTaskCreator func(in RuntimeCreateInput) (*model.Task, error)
+
+// RuntimeCreateInput is the API-side mirror of daemon.HeadlessInput. Kept as
+// a local struct so the api package doesn't import daemon (cycle).
+type RuntimeCreateInput struct {
+	Name       string
+	Prompt     string
+	Project    string
+	Backend    string
+	AutoName   bool
+	Runtime    string
+	RemoteHost string
+}
+
 // Server is the HTTP REST API server.
 type Server struct {
-	db         *db.DB
-	runner     *agent.Runner
-	token      string
-	createTask TaskCreator
-	httpSrv    *http.Server
+	db                *db.DB
+	runner            *agent.Runner
+	token             string
+	createTask        TaskCreator
+	createTaskRuntime RuntimeTaskCreator // optional; nil disables exe.dev path
+	httpSrv           *http.Server
 	push       *push.Manager
 	scheduler  ScheduleRunner   // optional; set by SetScheduler before ListenAndServe
 	clipboard  *clipboard.Store // optional; set by SetClipboard before ListenAndServe
@@ -124,6 +143,13 @@ func (s *Server) ListenAndServe(port int) (int, error) {
 		}
 	}()
 	return actualPort, nil
+}
+
+// SetRuntimeCreator wires the optional runtime-aware creator. Daemon calls
+// this after constructing the api.Server so cloud-runtime task creation is
+// available to the JSON POST /api/tasks handler.
+func (s *Server) SetRuntimeCreator(c RuntimeTaskCreator) {
+	s.createTaskRuntime = c
 }
 
 // Shutdown gracefully stops the HTTP server and signals background goroutines

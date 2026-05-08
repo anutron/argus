@@ -72,6 +72,12 @@ func (d *DB) createTables() error {
 	// Add sandboxed column to existing tasks tables.
 	d.conn.Exec(`ALTER TABLE tasks ADD COLUMN sandboxed INTEGER NOT NULL DEFAULT 0`) //nolint:errcheck
 
+	// Add runtime + remote_host columns to existing tasks tables. runtime is
+	// 'local' (default) or 'exedev'; remote_host names a host configured under
+	// config.ExeDevConfig.Hosts when runtime='exedev'.
+	d.conn.Exec(`ALTER TABLE tasks ADD COLUMN runtime     TEXT NOT NULL DEFAULT 'local'`) //nolint:errcheck
+	d.conn.Exec(`ALTER TABLE tasks ADD COLUMN remote_host TEXT NOT NULL DEFAULT ''`)      //nolint:errcheck
+
 	// Drop the legacy todo_path column and its index. The Obsidian vault feature
 	// has been removed; the column may still exist on databases created before
 	// the removal. SQLite supports DROP COLUMN since 3.35; the IF EXISTS clauses

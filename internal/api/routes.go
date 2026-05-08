@@ -88,8 +88,22 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("PUT /api/schedules/{id}", s.handleUpdateSchedule)
 	mux.HandleFunc("DELETE /api/schedules/{id}", s.handleDeleteSchedule)
 	mux.HandleFunc("POST /api/schedules/{id}/run", s.handleRunSchedule)
+	mux.HandleFunc("GET /api/exedev/hosts", s.handleListExeDevHosts)
 
 	return mux
+}
+
+// handleListExeDevHosts returns the names of configured exe.dev hosts.
+// Used by the PWA new-task form to populate the host dropdown when the user
+// switches Runtime to "exe.dev". Empty list means no hosts are configured;
+// the PWA surfaces a clear error in that case before POSTing.
+func (s *Server) handleListExeDevHosts(w http.ResponseWriter, _ *http.Request) {
+	cfg := s.db.Config()
+	names := make([]string, 0, len(cfg.ExeDev.Hosts))
+	for name := range cfg.ExeDev.Hosts {
+		names = append(names, name)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"hosts": names})
 }
 
 // handleDashboard serves the embedded HTML dashboard.

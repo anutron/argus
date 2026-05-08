@@ -1,6 +1,7 @@
 package db
 
 import (
+	"encoding/json"
 	"log/slog"
 	"strconv"
 
@@ -127,7 +128,31 @@ func (d *DB) Config() config.Config {
 		cfg.Argus.SourcePath = v
 	}
 
+	// exe.dev remote hosts. Stored as JSON because the shape is structured.
+	// Unparseable JSON falls back to an empty map rather than crashing the
+	// daemon — a bad row still lets the local runtime keep working.
+	if v, ok := kv["exedev.hosts"]; ok && v != "" {
+		var hosts map[string]config.ExeDevHost
+		if err := json.Unmarshal([]byte(v), &hosts); err == nil {
+			cfg.ExeDev.Hosts = hosts
+		} else {
+			slog.Warn("db.Config: failed to parse exedev.hosts JSON", "err", err)
+		}
+	}
+
 	return cfg
+}
+
+// SetExeDevHosts persists the exe.dev host map as JSON under "exedev.hosts".
+func (d *DB) SetExeDevHosts(hosts map[string]config.ExeDevHost) error {
+	if hosts == nil {
+		hosts = map[string]config.ExeDevHost{}
+	}
+	data, err := json.Marshal(hosts)
+	if err != nil {
+		return err
+	}
+	return d.SetConfigValue("exedev.hosts", string(data))
 }
 
 func (d *DB) SetConfigValue(key, value string) error {

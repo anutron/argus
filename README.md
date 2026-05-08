@@ -96,6 +96,14 @@ A terminal-native LLM code orchestrator. Manage multiple Claude Code / Codex ses
 - **Credential protection** — Blocks reads to `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.config/gcloud` by default
 - **Per-project config** — Global and per-project sandbox settings with deny-read and extra-write path overrides
 
+### Cloud runtime (exe.dev)
+
+- **Per-task toggle** — Each new task picks Local or exe.dev runtime in the new-task form (PWA select). Default is Local; legacy tasks keep working unchanged
+- **Full PTY over SSH** — Cloud tasks run on a persistent exe.dev VM with a real remote PTY. Same byte stream and same TUI surface as local tasks; resize, scrollback, and idle detection all work identically
+- **Remote workspace** — Argus creates a per-task directory on the VM (default `~/argus/<task>`); local code never stats it. Agent CLIs run inside `bash -lc` so login-shell PATH (nvm, asdf, etc.) is honoured
+- **Strict host-key auth** — `~/.ssh/known_hosts` must already contain the host. Run `ssh <host>` once interactively before pointing Argus at it. Auth is private-key only (defaults to `~/.ssh/id_ed25519`); no passwords or agent forwarding
+- **Configure hosts** in the DB config table under key `exedev.hosts` (JSON: `{<name>: {host, user, identity_file?, workspace_root?, agent_command?}}`). The PWA new-task form fetches the host list from `GET /api/exedev/hosts`
+
 ### Terminal & Rendering
 
 - **Full PTY emulation** — x/vt terminal emulator with direct cell painting to tcell. Supports colors, attributes (bold, faint, italic, strikethrough), underline styles, and OSC 8 hyperlinks

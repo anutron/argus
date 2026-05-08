@@ -231,6 +231,10 @@ type createTaskReq struct {
 	// per-project / global default. Validated against the configured backends
 	// before the task is created.
 	Backend string `json:"backend"`
+	// Runtime selects local vs cloud execution. Empty/"local" → local;
+	// "exedev" → run on the configured RemoteHost.
+	Runtime    string `json:"runtime,omitempty"`
+	RemoteHost string `json:"remote_host,omitempty"`
 }
 
 func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
@@ -268,9 +272,29 @@ func (s *Server) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		name = sanitizeName(req.Prompt)
 	}
 
-	task, err := s.createTask(name, req.Prompt, req.Project, req.Backend, autoName)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	var (
+		task *model.Task
+		cerr error
+	)
+	if req.Runtime != "" && req.Runtime != "local" {
+		if s.createTaskRuntime == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "runtime task creation not configured"})
+			return
+		}
+		task, cerr = s.createTaskRuntime(RuntimeCreateInput{
+			Name:       name,
+			Prompt:     req.Prompt,
+			Project:    req.Project,
+			Backend:    req.Backend,
+			AutoName:   autoName,
+			Runtime:    req.Runtime,
+			RemoteHost: req.RemoteHost,
+		})
+	} else {
+		task, cerr = s.createTask(name, req.Prompt, req.Project, req.Backend, autoName)
+	}
+	if cerr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": cerr.Error()})
 		return
 	}
 

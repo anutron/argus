@@ -22,9 +22,21 @@ type Task struct {
 	Sandboxed     bool      `json:"sandboxed,omitempty"`
 	Archived      bool      `json:"archived,omitempty"`
 	WaitingReview bool      `json:"waiting_review,omitempty"`
+	Runtime       Runtime   `json:"runtime,omitempty"`
+	RemoteHost    string    `json:"remote_host,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
 	StartedAt     time.Time `json:"started_at,omitempty"`
 	EndedAt       time.Time `json:"ended_at,omitempty"`
+}
+
+// IsRemote reports whether this task runs on a remote host (e.g. exe.dev).
+// Local-only code (worktree removal, sandbox profiles, attachment writes,
+// orphan-worktree sweeping) MUST gate on !task.IsRemote() — task.Worktree
+// holds a path on the remote VM in that case, and treating it as a local
+// path would either silently no-op or destructively recurse on a same-name
+// directory under the user's home.
+func (t *Task) IsRemote() bool {
+	return t.Runtime != RuntimeLocal
 }
 
 // Elapsed returns the duration since the task was started.

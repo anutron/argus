@@ -110,16 +110,18 @@ func (c *Client) Close() error {
 func (c *Client) Start(task *model.Task, cfg config.Config, rows, cols uint16, resume bool) (agent.SessionHandle, error) {
 	uxlog.Log("client.Start: task=%s session=%s resume=%v", task.ID, task.SessionID, resume)
 	req := &daemon.StartReq{
-		TaskID:    task.ID,
-		SessionID: task.SessionID,
-		Prompt:    task.Prompt,
-		Project:   task.Project,
-		Backend:   task.Backend,
-		Worktree:  task.Worktree,
-		Branch:    task.Branch,
-		Rows:      rows,
-		Cols:      cols,
-		Resume:    resume,
+		TaskID:     task.ID,
+		SessionID:  task.SessionID,
+		Prompt:     task.Prompt,
+		Project:    task.Project,
+		Backend:    task.Backend,
+		Worktree:   task.Worktree,
+		Branch:     task.Branch,
+		Runtime:    task.Runtime.String(),
+		RemoteHost: task.RemoteHost,
+		Rows:       rows,
+		Cols:       cols,
+		Resume:     resume,
 	}
 
 	var resp daemon.StartResp
