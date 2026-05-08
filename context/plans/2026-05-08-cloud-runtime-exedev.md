@@ -10,11 +10,11 @@
 
 ## Decisions (from clarifying questions)
 
-| Question | Answer |
-|---|---|
-| Where does the runtime choice live? | **Per-task toggle**. New-task form has a Local / exe.dev radio. |
-| Worktree model | **Remote-only**. No local `git worktree add` for cloud tasks. The repo lives in `~/argus/<task>` on the VM. |
-| Terminal pane | **Full PTY over SSH**. SSH gives us PTY, resize, stdin write, raw stdout — same surface as local. |
+| Question                            | Answer                                                                                                      |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Where does the runtime choice live? | **Per-task toggle**. New-task form has a Local / exe.dev radio.                                             |
+| Worktree model                      | **Remote-only**. No local `git worktree add` for cloud tasks. The repo lives in `~/argus/<task>` on the VM. |
+| Terminal pane                       | **Full PTY over SSH**. SSH gives us PTY, resize, stdin write, raw stdout — same surface as local.           |
 
 ## Architecture
 

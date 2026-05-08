@@ -14,7 +14,7 @@ counterpart deviates and where that drift can bite.
   may exist locally by coincidence.
 - **`Sandboxed` is always false for remote tasks.** `CreateAndStart` skips
   `IsTaskSandboxed` for remote runtime; the VM is the sandbox. A `Sandboxed:
-  true` row with `Runtime: exedev` is a corruption indicator.
+true` row with `Runtime: exedev` is a corruption indicator.
 - **Branch column is empty for remote tasks.** The remote workspace owns its
   own branch state and we don't track it locally. Anything that depends on
   `task.Branch` must check IsRemote() and skip or substitute.
