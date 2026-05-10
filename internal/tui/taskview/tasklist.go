@@ -92,6 +92,11 @@ type TaskListView struct {
 	// Used by App to force a tcell Sync — rows shifting under tview's
 	// diff-based emit is a known source of bleed-through in tmux.
 	OnLayoutChange func()
+	// Callback fired when filter-input mode toggles. Distinct from
+	// OnLayoutChange so the App can log a different reason — filter toggle
+	// reserves/releases the bottom row without changing the row signature.
+	// See gotchas/ui-threading.md.
+	OnFilterToggle func()
 
 	// Signature of the last buildRows output. Used to suppress
 	// OnLayoutChange when the rebuild produced the same rows.
@@ -665,10 +670,28 @@ func (tl *TaskListView) Filter() string {
 	return tl.filter
 }
 
+// setFiltering toggles filter-input mode. When the flag flips, the panel's
+// bottom row swaps between a task row and the filter input — a layout shift
+// that doesn't change `rowsSignature` (rows are unchanged, only `listH` is
+// reduced by one). Without notifying OnFilterToggle the App can't Sync, and
+// tcell's diff-based emit leaves stale cells from the previous bottom row.
+// See gotchas/ui-threading.md. Fires OnFilterToggle (not OnLayoutChange) so
+// the ux.log entry distinguishes filter-toggle from row-composition changes
+// — a debugger reading the log can tell which class of event triggered Sync.
+func (tl *TaskListView) setFiltering(v bool) {
+	if tl.filtering == v {
+		return
+	}
+	tl.filtering = v
+	if tl.OnFilterToggle != nil {
+		tl.OnFilterToggle()
+	}
+}
+
 // ClearFilter clears the filter and rebuilds rows.
 func (tl *TaskListView) ClearFilter() {
 	tl.filter = ""
-	tl.filtering = false
+	tl.setFiltering(false)
 	tl.buildRows()
 	tl.clampCursor()
 	tl.notifyCursorChange()
@@ -691,7 +714,7 @@ func (tl *TaskListView) handleFilterInput(event *tcell.EventKey) bool {
 		return true
 	case tcell.KeyEnter:
 		// Confirm filter — keep filter text active, exit input mode.
-		tl.filtering = false
+		tl.setFiltering(false)
 		return true
 	case tcell.KeyBackspace, tcell.KeyBackspace2:
 		if hasAlt {
@@ -768,7 +791,7 @@ func (tl *TaskListView) InputHandler() func(event *tcell.EventKey, setFocus func
 					tl.OnNew()
 				}
 			case '/':
-				tl.filtering = true
+				tl.setFiltering(true)
 			case 's':
 				if t := tl.SelectedTask(); t != nil {
 					t.SetStatus(t.Status.Next())
