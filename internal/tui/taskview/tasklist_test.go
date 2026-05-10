@@ -1811,6 +1811,197 @@ func TestTaskListView_WaitingReviewAndArchiveMutuallyExclusive(t *testing.T) {
 	}
 }
 
+func TestTaskListView_PinToggle(t *testing.T) {
+	tl := NewTaskListView()
+	var captured *model.Task
+	tl.OnPin = func(task *model.Task) {
+		captured = task
+	}
+	tl.SetTasks([]*model.Task{
+		{ID: "1", Name: "task1", Status: model.StatusPending, Project: "p"},
+	})
+	tl.expanded = "p"
+	tl.buildRows()
+	tl.clampCursor()
+
+	handler := tl.InputHandler()
+	// Press 'P' — task should be pinned.
+	handler(tcell.NewEventKey(tcell.KeyRune, 'P', tcell.ModNone), func(tview.Primitive) {})
+	if captured == nil {
+		t.Fatal("OnPin should have been called")
+	}
+	if !captured.Pinned {
+		t.Error("task should be Pinned after pressing 'P'")
+	}
+
+	// Press 'P' again — toggle off. The task is now in the Pinned section, so
+	// move the cursor to wherever the captured task lives now before re-firing.
+	pinnedTask := captured
+	captured = nil
+	for i, r := range tl.rows {
+		if r.kind == rowTask && r.task == pinnedTask {
+			tl.cursor = i
+			break
+		}
+	}
+	handler(tcell.NewEventKey(tcell.KeyRune, 'P', tcell.ModNone), func(tview.Primitive) {})
+	if captured == nil {
+		t.Fatal("OnPin should have fired again")
+	}
+	if captured.Pinned {
+		t.Error("task should no longer be pinned after second 'P'")
+	}
+}
+
+func TestTaskListView_PinClearsOtherFlags(t *testing.T) {
+	tl := NewTaskListView()
+	tl.SetTasks([]*model.Task{
+		{ID: "1", Name: "task1", Status: model.StatusPending, Project: "p", Archived: true},
+	})
+	tl.expanded = "p"
+	tl.archiveExpanded = true
+	tl.archiveProject = "p"
+	tl.buildRows()
+	for i, r := range tl.rows {
+		if r.kind == rowTask && r.task.ID == "1" {
+			tl.cursor = i
+			break
+		}
+	}
+
+	tl.OnPin = func(*model.Task) {}
+	handler := tl.InputHandler()
+	handler(tcell.NewEventKey(tcell.KeyRune, 'P', tcell.ModNone), func(tview.Primitive) {})
+
+	task := tl.tasks[0]
+	if !task.Pinned {
+		t.Error("task should be Pinned after 'P'")
+	}
+	if task.Archived {
+		t.Error("pinning an archived task should clear Archived")
+	}
+
+	// Move the cursor to the now-pinned task and press 'a' — should clear
+	// Pinned and set Archived.
+	for i, r := range tl.rows {
+		if r.kind == rowTask && r.task == task {
+			tl.cursor = i
+			break
+		}
+	}
+	tl.OnArchive = func(*model.Task) {}
+	handler(tcell.NewEventKey(tcell.KeyRune, 'a', tcell.ModNone), func(tview.Primitive) {})
+	if task.Pinned {
+		t.Error("pressing 'a' on a pinned task should clear Pinned")
+	}
+	if !task.Archived {
+		t.Error("task should be Archived after 'a'")
+	}
+}
+
+func TestTaskListView_PinnedSectionRendersAboveActive(t *testing.T) {
+	tl := NewTaskListView()
+	tl.SetTasks([]*model.Task{
+		{ID: "1", Name: "active", Project: "p", Status: model.StatusPending},
+		{ID: "2", Name: "pinned", Project: "p", Status: model.StatusPending, Pinned: true},
+	})
+	tl.expanded = "p"
+	tl.buildRows()
+
+	// First row must be the Pinned header.
+	if len(tl.rows) == 0 || tl.rows[0].kind != rowPinnedHeader {
+		t.Fatalf("expected first row to be rowPinnedHeader, got %+v", tl.rows)
+	}
+	// Pinned task must appear before any active task in the row stream.
+	pinnedIdx, activeIdx := -1, -1
+	for i, r := range tl.rows {
+		if r.kind != rowTask {
+			continue
+		}
+		if r.task.ID == "2" && pinnedIdx == -1 {
+			pinnedIdx = i
+		}
+		if r.task.ID == "1" && activeIdx == -1 {
+			activeIdx = i
+		}
+	}
+	if pinnedIdx == -1 || activeIdx == -1 {
+		t.Fatalf("expected both tasks in rows, pinnedIdx=%d activeIdx=%d", pinnedIdx, activeIdx)
+	}
+	if pinnedIdx >= activeIdx {
+		t.Errorf("pinned task at row %d should precede active task at row %d", pinnedIdx, activeIdx)
+	}
+}
+
+func TestTaskListView_NavigatePinnedToActiveAndBack(t *testing.T) {
+	// Cursor should cross the Pinned/Active boundary in both directions
+	// without skipping rows or getting stuck on the trailing separator.
+	tl := NewTaskListView()
+	tl.SetTasks([]*model.Task{
+		{ID: "1", Name: "pinned-task", Project: "p", Status: model.StatusPending, Pinned: true},
+		{ID: "2", Name: "active-task", Project: "p", Status: model.StatusPending},
+	})
+	tl.expanded = "p"
+	tl.buildRows()
+	tl.clampCursor()
+
+	// Cursor should land on the pinned task first (Pinned section is on top).
+	if got := tl.SelectedTask(); got == nil || got.ID != "1" {
+		t.Fatalf("expected initial cursor on pinned task id=1, got %+v", got)
+	}
+
+	// Down → cross into Active.
+	tl.CursorDown()
+	if got := tl.SelectedTask(); got == nil || got.ID != "2" {
+		t.Fatalf("expected cursor on active task id=2 after down, got %+v", got)
+	}
+
+	// Up → cross back into Pinned.
+	tl.CursorUp()
+	if got := tl.SelectedTask(); got == nil || got.ID != "1" {
+		t.Fatalf("expected cursor back on pinned task id=1 after up, got %+v", got)
+	}
+}
+
+func TestTaskListView_PinnedRemainsExpandedWhenCursorLeaves(t *testing.T) {
+	// The Pinned section must NOT auto-collapse when the cursor moves into
+	// Active — pinning is an explicit "keep visible" action.
+	tl := NewTaskListView()
+	tl.SetTasks([]*model.Task{
+		{ID: "1", Name: "pinned", Project: "p", Status: model.StatusPending, Pinned: true},
+		{ID: "2", Name: "active", Project: "p", Status: model.StatusPending},
+	})
+	tl.expanded = "p"
+	tl.buildRows()
+	tl.clampCursor()
+
+	// Sanity: the pinned task row exists.
+	pinnedTaskRow := -1
+	for i, r := range tl.rows {
+		if r.kind == rowTask && r.task.ID == "1" {
+			pinnedTaskRow = i
+			break
+		}
+	}
+	if pinnedTaskRow == -1 {
+		t.Fatal("pinned task row missing on initial build")
+	}
+
+	// Move cursor down into Active.
+	tl.CursorDown()
+	if got := tl.SelectedTask(); got == nil || got.ID != "2" {
+		t.Fatalf("expected cursor on active task id=2, got %+v", got)
+	}
+
+	// Pinned task row must STILL be present (section did not collapse).
+	for _, r := range tl.rows {
+		if r.kind == rowTask && r.task.ID == "1" {
+			return // pass
+		}
+	}
+	t.Error("pinned task row was hidden after cursor moved into Active section")
+}
+
 func TestTaskListView_NavigateThroughAllThreeSections(t *testing.T) {
 	// Downward navigation active → WR → archive should visit a task in each
 	// section exactly once, regardless of which section is currently expanded.

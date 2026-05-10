@@ -22,6 +22,7 @@ type Task struct {
 	Sandboxed     bool      `json:"sandboxed,omitempty"`
 	Archived      bool      `json:"archived,omitempty"`
 	WaitingReview bool      `json:"waiting_review,omitempty"`
+	Pinned        bool      `json:"pinned,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
 	StartedAt     time.Time `json:"started_at,omitempty"`
 	EndedAt       time.Time `json:"ended_at,omitempty"`
@@ -65,6 +66,36 @@ func GenerateSessionID() string {
 	b[6] = (b[6] & 0x0f) | 0x40 // version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // variant 2
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// SetPinned, SetArchived, and SetWaitingReview enforce the mutual-exclusivity
+// invariant for the three section flags: at most one is true at a time.
+// All callers (TUI key handlers, MCP tools, HTTP API endpoints) must go
+// through these setters — direct assignment leaks illegal states (e.g. a
+// pinned-and-archived task) into the DB.
+
+func (t *Task) SetPinned(v bool) {
+	t.Pinned = v
+	if v {
+		t.Archived = false
+		t.WaitingReview = false
+	}
+}
+
+func (t *Task) SetArchived(v bool) {
+	t.Archived = v
+	if v {
+		t.Pinned = false
+		t.WaitingReview = false
+	}
+}
+
+func (t *Task) SetWaitingReview(v bool) {
+	t.WaitingReview = v
+	if v {
+		t.Pinned = false
+		t.Archived = false
+	}
 }
 
 // SetStatus updates the task status and manages timestamps.
