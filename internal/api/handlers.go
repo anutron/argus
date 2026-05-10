@@ -439,6 +439,10 @@ func (s *Server) handleResumeTask(w http.ResponseWriter, r *http.Request) {
 
 // --- Delete Task ---
 
+// handleDeleteTask is a per-task destructive endpoint. Auth: requires a valid
+// token but NOT master — same tier as handleStopTask, since per-task ops are
+// expected from the mobile PWA. requireMaster gates apply only to cross-task
+// or config-mutating endpoints (handleStopAll, project/backend/token CRUD).
 func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	task, err := s.db.Get(id)
@@ -450,10 +454,29 @@ func (s *Server) handleDeleteTask(w http.ResponseWriter, r *http.Request) {
 	// Stop the session if running.
 	_ = s.runner.Stop(id)
 
+	// Remove session log file.
+	os.Remove(agent.SessionLogPath(id)) //nolint:errcheck,gosec // G304: id was validated by db.Get above; SessionLogPath roots at ~/.argus/sessions/<id>.log
+
 	if err := s.db.Delete(id); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+
+	// Clean up worktree and branch in background — git operations can take seconds.
+	// Mirrors tui.App.deleteTask so worktrees don't linger as orphans until the next
+	// completed-task prune sweep.
+	cfg := s.db.Config()
+	worktree, branch := task.Worktree, task.Branch
+	uxlog.Log("[api] delete: task=%s name=%q worktree=%q branch=%q", id, task.Name, worktree, branch)
+	go func() {
+		repoDir := agent.ResolveDir(task, cfg)
+		if worktree != "" {
+			agent.RemoveWorktreeAndBranch(worktree, branch, repoDir)
+		} else if branch != "" && repoDir != "" {
+			agent.DeleteBranch(repoDir, branch)
+			agent.DeleteRemoteBranch(repoDir, branch)
+		}
+	}()
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }

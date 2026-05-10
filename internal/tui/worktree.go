@@ -3,6 +3,7 @@ package tui
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/drn/argus/internal/agent"
 	"github.com/drn/argus/internal/uxlog"
@@ -19,6 +20,23 @@ func countOrphanedWorktrees(wtRoot string, knownPaths map[string]bool) int {
 // Returns the count of cleaned directories.
 func sweepOrphanedWorktrees(wtRoot string, knownPaths map[string]bool, projects map[string]string) int {
 	return walkOrphanedWorktrees(wtRoot, knownPaths, projects)
+}
+
+// firstKnownDescendant returns a known worktree path that lives strictly
+// inside `dir`, or "" if there is none. Defends against historical task names
+// whose stored worktree path goes deeper than the fixed wtRoot/<project>/<task>
+// layout the walker assumes — without this guard the walker would misclassify
+// the parent dir as an orphan and `os.RemoveAll` it, taking the live worktree
+// underneath with it. Returning the descendant (rather than a bool) lets the
+// caller log which tracked path triggered the skip.
+func firstKnownDescendant(dir string, knownPaths map[string]bool) string {
+	prefix := filepath.Clean(dir) + string(filepath.Separator)
+	for known := range knownPaths {
+		if strings.HasPrefix(filepath.Clean(known), prefix) {
+			return known
+		}
+	}
+	return ""
 }
 
 // walkOrphanedWorktrees scans wtRoot/<project>/<task>/ dirs.
@@ -49,6 +67,10 @@ func walkOrphanedWorktrees(wtRoot string, knownPaths map[string]bool, projects m
 			}
 			wtPath := filepath.Join(projDir, taskEntry.Name())
 			if knownPaths[wtPath] {
+				continue
+			}
+			if known := firstKnownDescendant(wtPath, knownPaths); known != "" {
+				uxlog.Log("[worktree] orphan sweep: skipping %q — ancestor of tracked worktree %q", wtPath, known)
 				continue
 			}
 			count++

@@ -21,8 +21,15 @@ import (
 // painful to navigate from a terminal: straight + smart quotes, backticks,
 // parens, $, |, &, ;, <, >, !, #. These pass git-check-ref-format but break
 // `cd`, glob matching, and tool autocompletion in zsh/bash.
+//
+// `/` is also stripped. git allows slashes in branch names, but the same safe
+// name is also used as the worktree directory under wtRoot/<project>/<task>.
+// A slash there creates extra path depth (e.g. wtRoot/proj/Rebase-https-/github),
+// which the orphan sweeper — fixed at two levels deep — misclassifies the
+// parent dir as an orphan and `os.RemoveAll`s it, taking the live worktree
+// underneath with it.
 var invalidBranchChars = regexp.MustCompile(
-	"[[:cntrl:] ~^:?*\\[\\]{}\\\\.`$|&;<>()!#'\"‘’“”]+",
+	"[[:cntrl:] /~^:?*\\[\\]{}\\\\.`$|&;<>()!#'\"‘’“”]+",
 )
 
 // multiDash collapses runs of `-` left over after the invalid-char strip.
@@ -35,13 +42,17 @@ var multiDash = regexp.MustCompile(`-+`)
 const maxBranchNameLen = 30
 
 func sanitizeBranchName(name string) string {
+	// invalidBranchChars covers ., {, }, /, and others, so the regex+multiDash
+	// pass alone subsumes the historical string-level guards (Trim ".", Trim
+	// "/", ReplaceAll "..", ReplaceAll "//", ReplaceAll "@{") that this
+	// function previously ran. Worked example:
+	//   "ref@{0}"   → "ref@-0-" → multiDash → "ref@-0-" → trim → "ref@-0"
+	//   "name..x"   → "name--x" → multiDash → "name-x"
+	//   "a/b/c"     → "a-b-c"   → multiDash → "a-b-c"
+	// Only `@` survives the regex (intentional: it's git-legal), so trailing
+	// hyphen trim is the only post-regex pass needed.
 	s := invalidBranchChars.ReplaceAllString(name, "-")
-	s = multiDash.ReplaceAllString(s, "-") // collapse `--` → `-`
-	s = strings.Trim(s, ".")               // cannot start or end with .
-	s = strings.Trim(s, "/")               // cannot start or end with /
-	s = strings.ReplaceAll(s, "..", "-")   // no consecutive dots
-	s = strings.ReplaceAll(s, "//", "/")   // no consecutive slashes
-	s = strings.ReplaceAll(s, "@{", "-")   // no @{
+	s = multiDash.ReplaceAllString(s, "-")
 	s = strings.Trim(s, "-")
 	if s == "" {
 		s = "task" // fallback when name is entirely invalid characters
