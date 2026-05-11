@@ -217,7 +217,13 @@ func (f *NewTaskForm) selectedProjectPath() string {
 }
 
 // acTrigger returns the autocomplete trigger character for the selected backend:
-// "$" for codex backends, "/" for all others.
+// "$" for codex (codex's native skill prefix), "/" for everything else.
+//
+// Pi is intentionally bucketed with claude under "/" because pi ships
+// slash-prefixed prompt templates (`/<name>` expansions, per pi.dev docs),
+// matching claude's slash-skill UX. Pi's `@<file>` include prefix is a
+// separate, runtime-only feature — pi reads files itself when it sees `@`,
+// so Argus does not need to autocomplete `@`-prefixed tokens here.
 func (f *NewTaskForm) acTrigger() string {
 	if len(f.backendNames) > 0 && f.backendIdx < len(f.backendNames) {
 		if b, ok := f.backends[f.backendNames[f.backendIdx]]; ok && agent.IsCodexBackend(b.Command) {
