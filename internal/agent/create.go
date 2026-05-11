@@ -29,7 +29,6 @@ type CreateInput struct {
 	Prompt     string
 	Project    string
 	Backend    string // optional; empty = cfg.Defaults.Backend
-	PRURL      string // optional; set for review tasks
 	BaseBranch string // optional; overrides projCfg.Branch for this task
 
 	// AutoName, when true, fires a fire-and-forget Haiku rename in a
@@ -37,7 +36,7 @@ type CreateInput struct {
 	// is race-guarded: it only overwrites Name if the row's current Name
 	// still equals the regex-derived slug. Callers should set this only
 	// when Name was string-interpolated from Prompt (not user-typed and
-	// not a structured slug like "review-pr-123-…" worth preserving).
+	// not a structured slug like "<src>-fork" worth preserving).
 	AutoName bool
 
 	// Attachments are written to <worktree>/.context/<name> after worktree
@@ -179,7 +178,6 @@ func CreateAndStart(database *db.DB, runner SessionProvider, input CreateInput) 
 		Backend:  backend,
 		Worktree: wtPath,
 		Branch:   branchName,
-		PRURL:    input.PRURL,
 	}
 	// Persist sandbox state at creation time so the display reflects the
 	// setting active when the task was launched, not the current setting.

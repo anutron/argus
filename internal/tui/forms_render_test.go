@@ -12,7 +12,6 @@ import (
 
 	"github.com/drn/argus/internal/agent"
 	"github.com/drn/argus/internal/config"
-	"github.com/drn/argus/internal/github"
 	"github.com/drn/argus/internal/gitutil"
 	"github.com/drn/argus/internal/model"
 	"github.com/drn/argus/internal/testutil"
@@ -185,14 +184,15 @@ func TestApp_HandleAgentKey_EnterRestart(t *testing.T) {
 	app.handleAgentKey(tcell.NewEventKey(tcell.KeyEnter, 0, 0))
 }
 
-func TestApp_HandleAgentKey_OOpenPR(t *testing.T) {
+func TestApp_HandleAgentKey_ODeadSession(t *testing.T) {
 	d := testDB(t)
 	runner := agent.NewRunner(nil)
 	app := New(d, runner, false)
 	app.mode = modeAgent
 	app.agentState.Reset("t1", "n")
 
-	// 'o' on dead session calls OpenPR (no panic).
+	// 'o' on a dead session with terminal focus falls through to the PTY
+	// forward path without panicking.
 	app.handleAgentKey(tcell.NewEventKey(tcell.KeyRune, 'o', 0))
 }
 
@@ -350,29 +350,6 @@ func TestApp_IsTaskRunning(t *testing.T) {
 	app.runningIDs = []string{"a", "b"}
 	testutil.Equal(t, app.isTaskRunning("a"), true)
 	testutil.Equal(t, app.isTaskRunning("c"), false)
-}
-
-// --- Reviews submitComment / submitApprove with onFetch callback ---
-
-func TestReviewsView_SubmitComment_NoOnFetch(t *testing.T) {
-	rv := NewReviewsView()
-	pr := github.PR{Number: 1}
-	rv.selectedPR = &pr
-	rv.draftBody = "x"
-	d := testDB(t)
-	runner := agent.NewRunner(nil)
-	app := New(d, runner, false)
-	rv.submitComment(app)
-}
-
-func TestReviewsView_SubmitApprove_NoOnFetch(t *testing.T) {
-	rv := NewReviewsView()
-	pr := github.PR{Number: 1}
-	rv.selectedPR = &pr
-	d := testDB(t)
-	runner := agent.NewRunner(nil)
-	app := New(d, runner, false)
-	rv.submitApprove(app)
 }
 
 // --- More renametask tests for completeness ---
