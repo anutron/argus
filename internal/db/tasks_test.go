@@ -1,6 +1,7 @@
 package db
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/drn/argus/internal/model"
@@ -44,6 +45,7 @@ func TestDB_OrchestrationFields(t *testing.T) {
 		BaseBranch: "argus/m1",
 		DependsOn:  []string{"id-a", "id-b"},
 		Result:     `{"pr_url":"https://x/pull/1"}`,
+		PlanSlug:   "thanxai-marketplace-mcp-v1",
 	}
 	testutil.NoError(t, d.Add(task))
 
@@ -52,17 +54,20 @@ func TestDB_OrchestrationFields(t *testing.T) {
 	testutil.Equal(t, got.BaseBranch, "argus/m1")
 	testutil.DeepEqual(t, got.DependsOn, []string{"id-a", "id-b"})
 	testutil.Equal(t, got.Result, `{"pr_url":"https://x/pull/1"}`)
+	testutil.Equal(t, got.PlanSlug, "thanxai-marketplace-mcp-v1")
 
-	// Updating clears DependsOn (orchestrator transferred control) and
-	// rewrites Result.
+	// Updating clears DependsOn (orchestrator transferred control), rewrites
+	// Result, and re-stamps PlanSlug.
 	got.DependsOn = nil
 	got.Result = `{"pr_url":"https://x/pull/2"}`
+	got.PlanSlug = "retry-1"
 	testutil.NoError(t, d.Update(got))
 
 	got2, err := d.Get(task.ID)
 	testutil.NoError(t, err)
 	testutil.Equal(t, len(got2.DependsOn), 0)
 	testutil.Equal(t, got2.Result, `{"pr_url":"https://x/pull/2"}`)
+	testutil.Equal(t, got2.PlanSlug, "retry-1")
 }
 
 // TestDB_SetResult exercises the partial-update path used by task_set_result.
@@ -92,6 +97,100 @@ func TestDB_SetResult(t *testing.T) {
 
 	// Missing row surfaces an error so callers don't silently no-op.
 	testutil.Error(t, d.SetResult("does-not-exist", "{}"))
+}
+
+// TestDB_SetDependsOn exercises the partial-update path used by orch.Link /
+// Unlink. Like SetResult, the column write must not clobber concurrent
+// status changes from the agent's task_complete call.
+func TestDB_SetDependsOn(t *testing.T) {
+	d := testDB(t)
+	a := &model.Task{Name: "A"}
+	b := &model.Task{Name: "B", DependsOn: []string{"a-id"}}
+	testutil.NoError(t, d.Add(a))
+	testutil.NoError(t, d.Add(b))
+
+	// Simulate a concurrent status flip — orch.Link's caller may have read
+	// the task while the agent was in_progress; the agent then completed.
+	b.SetStatus(model.StatusComplete)
+	testutil.NoError(t, d.Update(b))
+
+	testutil.NoError(t, d.SetDependsOn(b.ID, []string{a.ID, "extra-id"}))
+
+	got, err := d.Get(b.ID)
+	testutil.NoError(t, err)
+	testutil.DeepEqual(t, got.DependsOn, []string{a.ID, "extra-id"})
+	testutil.Equal(t, got.Status, model.StatusComplete) // not clobbered
+
+	// Empty slice clears the column.
+	testutil.NoError(t, d.SetDependsOn(b.ID, nil))
+	got2, _ := d.Get(b.ID)
+	testutil.Equal(t, len(got2.DependsOn), 0)
+
+	// Missing row surfaces ErrTaskNotFound.
+	err = d.SetDependsOn("ghost", nil)
+	if !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("expected ErrTaskNotFound, got %v", err)
+	}
+}
+
+// TestDB_SetPlanSlug — partial update of the orchestrator grouping label.
+func TestDB_SetPlanSlug(t *testing.T) {
+	d := testDB(t)
+	task := &model.Task{Name: "t"}
+	testutil.NoError(t, d.Add(task))
+	task.SetStatus(model.StatusInReview)
+	testutil.NoError(t, d.Update(task))
+
+	testutil.NoError(t, d.SetPlanSlug(task.ID, "my-stack"))
+	got, _ := d.Get(task.ID)
+	testutil.Equal(t, got.PlanSlug, "my-stack")
+	testutil.Equal(t, got.Status, model.StatusInReview) // not clobbered
+
+	testutil.NoError(t, d.SetPlanSlug(task.ID, ""))
+	got2, _ := d.Get(task.ID)
+	testutil.Equal(t, got2.PlanSlug, "")
+
+	if err := d.SetPlanSlug("ghost", "x"); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("expected ErrTaskNotFound, got %v", err)
+	}
+}
+
+// TestDB_SetArchived covers the partial-update + pinned-clearing invariant
+// the halt cascade relies on. Archiving a pinned task MUST yield a clean
+// archived row, not a (pinned=1, archived=1) Frankenstein the task list
+// would render in both the Pinned and Archive sections.
+func TestDB_SetArchived(t *testing.T) {
+	d := testDB(t)
+	pinned := &model.Task{Name: "pinned"}
+	pinned.SetPinned(true)
+	testutil.NoError(t, d.Add(pinned))
+	testutil.Equal(t, pinned.Pinned, true)
+
+	// Concurrent status flip simulation — must not be clobbered.
+	pinned.SetStatus(model.StatusInProgress)
+	testutil.NoError(t, d.Update(pinned))
+
+	testutil.NoError(t, d.SetArchived(pinned.ID, true))
+	got, _ := d.Get(pinned.ID)
+	testutil.Equal(t, got.Archived, true)
+	testutil.Equal(t, got.Pinned, false) // mutual exclusivity preserved
+	testutil.Equal(t, got.Status, model.StatusInProgress)
+
+	// Unarchive leaves pinned alone — pinning state survives a round trip.
+	// To prove the "leaves pinned alone" claim load-bearingly, re-pin the
+	// row directly in the DB (without going through SetArchived), then
+	// unarchive and verify the pin survived. If SetArchived ever started
+	// clearing pinned on the false branch too, this assertion would fail.
+	_, err := d.conn.Exec(`UPDATE tasks SET pinned=1 WHERE id=?`, pinned.ID)
+	testutil.NoError(t, err)
+	testutil.NoError(t, d.SetArchived(pinned.ID, false))
+	got2, _ := d.Get(pinned.ID)
+	testutil.Equal(t, got2.Archived, false)
+	testutil.Equal(t, got2.Pinned, true)
+
+	if err := d.SetArchived("ghost", true); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("expected ErrTaskNotFound, got %v", err)
+	}
 }
 
 // TestDB_FindByNameProject exercises the idempotency lookup. Archived rows

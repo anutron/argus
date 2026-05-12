@@ -48,6 +48,11 @@ type TaskCreateInput struct {
 	// before this task's agent session is auto-started. Empty / nil starts
 	// the session immediately (legacy behaviour).
 	DependsOn []string
+
+	// PlanSlug is the orchestrator-supplied grouping label so the DAG view
+	// can scope a stack without traversing depends_on reachability. Opaque
+	// to the daemon — same contract as Result.
+	PlanSlug string
 }
 
 // TaskCreator creates a task with worktree and starts an agent session.
@@ -73,6 +78,13 @@ type TaskStore interface {
 	// section so a duplicate detection doesn't need to scan every task in
 	// memory each call. Backed by an indexed SQL query in db.DB.
 	FindByNameProject(name, project string) (*model.Task, error)
+	// SetDependsOn, SetPlanSlug, and SetArchived are partial-column writes
+	// used by orch.Link / Unlink / SetPlanSlug / HaltDownstream to avoid
+	// clobbering a concurrent status flip via a stale full-row Update.
+	// Same pattern as SetResult / Rename. *db.DB satisfies all three.
+	SetDependsOn(id string, deps []string) error
+	SetPlanSlug(id, slug string) error
+	SetArchived(id string, archived bool) error
 }
 
 // TaskStopper can stop a running agent session.
@@ -530,6 +542,7 @@ Idempotency: when ` + "`name`" + ` is supplied (not auto-generated from prompt) 
 				"project":     map[string]interface{}{"type": "string", "description": "Project name (must exist in Argus config)"},
 				"base_branch": map[string]interface{}{"type": "string", "description": "Optional. Start point for the new worktree's branch (e.g. 'argus/parent-task'). Resolves to origin/<ref> / upstream/<ref> if no local match. Empty = project default (master/main)."},
 				"depends_on":  map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}, "description": "Optional. Upstream task IDs whose status must reach 'complete' before this task's agent starts. The worktree is still created immediately."},
+				"plan_slug":   map[string]interface{}{"type": "string", "description": "Optional. Orchestrator grouping label for the DAG view; opaque to the daemon. Tasks sharing the same plan_slug render as one stack."},
 				"upsert":      map[string]interface{}{"type": "boolean", "description": "Optional. If true and a non-archived task with the same (name, project) exists, return that task instead of erroring."},
 			},
 			"required": []string{"prompt", "project"},
@@ -537,12 +550,13 @@ Idempotency: when ` + "`name`" + ` is supplied (not auto-generated from prompt) 
 	},
 	{
 		Name:        "task_list",
-		Description: "List Argus tasks, optionally filtered by status and/or project.",
+		Description: "List Argus tasks, optionally filtered by status, project, and/or plan_slug. Returned rows include the plan_slug column for DAG-view scoping.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
-				"status":  map[string]interface{}{"type": "string", "description": "Filter by status: pending, in_progress, in_review, complete"},
-				"project": map[string]interface{}{"type": "string", "description": "Filter by project name"},
+				"status":    map[string]interface{}{"type": "string", "description": "Filter by status: pending, in_progress, in_review, complete"},
+				"project":   map[string]interface{}{"type": "string", "description": "Filter by project name"},
+				"plan_slug": map[string]interface{}{"type": "string", "description": "Filter by orchestrator stack label (set on each sub-task via task_create / task_set_plan_slug)"},
 			},
 		},
 	},
@@ -752,6 +766,7 @@ func (s *Server) handleToolsList(req *Request) *Response {
 	copy(tools, toolDefs)
 	if s.taskMgmtEnabled() {
 		tools = append(tools, taskToolDefs...)
+		tools = append(tools, linkingToolDefs...)
 	}
 	if s.clipboardEnabled() {
 		tools = append(tools, clipboardToolDefs...)
@@ -799,6 +814,16 @@ func (s *Server) handleToolsCall(req *Request) *Response {
 		return s.toolTaskComplete(req.ID, params.Arguments)
 	case "task_set_result":
 		return s.toolTaskSetResult(req.ID, params.Arguments)
+	case "task_link":
+		return s.toolTaskLink(req.ID, params.Arguments)
+	case "task_unlink":
+		return s.toolTaskUnlink(req.ID, params.Arguments)
+	case "task_deps":
+		return s.toolTaskDeps(req.ID, params.Arguments)
+	case "task_halt_downstream":
+		return s.toolTaskHaltDownstream(req.ID, params.Arguments)
+	case "task_set_plan_slug":
+		return s.toolTaskSetPlanSlug(req.ID, params.Arguments)
 	case "argus_clipboard_set":
 		return s.toolClipboardSet(req.ID, params.Arguments)
 	case "schedule_list":
@@ -1017,6 +1042,7 @@ func (s *Server) toolTaskCreate(id interface{}, args json.RawMessage) *Response 
 		Project    string   `json:"project"`
 		BaseBranch string   `json:"base_branch"`
 		DependsOn  []string `json:"depends_on"`
+		PlanSlug   string   `json:"plan_slug"`
 		Upsert     bool     `json:"upsert"`
 	}
 	json.Unmarshal(args, &p) //nolint:errcheck
@@ -1136,6 +1162,7 @@ func (s *Server) toolTaskCreate(id interface{}, args json.RawMessage) *Response 
 		AutoName:   autoName,
 		BaseBranch: strings.TrimSpace(p.BaseBranch),
 		DependsOn:  p.DependsOn,
+		PlanSlug:   strings.TrimSpace(p.PlanSlug),
 	})
 	if err != nil {
 		log.Printf("[mcp] task_create failed: %v", err)
@@ -1275,8 +1302,9 @@ func (s *Server) toolTaskList(id interface{}, args json.RawMessage) *Response {
 	}
 
 	var p struct {
-		Status  string `json:"status"`
-		Project string `json:"project"`
+		Status   string `json:"status"`
+		Project  string `json:"project"`
+		PlanSlug string `json:"plan_slug"`
 	}
 	json.Unmarshal(args, &p) //nolint:errcheck
 
@@ -1296,10 +1324,16 @@ func (s *Server) toolTaskList(id interface{}, args json.RawMessage) *Response {
 		if p.Project != "" && t.Project != p.Project {
 			continue
 		}
+		if p.PlanSlug != "" && t.PlanSlug != p.PlanSlug {
+			continue
+		}
 		count++
 		fmt.Fprintf(&sb, "- **%s** `%s` [%s] (%s)", t.Name, t.ID, t.Status.String(), t.Project)
 		if t.Branch != "" {
 			fmt.Fprintf(&sb, " branch:%s", t.Branch)
+		}
+		if t.PlanSlug != "" {
+			fmt.Fprintf(&sb, " plan:%s", t.PlanSlug)
 		}
 		if elapsed := t.ElapsedString(); elapsed != "" {
 			fmt.Fprintf(&sb, " %s", elapsed)

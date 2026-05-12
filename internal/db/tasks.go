@@ -10,9 +10,16 @@ import (
 	"github.com/drn/argus/internal/model"
 )
 
+// ErrTaskNotFound is the sentinel returned (wrapped) by every db.* task
+// mutation when the target row is missing. Callers use errors.Is(err,
+// db.ErrTaskNotFound) instead of grepping the error string — string-matching
+// silently breaks on any future rename of the wrapped format. orch and the
+// HTTP API both route this to a 404.
+var ErrTaskNotFound = errors.New("task not found")
+
 // taskColumns is the canonical column list for task queries. Order MUST
 // match scanTask's Scan call and the INSERT/UPDATE statements below.
-const taskColumns = `id, name, status, project, branch, prompt, backend, worktree, agent_pid, session_id, sandboxed, archived, pinned, base_branch, depends_on, result, created_at, started_at, ended_at`
+const taskColumns = `id, name, status, project, branch, prompt, backend, worktree, agent_pid, session_id, sandboxed, archived, pinned, base_branch, depends_on, result, plan_slug, created_at, started_at, ended_at`
 
 // scanner is implemented by both *sql.Row and *sql.Rows.
 type scanner interface {
@@ -24,7 +31,7 @@ func scanTask(row scanner) (*model.Task, error) {
 	t := &model.Task{}
 	var status, createdAt, startedAt, endedAt, dependsOn string
 	var sandboxed, archived, pinned int
-	if err := row.Scan(&t.ID, &t.Name, &status, &t.Project, &t.Branch, &t.Prompt, &t.Backend, &t.Worktree, &t.AgentPID, &t.SessionID, &sandboxed, &archived, &pinned, &t.BaseBranch, &dependsOn, &t.Result, &createdAt, &startedAt, &endedAt); err != nil {
+	if err := row.Scan(&t.ID, &t.Name, &status, &t.Project, &t.Branch, &t.Prompt, &t.Backend, &t.Worktree, &t.AgentPID, &t.SessionID, &sandboxed, &archived, &pinned, &t.BaseBranch, &dependsOn, &t.Result, &t.PlanSlug, &createdAt, &startedAt, &endedAt); err != nil {
 		return nil, err
 	}
 	t.Status, _ = model.ParseStatus(status)
@@ -100,9 +107,9 @@ func (d *DB) Add(t *model.Task) error {
 	if t.Pinned {
 		pinnedInt = 1
 	}
-	_, err := d.conn.Exec(`INSERT INTO tasks (id, name, status, project, branch, prompt, backend, worktree, agent_pid, session_id, sandboxed, archived, pinned, base_branch, depends_on, result, created_at, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+	_, err := d.conn.Exec(`INSERT INTO tasks (id, name, status, project, branch, prompt, backend, worktree, agent_pid, session_id, sandboxed, archived, pinned, base_branch, depends_on, result, plan_slug, created_at, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		t.ID, t.Name, t.Status.String(), t.Project, t.Branch, t.Prompt, t.Backend, t.Worktree, t.AgentPID, t.SessionID, sandboxedInt, archivedInt, pinnedInt,
-		t.BaseBranch, encodeDependsOn(t.DependsOn), t.Result,
+		t.BaseBranch, encodeDependsOn(t.DependsOn), t.Result, t.PlanSlug,
 		formatTime(t.CreatedAt), formatTime(t.StartedAt), formatTime(t.EndedAt))
 	return err
 }
@@ -123,16 +130,16 @@ func (d *DB) Update(t *model.Task) error {
 	if t.Pinned {
 		pinnedInt = 1
 	}
-	res, err := d.conn.Exec(`UPDATE tasks SET name=?, status=?, project=?, branch=?, prompt=?, backend=?, worktree=?, agent_pid=?, session_id=?, sandboxed=?, archived=?, pinned=?, base_branch=?, depends_on=?, result=?, created_at=?, started_at=?, ended_at=? WHERE id=?`,
+	res, err := d.conn.Exec(`UPDATE tasks SET name=?, status=?, project=?, branch=?, prompt=?, backend=?, worktree=?, agent_pid=?, session_id=?, sandboxed=?, archived=?, pinned=?, base_branch=?, depends_on=?, result=?, plan_slug=?, created_at=?, started_at=?, ended_at=? WHERE id=?`,
 		t.Name, t.Status.String(), t.Project, t.Branch, t.Prompt, t.Backend, t.Worktree, t.AgentPID, t.SessionID, sandboxedInt, archivedInt, pinnedInt,
-		t.BaseBranch, encodeDependsOn(t.DependsOn), t.Result,
+		t.BaseBranch, encodeDependsOn(t.DependsOn), t.Result, t.PlanSlug,
 		formatTime(t.CreatedAt), formatTime(t.StartedAt), formatTime(t.EndedAt), t.ID)
 	if err != nil {
 		return err
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("task not found: %s", t.ID)
+		return fmt.Errorf("%w: %s", ErrTaskNotFound, t.ID)
 	}
 	return nil
 }
@@ -150,7 +157,7 @@ func (d *DB) Rename(id, name string) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("task not found: %s", id)
+		return fmt.Errorf("%w: %s", ErrTaskNotFound, id)
 	}
 	return nil
 }
@@ -177,7 +184,7 @@ func (d *DB) RenameIfName(id, expected, newName string) (bool, error) {
 	var exists int
 	if err := d.conn.QueryRow(`SELECT 1 FROM tasks WHERE id=?`, id).Scan(&exists); err != nil {
 		if err == sql.ErrNoRows {
-			return false, fmt.Errorf("task not found: %s", id)
+			return false, fmt.Errorf("%w: %s", ErrTaskNotFound, id)
 		}
 		return false, err
 	}
@@ -197,7 +204,82 @@ func (d *DB) SetResult(id, result string) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("task not found: %s", id)
+		return fmt.Errorf("%w: %s", ErrTaskNotFound, id)
+	}
+	return nil
+}
+
+// SetPlanSlug writes only the orchestrator grouping label. Same partial-update
+// pattern as SetResult — bypasses the full-row Update so a concurrent agent
+// status flip (in_progress → in_review on session exit) is not clobbered by
+// a stale read-then-write round trip. Empty string clears the slug.
+func (d *DB) SetPlanSlug(id, slug string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	res, err := d.conn.Exec(`UPDATE tasks SET plan_slug=? WHERE id=?`, slug, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("%w: %s", ErrTaskNotFound, id)
+	}
+	return nil
+}
+
+// SetDependsOn writes only the depends_on column. Used by orch.Link / Unlink
+// so the read-modify-write cycle does not need to take the full-row Update
+// path. The encoded JSON empty array is stored as the empty string by
+// encodeDependsOn so the migrated/fresh-DB defaults line up.
+func (d *DB) SetDependsOn(id string, deps []string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	res, err := d.conn.Exec(`UPDATE tasks SET depends_on=? WHERE id=?`, encodeDependsOn(deps), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("%w: %s", ErrTaskNotFound, id)
+	}
+	return nil
+}
+
+// SetArchived writes only the archived column (plus the pinned-clearing leg
+// of the mutual-exclusivity invariant when archived=true). Used by
+// orch.HaltDownstream so archiving a pending or in-review descendant cannot
+// clobber a concurrent status flip from the depswatcher (e.g. pending →
+// in_progress between the halt loop's Get and Update).
+//
+// pinned must be cleared when archived flips true because the rest of the
+// codebase relies on the invariant "at most one of {Pinned, Archived} is
+// true" — see model.Task.SetArchived. A halt cascade reaching a pinned task
+// MUST yield a clean archived row, not a (pinned=1, archived=1) Frankenstein
+// the task list would render in BOTH the Pinned and Archive sections.
+//
+// Unarchiving (archived=false) leaves pinned alone — pinning state survives
+// a round trip through the archive section.
+func (d *DB) SetArchived(id string, archived bool) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	var (
+		res sql.Result
+		err error
+	)
+	if archived {
+		res, err = d.conn.Exec(`UPDATE tasks SET archived=1, pinned=0 WHERE id=?`, id)
+	} else {
+		res, err = d.conn.Exec(`UPDATE tasks SET archived=0 WHERE id=?`, id)
+	}
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("%w: %s", ErrTaskNotFound, id)
 	}
 	return nil
 }
@@ -232,7 +314,7 @@ func (d *DB) Delete(id string) error {
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return fmt.Errorf("task not found: %s", id)
+		return fmt.Errorf("%w: %s", ErrTaskNotFound, id)
 	}
 	return nil
 }
@@ -244,7 +326,7 @@ func (d *DB) Get(id string) (*model.Task, error) {
 	row := d.conn.QueryRow(`SELECT `+taskColumns+` FROM tasks WHERE id=?`, id)
 	t, err := scanTask(row)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("task not found: %s", id)
+		return nil, fmt.Errorf("%w: %s", ErrTaskNotFound, id)
 	}
 	if err != nil {
 		return nil, err

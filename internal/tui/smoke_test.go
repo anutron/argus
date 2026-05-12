@@ -337,12 +337,15 @@ func TestSmoke_TabSwitching(t *testing.T) {
 	sim, stop := wireApp(t, app)
 	defer stop()
 
-	// Switch to each tab via numeric keys.
+	// Switch to each tab via numeric keys. After TabDAG was inserted between
+	// TabTasks and TabSettings, the numeric mapping is 1=Tasks, 2=DAG,
+	// 3=Settings.
 	for _, tc := range []struct {
 		key  rune
 		want widget.Tab
 	}{
-		{'2', widget.TabSettings},
+		{'2', widget.TabDAG},
+		{'3', widget.TabSettings},
 		{'1', widget.TabTasks},
 	} {
 		sim.InjectKey(tcell.KeyRune, tc.key, 0)
@@ -1374,5 +1377,160 @@ func TestSmoke_SettingsPagePasteRouting(t *testing.T) {
 	readUI(t, app.tapp, func() { got = app.settings.editVaultBuf })
 	if got != "/vault" {
 		t.Errorf("paste did not reach vault editor: editVaultBuf = %q, want %q", got, "/vault")
+	}
+}
+
+// TestSmoke_DAGTabRendersAndFiresRedraw exercises the new DAG tab end-to-end:
+// switching to the tab populates the widget, the OnBranchChange callback
+// fires forceRedraw on the snapshot install, and the cursor can be moved by
+// the inner widget's input handler.
+func TestSmoke_DAGTabRendersAndFiresRedraw(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "ux.log")
+	if err := uxlog.Init(logPath); err != nil {
+		t.Fatalf("uxlog.Init: %v", err)
+	}
+	defer uxlog.Close()
+
+	d := testDB(t)
+	runner := agent.NewRunner(nil)
+	app := New(d, runner, false)
+	// Two linked tasks so the DAG has edges to render.
+	_ = d.Add(&model.Task{ID: "p1", Name: "parent", Status: model.StatusComplete, CreatedAt: time.Now()})
+	_ = d.Add(&model.Task{ID: "c1", Name: "child", Status: model.StatusInProgress, DependsOn: []string{"p1"}, CreatedAt: time.Now()})
+	app.refreshTasks()
+
+	sim, stop := wireApp(t, app)
+	defer stop()
+
+	readLog := func() string {
+		b, _ := os.ReadFile(logPath)
+		return string(b)
+	}
+
+	// Switch to the DAG tab via the global Right arrow.
+	prior := strings.Count(readLog(), "force redraw: dag branch changed")
+	sim.InjectKey(tcell.KeyRight, 0, 0)
+	syncUI(t, app.tapp)
+
+	// DAG tab active + page switched.
+	readUI(t, app.tapp, func() {
+		if app.header.ActiveTab() != widget.TabDAG {
+			t.Errorf("expected TabDAG active, got %v", app.header.ActiveTab())
+		}
+		page, _ := app.pages.GetFrontPage()
+		if page != "dag" {
+			t.Errorf("expected dag page, got %q", page)
+		}
+	})
+
+	// branch-change must have fired (snapshot installed → forceRedraw).
+	if strings.Count(readLog(), "force redraw: dag branch changed") <= prior {
+		t.Errorf("expected dag branch-change forceRedraw after tab switch; log so far:\n%s", readLog())
+	}
+
+	// Cursor lives on a real node.
+	readUI(t, app.tapp, func() {
+		cur := app.dagWidget.CurrentTask()
+		if cur != "p1" && cur != "c1" {
+			t.Errorf("dag cursor = %q, want p1 or c1", cur)
+		}
+	})
+}
+
+// TestSmoke_NumericTabKeysRouteCorrectly guards the keybinding bug where
+// `case '2'` continued to route to TabSettings after TabDAG was inserted
+// between Tasks and Settings, so the statusbar advertised "2=DAG, 3=settings"
+// but actual keystrokes landed on the wrong tabs. This test exercises the
+// exact path the user takes — number-key shortcut — rather than the arrow-key
+// path the original DAG smoke test happened to use.
+func TestSmoke_NumericTabKeysRouteCorrectly(t *testing.T) {
+	d := testDB(t)
+	runner := agent.NewRunner(nil)
+	app := New(d, runner, false)
+
+	sim, stop := wireApp(t, app)
+	defer stop()
+
+	// Start on Tasks.
+	readUI(t, app.tapp, func() {
+		if app.header.ActiveTab() != widget.TabTasks {
+			t.Fatalf("initial tab = %v, want TabTasks", app.header.ActiveTab())
+		}
+	})
+
+	// `2` → DAG.
+	sim.InjectKey(tcell.KeyRune, '2', 0)
+	syncUI(t, app.tapp)
+	readUI(t, app.tapp, func() {
+		if app.header.ActiveTab() != widget.TabDAG {
+			t.Errorf("'2' routed to %v, want TabDAG", app.header.ActiveTab())
+		}
+	})
+
+	// `1` → back to Tasks.
+	sim.InjectKey(tcell.KeyRune, '1', 0)
+	syncUI(t, app.tapp)
+	readUI(t, app.tapp, func() {
+		if app.header.ActiveTab() != widget.TabTasks {
+			t.Errorf("'1' routed to %v, want TabTasks", app.header.ActiveTab())
+		}
+	})
+
+	// `3` → Settings.
+	sim.InjectKey(tcell.KeyRune, '3', 0)
+	syncUI(t, app.tapp)
+	readUI(t, app.tapp, func() {
+		if app.header.ActiveTab() != widget.TabSettings {
+			t.Errorf("'3' routed to %v, want TabSettings", app.header.ActiveTab())
+		}
+	})
+}
+
+// TestSmoke_ClickDAGPageDoesNotStealFocus enforces the CLAUDE.md page-wrapper
+// rule: clicking on any non-interactive area inside the DAG page must keep
+// focus on the page wrapper, which forwards InputHandler to the inner
+// widget. Without this contract, tview's default Box.MouseHandler can park
+// focus on a primitive with no InputHandler and silently drop keystrokes.
+// Pattern mirrors TestSmoke_TaskPageClickKeepsFocus / SettingsPage's click
+// test.
+func TestSmoke_ClickDAGPageDoesNotStealFocus(t *testing.T) {
+	d := testDB(t)
+	runner := agent.NewRunner(nil)
+	app := New(d, runner, false)
+	_ = d.Add(&model.Task{ID: "click-1", Name: "click test", Status: model.StatusPending, CreatedAt: time.Now()})
+	app.refreshTasks()
+
+	sim, stop := wireApp(t, app)
+	defer stop()
+
+	// Switch to DAG tab.
+	sim.InjectKey(tcell.KeyRune, '2', 0)
+	syncUI(t, app.tapp)
+
+	var focused tview.Primitive
+	readUI(t, app.tapp, func() { focused = app.tapp.GetFocus() })
+	if focused != app.dagPage {
+		t.Fatalf("expected initial focus on dagPage, got %T", focused)
+	}
+
+	// Click on a position likely to land on the page wrapper's border row.
+	sim.InjectMouse(0, 1, tcell.Button1, 0)
+	syncUI(t, app.tapp)
+
+	readUI(t, app.tapp, func() { focused = app.tapp.GetFocus() })
+	if focused != app.dagPage {
+		t.Errorf("click on dag page wrapper border stole focus from dagPage (got %T)", focused)
+	}
+
+	// Click inside the widget area too — focus must STILL be on the page
+	// wrapper so the wrapper's InputHandler routes keystrokes to the inner
+	// widget (the wrapper has an InputHandler that forwards; the inner
+	// widget alone would still receive keys but the wrapper-focused path
+	// is what the rest of the page contract assumes).
+	sim.InjectMouse(20, 10, tcell.Button1, 0)
+	syncUI(t, app.tapp)
+	readUI(t, app.tapp, func() { focused = app.tapp.GetFocus() })
+	if focused != app.dagPage {
+		t.Errorf("click inside dag node area stole focus from dagPage (got %T)", focused)
 	}
 }

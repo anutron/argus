@@ -608,6 +608,40 @@ func (m *mockTaskDB) SetResult(id, result string) error {
 	return fmt.Errorf("not found")
 }
 
+func (m *mockTaskDB) SetDependsOn(id string, deps []string) error {
+	for _, t := range m.tasks {
+		if t.ID == id {
+			t.DependsOn = append([]string(nil), deps...)
+			return nil
+		}
+	}
+	return fmt.Errorf("not found")
+}
+
+func (m *mockTaskDB) SetPlanSlug(id, slug string) error {
+	for _, t := range m.tasks {
+		if t.ID == id {
+			t.PlanSlug = slug
+			return nil
+		}
+	}
+	return fmt.Errorf("not found")
+}
+
+func (m *mockTaskDB) SetArchived(id string, archived bool) error {
+	for _, t := range m.tasks {
+		if t.ID == id {
+			t.Archived = archived
+			// Mirror *db.DB.SetArchived: archiving clears pinned.
+			if archived {
+				t.Pinned = false
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("not found")
+}
+
 func (m *mockTaskDB) FindByNameProject(name, project string) (*model.Task, error) {
 	for _, t := range m.tasks {
 		if t.Archived {
@@ -700,14 +734,17 @@ func TestToolsList_WithTasks(t *testing.T) {
 	var list ToolsListResult
 	json.Unmarshal(result, &list) //nolint:errcheck
 
-	// 5 KB tools + 8 task tools (orchestration adds task_set_result) = 13
-	testutil.Equal(t, len(list.Tools), 13)
+	// 5 KB tools + 8 task tools + 5 linking tools (link/unlink/deps/halt/plan_slug) = 18
+	testutil.Equal(t, len(list.Tools), 18)
 
 	names := make(map[string]bool)
 	for _, tool := range list.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"task_create", "task_list", "task_get", "task_stop", "task_archive", "task_rename", "task_complete", "task_set_result"} {
+	for _, want := range []string{
+		"task_create", "task_list", "task_get", "task_stop", "task_archive", "task_rename", "task_complete", "task_set_result",
+		"task_link", "task_unlink", "task_deps", "task_halt_downstream", "task_set_plan_slug",
+	} {
 		if !names[want] {
 			t.Errorf("missing tool: %s", want)
 		}
@@ -1324,8 +1361,8 @@ func TestToolsList_WithClipboard(t *testing.T) {
 	var list ToolsListResult
 	json.Unmarshal(result, &list) //nolint:errcheck
 
-	// 5 KB tools + 8 task tools (incl task_set_result) + 1 clipboard tool = 14
-	testutil.Equal(t, len(list.Tools), 14)
+	// 5 KB tools + 8 task tools + 5 linking tools + 1 clipboard tool = 19
+	testutil.Equal(t, len(list.Tools), 19)
 
 	names := make(map[string]bool)
 	for _, tool := range list.Tools {
