@@ -200,6 +200,31 @@ type App struct {
 	// tmux/iTerm2 ghosts after a resize.
 	lastScreenW int
 	lastScreenH int
+
+	// multiplexerMode is set at startup by detectMultiplexer() — `$TMUX`,
+	// `$STY`, or `$TERM` prefix `tmux`/`screen`, overridable via
+	// `ARGUS_FORCE_SYNC=1|0`. When true, content-only updates inside
+	// tcell-managed widgets (preview pane RefreshOutput, terminal pane PTY
+	// streaming) must Sync because tcell.Show()'s SGR/cursor optimization
+	// can desync from tmux's pane backing after tmux redraws from its own
+	// state. Outside a multiplexer, tcell's diff is trustworthy on its
+	// own and content updates flow through Show() with no Sync.
+	multiplexerMode atomic.Bool
+
+	// pendingContentSync is set by forceContentSync when a content-only
+	// path (preview RefreshOutput, terminal pane new bytes) updated cells
+	// without changing widget shape. Distinct from `pendingSync` —
+	// `pendingSync` covers layout-shift triggers (OnBranchChange,
+	// resize), `pendingContentSync` covers content updates that bypass
+	// those callbacks by design.
+	//
+	// The flag is ONLY set when `multiplexerMode` is true: forceContentSync
+	// early-returns when bare-terminal. So in production the flag should
+	// never be true while multiplexerMode is false. afterDraw still
+	// conjuncts `multiplexerMode.Load()` when consuming the flag — this
+	// is belt-and-suspenders defense (e.g. tests may flip multiplexerMode
+	// after setting the flag), not a contract requirement.
+	pendingContentSync atomic.Bool
 }
 
 // New creates the tui application shell.
@@ -225,6 +250,11 @@ func New(database *db.DB, runner agent.SessionProvider, daemonConnected bool) *A
 		pendingRerenderRestart: make(map[string]bool),
 		wtRoot:                 filepath.Join(db.DataDir(), "worktrees"),
 	}
+	app.multiplexerMode.Store(detectMultiplexer())
+	if app.multiplexerMode.Load() {
+		uxlog.Log("[tui] multiplexerMode enabled — content-only updates will Sync")
+	}
+
 	if dc, ok := runner.(*dclient.Client); ok {
 		app.daemonClient = dc
 	}
@@ -300,6 +330,7 @@ func (a *App) buildUI() {
 	a.taskGitPanel.OnBranchChange = func() { a.forceRedraw("task git panel branch changed") }
 	a.taskPreview = NewTaskPreviewPanel()
 	a.taskPreview.OnBranchChange = func() { a.forceRedraw("task preview branch changed") }
+	a.taskPreview.OnContentChange = func() { a.forceContentSync("task preview content updated") }
 	a.taskDetail = taskview.NewTaskDetailPanel()
 	a.taskDetail.OnBranchChange = func() { a.forceRedraw("task detail branch changed") }
 
@@ -320,6 +351,7 @@ func (a *App) buildUI() {
 		a.updateFocusIndicators()
 	}
 	a.agentPane.OnBranchChange = func() { a.forceRedraw("agentpane branch changed") }
+	a.agentPane.OnContentChange = func() { a.forceContentSync("agentpane content updated") }
 	a.agentPane.OnNeedRedraw = func() {
 		a.tapp.QueueUpdateDraw(func() {})
 	}
@@ -394,37 +426,49 @@ func (a *App) buildUI() {
 // inside `a.draw()` after `root.Draw(screen)` has populated the cell buffer
 // with new content but before `screen.Show()` emits diffs.
 //
-// Calls `screen.Sync()` only when a layout-shift trigger fired: an explicit
-// `forceRedraw` (pendingSync) from one of the OnBranchChange / OnLayoutChange
-// callbacks, or a screen resize. Normal content updates (typing, cursor
-// nav, PTY output, spinner ticks) flow through tcell's per-cell diff via
-// Show() — the terminal sees only the changed cells, no clear-screen
-// escape, no flash. Earlier revisions Sync'd every frame inside tmux to
-// fix tearing; that caused visible per-frame flashing because tcell.Sync
-// emits CSI 2J. The branch-change contract plus the EventFocus recovery
-// in lazyScreen covers the documented tmux drift sources directly, so
-// the brute-force per-frame Sync is unnecessary. See
-// gotchas/ui-threading.md for the full callback inventory (pages,
-// tasklist, settings, taskGitPanel, taskPreview, taskDetail, gitPanel,
-// filePanel, agentPane, dagWidget) and the focus-event recovery path.
+// Calls `screen.Sync()` on three triggers: an explicit `forceRedraw`
+// (pendingSync) from one of the OnBranchChange / OnLayoutChange callbacks,
+// a screen resize, or — when `multiplexerMode` is on — a content-only
+// update (pendingContentSync) from a widget that streams cells without
+// changing its shape signature. The content-sync trigger only matters
+// inside a multiplexer: tcell.Show()'s SGR/cursor-move optimization can
+// desync from tmux's pane backing after tmux redraws from its own state,
+// leaving stale cells at unwritten positions. A Sync rewrites everything
+// with absolute positioning, recovering the drift. Outside tmux,
+// `pendingContentSync` is ignored — Show()'s diff is trustworthy on its
+// own. See gotchas/ui-threading.md for the full callback inventory and
+// the content-sync rationale.
 func (a *App) afterDraw(screen tcell.Screen) {
 	width, height := screen.Size()
 	sizeChanged := width != a.lastScreenW || height != a.lastScreenH
 	a.lastScreenW = width
 	a.lastScreenH = height
 	consumed := a.pendingSync.CompareAndSwap(true, false)
-	if !sizeChanged && !consumed {
+	contentConsumed := a.pendingContentSync.CompareAndSwap(true, false) && a.multiplexerMode.Load()
+	if !sizeChanged && !consumed && !contentConsumed {
 		return
 	}
 	// Log every Sync with its trigger so a debugger can correlate against
-	// the matching `[tui] force redraw: ...` entry from forceRedraw.
+	// the matching `[tui] force redraw: ...` / `[tui] force content sync:
+	// ...` entry. Multiple flags can trigger together (a resize that also
+	// fires pendingSync is common); the switch picks the most specific
+	// combination so the log lists every reason a Sync would have fired
+	// even if only one was needed.
 	switch {
+	case sizeChanged && consumed && contentConsumed:
+		uxlog.Log("[tui] afterDraw sync: size %dx%d (resize + forceRedraw + content)", width, height)
 	case sizeChanged && consumed:
 		uxlog.Log("[tui] afterDraw sync: size %dx%d (resize + forceRedraw)", width, height)
+	case sizeChanged && contentConsumed:
+		uxlog.Log("[tui] afterDraw sync: size %dx%d (resize + content)", width, height)
+	case consumed && contentConsumed:
+		uxlog.Log("[tui] afterDraw sync: forceRedraw + content consumed")
 	case sizeChanged:
 		uxlog.Log("[tui] afterDraw sync: size %dx%d (resize)", width, height)
 	case consumed:
 		uxlog.Log("[tui] afterDraw sync: forceRedraw consumed")
+	case contentConsumed:
+		uxlog.Log("[tui] afterDraw sync: content update (multiplexer)")
 	}
 	screen.Sync()
 }
@@ -1941,6 +1985,33 @@ func (a *App) switchTab(t widget.Tab) {
 func (a *App) forceRedraw(reason string) {
 	uxlog.Log("[tui] force redraw: %s", reason)
 	a.pendingSync.Store(true)
+}
+
+// forceContentSync requests a tcell Sync for a content-only cell update
+// (preview RefreshOutput, terminal pane PTY streaming). Only effective
+// when running inside a multiplexer; on a bare terminal it early-returns
+// without setting any flag, keeping the no-Sync fast path free of even
+// atomic-flag overhead. Inside a multiplexer it CAS-sets pendingContentSync
+// — multiple calls within a draw cycle collapse to ONE Sync because the
+// CAS only succeeds when the flag was previously false. afterDraw consumes
+// the flag and emits one screen.Sync().
+//
+// Wired by widgets whose Draw streams cells within an unchanged shape:
+// TaskPreviewPanel.RefreshOutput fires after rebuilding the grid;
+// TerminalPane fires after consuming new PTY bytes via paintEmu.
+// These paths bypass the OnBranchChange contract by design (no shape
+// flip), so without an explicit Sync trigger the resulting tcell.Show()
+// diff lands into a tmux pane backing that may have drifted via tmux-
+// internal events (status-bar redraw on its 1s tick, copy-mode exit,
+// pane refresh on window return). The Sync rewrites with absolute
+// positioning and clears the drift.
+func (a *App) forceContentSync(reason string) {
+	if !a.multiplexerMode.Load() {
+		return
+	}
+	if a.pendingContentSync.CompareAndSwap(false, true) {
+		uxlog.Log("[tui] force content sync: %s", reason)
+	}
 }
 
 // onTaskCursorChange updates the preview, git status, and detail panels when the task list cursor moves.
