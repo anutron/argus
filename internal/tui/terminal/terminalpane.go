@@ -196,26 +196,14 @@ type TerminalPane struct {
 	// unified diff↔split diff), scroll-mode 0↔nonzero (live↔replay
 	// emulator), and async replay rebuild completion (fallback emulator →
 	// fresh 50K-line emulator with potentially different content at the
-	// same cell positions). Each branch paints different cells in the same
-	// rect; tcell's diff-based Show() can leave stale cells from the
-	// previous branch on screen. The app wires this to forceRedraw so
-	// afterDraw runs Sync. See gotchas/ui-threading.md.
+	// same cell positions). The app wires this to forceRedraw, which is
+	// now log-only (does NOT trigger Sync) — DrawBorderedPanel's FillArea
+	// covers the inner rect every frame and tcell.Show()'s diff handles
+	// branch transitions correctly. See gotchas/ui-threading.md.
 	//
 	// Safe to fire from any goroutine: the callback is set once in
-	// buildUI and never reassigned, and forceRedraw uses an atomic flag.
+	// buildUI and never reassigned, and forceRedraw just logs.
 	OnBranchChange func()
-
-	// OnContentChange fires when new PTY bytes have been consumed by the
-	// emulator and emitted to the cell buffer — i.e., terminal content
-	// updated within an unchanged Draw branch. App wires this to
-	// forceContentSync (no-op outside a multiplexer). The branch-change
-	// contract doesn't cover same-shape PTY streaming: tcell.Show()'s
-	// per-cell diff handles content updates correctly on bare terminals,
-	// but inside tmux the SGR/cursor optimization can desync from the
-	// pane backing after tmux's own redraws (status-bar tick, copy-mode
-	// exit, pane refresh on return). A Sync rewrites with absolute
-	// positioning and clears the drift. See gotchas/ui-threading.md.
-	OnContentChange func()
 }
 
 // mouseScrollStep is the number of lines scrolled per mouse wheel tick.
@@ -246,15 +234,6 @@ func NewTerminalPane() *TerminalPane {
 func (tp *TerminalPane) notifyBranchChange() {
 	if tp.OnBranchChange != nil {
 		tp.OnBranchChange()
-	}
-}
-
-// notifyContentChange fires OnContentChange if set. Same locking contract
-// as notifyBranchChange: call AFTER releasing tp.mu. No-op when the
-// callback isn't wired (bare-terminal mode).
-func (tp *TerminalPane) notifyContentChange() {
-	if tp.OnContentChange != nil {
-		tp.OnContentChange()
 	}
 }
 
@@ -546,9 +525,8 @@ func (tp *TerminalPane) consumeReplayRebuildPendingLocked() {
 	// AccelScrollUp can't clamp (no emu yet, no maxScroll), so the user
 	// can scroll past the available scrollback. Without snapping here,
 	// the cache-validity check (scrollOffset <= replayEmuMaxScroll) fails
-	// on every frame, each Draw kicks another async rebuild, and the
-	// rebuild completion fires notifyBranchChange -> screen.Sync() — the
-	// visible flicker at the top of the scrollback.
+	// on every frame and each Draw kicks another async rebuild — visible
+	// flicker at the top of the scrollback.
 	if tp.scrollOffset > tp.replayEmuMaxScroll {
 		uxlog.Log("[terminalpane] clamp scrollOffset old=%d new=%d after rebuild",
 			tp.scrollOffset, tp.replayEmuMaxScroll)
@@ -1222,10 +1200,11 @@ func (tp *TerminalPane) asyncReplayRebuild(taskID string, scrollOffset, viewport
 	// Branch change: the fallback emulator (or "Waiting for output..." text)
 	// painted on prior frames is being replaced by a fresh 50K-line replay
 	// emulator. Different content fills the same rect — fire OnBranchChange
-	// so afterDraw runs Sync, wiping any stale fallback cells. notify is
-	// safe to call from this background goroutine: the callback is set once
-	// in buildUI and never reassigned (no race), and forceRedraw uses an
-	// atomic flag (no cross-goroutine ordering concerns).
+	// for the debug-trail log entry. forceRedraw is log-only (does NOT
+	// trigger Sync); the actual stale-cell prevention is DrawBorderedPanel's
+	// FillArea covering the inner rect every frame. notify is safe from
+	// this background goroutine: the callback is set once in buildUI and
+	// never reassigned (no race), and forceRedraw is just a uxlog call.
 	tp.notifyBranchChange()
 
 	// Trigger a redraw so the next Draw() picks up the new emulator.
@@ -1327,15 +1306,6 @@ func (tp *TerminalPane) renderLive(screen tcell.Screen, x, y, w, h int, ptyCols,
 	// Cache miss or stale — fall through to full paintEmu.
 
 	tp.paintEmu(screen, x, y, w, h, tp.emu, ptyCols, ptyRows, true, tp.cursorVisible)
-
-	// Content updated (new PTY bytes consumed, or full rebuild paint) —
-	// notify the App so multiplexerMode can Sync on the next afterDraw.
-	// Bypasses the OnBranchChange contract by design: the cells changed
-	// inside the same Draw branch (PTY streaming, not a layout shift).
-	// Outside a multiplexer this is a cheap no-op.
-	if newBytes > 0 || needRebuild {
-		tp.notifyContentChange()
-	}
 }
 
 // paintEmu renders x/vt emulator cells to the tcell screen with content trimming and scrollback.

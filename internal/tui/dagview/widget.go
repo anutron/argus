@@ -28,9 +28,10 @@ type Widget struct {
 
 	// OnBranchChange fires when Draw will paint a structurally different
 	// frame than the previous one (node count, layer count, edge count, or
-	// node-status set). App wires this to forceRedraw so tcell's per-cell
-	// diff doesn't leave ghost glyphs behind. See gotchas/ui-threading.md
-	// and gotchas/dag-rendering.md.
+	// node-status set). App wires this to forceRedraw, which is now a
+	// log-only debug signal (does NOT trigger Sync) — tcell.Show()'s
+	// per-cell diff plus tview.Clear() handle the rendering. See
+	// gotchas/ui-threading.md and gotchas/dag-rendering.md.
 	OnBranchChange func()
 	lastShape      uint64
 }
@@ -290,8 +291,8 @@ func parseFailed(raw string) bool {
 // branchShape captures the parts of state that, when changed, mean Draw
 // would paint a structurally different cell set. The widget compares this
 // signature across SetNodes / SetFocused / MoveCursor to decide whether to
-// fire OnBranchChange. See the contract in CLAUDE.md ("UX-tearing prevention
-// — the branch-change callback contract").
+// fire OnBranchChange — purely as a debug-trail signal; forceRedraw is
+// log-only post-May-2026. See gotchas/ui-threading.md.
 //
 // The cursor field is folded into the signature via FNV-1a over the cursor
 // task ID so a move between two non-empty cursors (same node count, same
