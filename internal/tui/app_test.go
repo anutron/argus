@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/drn/argus/internal/testutil"
 	"github.com/drn/argus/internal/tui/modal"
 	"github.com/drn/argus/internal/tui/widget"
+	"github.com/drn/argus/internal/uxlog"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
@@ -2247,5 +2249,119 @@ func TestTcellKeyToBytes_MoreCases(t *testing.T) {
 			got := tcellKeyToBytes(ev)
 			testutil.Equal(t, string(got), string(tt.want))
 		})
+	}
+}
+
+// recordingScreen is a tcell.Screen test double that counts Sync() calls.
+// Only Size and Sync are exercised by afterDraw; the embedded nil-interface
+// Screen is unused and will panic if any other method is invoked, which is
+// the intended invariant for this test.
+type recordingScreen struct {
+	tcell.Screen
+	w, h      int
+	syncCount int
+}
+
+func (r *recordingScreen) Size() (int, int) { return r.w, r.h }
+func (r *recordingScreen) Sync()            { r.syncCount++ }
+
+// TestApp_AfterDrawForceSync pins the architectural commitment from the
+// "A) sync every frame inside multiplexers" decision: when forceSync is set
+// (e.g. detected via $TMUX), afterDraw must call screen.Sync() on every
+// draw cycle, not just on resize / forceRedraw consumption.
+func TestApp_AfterDrawForceSync(t *testing.T) {
+	tests := []struct {
+		name      string
+		forceSync bool
+		pending   bool
+		resize    bool
+		wantSync  bool
+	}{
+		{name: "no flags", forceSync: false, pending: false, resize: false, wantSync: false},
+		{name: "pendingSync only", forceSync: false, pending: true, resize: false, wantSync: true},
+		{name: "forceSync only", forceSync: true, pending: false, resize: false, wantSync: true},
+		{name: "resize only", forceSync: false, pending: false, resize: true, wantSync: true},
+		{name: "forceSync + pending", forceSync: true, pending: true, resize: false, wantSync: true},
+		{name: "forceSync + resize", forceSync: true, pending: false, resize: true, wantSync: true},
+		{name: "all three", forceSync: true, pending: true, resize: true, wantSync: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDB(t)
+			runner := agent.NewRunner(nil)
+			app := New(d, runner, false)
+			// Force-set state independently of detection so the test exercises
+			// the field, not the detection that already has its own coverage.
+			app.forceSync.Store(tt.forceSync)
+			app.pendingSync.Store(tt.pending)
+			app.lastScreenW = 80
+			app.lastScreenH = 24
+			rec := &recordingScreen{w: 80, h: 24}
+			if tt.resize {
+				rec.w = 100
+			}
+			app.afterDraw(rec)
+			gotSync := rec.syncCount > 0
+			testutil.Equal(t, gotSync, tt.wantSync)
+			// pendingSync must be consumed iff it was set, regardless of other triggers.
+			testutil.Equal(t, app.pendingSync.Load(), false)
+		})
+	}
+}
+
+// TestApp_AfterDrawForceSyncDoesNotSpamLog locks in the deliberate decision
+// NOT to uxlog every per-frame forceSync — the log would drown ux.log at
+// terminal-rate input. afterDraw still Syncs, just silently. We assert two
+// invariants over 100 silent frames: (a) Sync was called every frame
+// (forceSync's whole job), and (b) NO "[tui] afterDraw sync" lines were
+// written to uxlog (the suppression contract). Both must hold simultaneously
+// — counting syncs alone would let a future stray uxlog.Log slip through.
+func TestApp_AfterDrawForceSyncDoesNotSpamLog(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "ux.log")
+	if err := uxlog.Init(logPath); err != nil {
+		t.Fatalf("uxlog.Init: %v", err)
+	}
+	defer uxlog.Close()
+
+	d := testDB(t)
+	runner := agent.NewRunner(nil)
+	app := New(d, runner, false)
+	app.forceSync.Store(true)
+	app.lastScreenW = 80
+	app.lastScreenH = 24
+	// refreshTasks() fires legitimate OnLayoutChange / OnBranchChange callbacks
+	// during New() which leave pendingSync=true. Drain it before the test loop
+	// so the first iteration's CAS doesn't fire a legitimate "forceRedraw
+	// consumed" log line that pollutes the per-frame-suppression assertion.
+	app.pendingSync.Store(false)
+	// Snapshot the log size AFTER any New()-induced "afterDraw sync" line so
+	// the assertion only inspects what the 100-frame loop itself produced.
+	preLoopSize := int64(0)
+	if fi, err := os.Stat(logPath); err == nil {
+		preLoopSize = fi.Size()
+	}
+	rec := &recordingScreen{w: 80, h: 24}
+	for range 100 {
+		app.afterDraw(rec)
+	}
+	testutil.Equal(t, rec.syncCount, 100)
+
+	f, err := os.Open(logPath)
+	if err != nil {
+		t.Fatalf("open uxlog: %v", err)
+	}
+	defer f.Close()
+	if _, err := f.Seek(preLoopSize, 0); err != nil {
+		t.Fatalf("seek uxlog: %v", err)
+	}
+	tail, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatalf("read uxlog tail: %v", err)
+	}
+	// The "[tui] afterDraw sync" prefix covers all three log variants
+	// (resize, resize+forceRedraw, forceRedraw consumed). None should fire
+	// in the 100-frame loop when only forceSync triggers.
+	if strings.Contains(string(tail), "[tui] afterDraw sync") {
+		t.Fatalf("forceSync must not log per-frame; got post-setup tail:\n%s", string(tail))
 	}
 }

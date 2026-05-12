@@ -195,6 +195,19 @@ type App struct {
 	// tmux/iTerm2 ghosts after a resize.
 	lastScreenW int
 	lastScreenH int
+
+	// forceSync, when true, makes afterDraw call screen.Sync() on every draw
+	// cycle instead of relying on the branch-change callbacks. Set at startup
+	// by detectMultiplexer(): tmux/screen maintain their own pane backing
+	// store that drifts from tcell's belief about the terminal, so the per-
+	// cell diff in tcell.Show() produces visible tearing across layout shifts.
+	// Syncing every frame trades the diff optimization (~free over a local
+	// PTY) for correctness. See gotchas/ui-threading.md "forceSync".
+	//
+	// atomic.Bool (not plain bool) for symmetry with pendingSync and to keep
+	// it safe under any future test that flips it after wireApp starts the
+	// tview event loop — the field is read on the tview draw goroutine.
+	forceSync atomic.Bool
 }
 
 // New creates the tui application shell.
@@ -219,6 +232,10 @@ func New(database *db.DB, runner agent.SessionProvider, daemonConnected bool) *A
 		viewedWhileAgent:       make(map[string]bool),
 		pendingRerenderRestart: make(map[string]bool),
 		wtRoot:                 filepath.Join(db.DataDir(), "worktrees"),
+	}
+	app.forceSync.Store(detectMultiplexer())
+	if app.forceSync.Load() {
+		uxlog.Log("[tui] forceSync enabled — multiplexer detected, syncing every frame")
 	}
 
 	if dc, ok := runner.(*dclient.Client); ok {
@@ -382,29 +399,33 @@ func (a *App) buildUI() {
 // Calling `screen.Sync()` here is safe — tcell's Sync() invalidates all cells
 // and immediately emits a full clear+redraw. Show() then runs but finds no
 // dirty cells, so nothing is double-emitted. Net cost: one full-screen redraw
-// per draw cycle where forceRedraw was requested or the screen was resized.
+// per draw cycle where ANY of three triggers fired: forceRedraw was requested
+// (pendingSync), the screen was resized, or forceSync is set (multiplexer
+// mode — Sync every frame because tcell's per-cell diff isn't trustworthy
+// inside tmux/screen). The forceSync path is intentionally NOT logged per
+// frame; see the switch below.
 func (a *App) afterDraw(screen tcell.Screen) {
 	w, h := screen.Size()
 	sizeChanged := w != a.lastScreenW || h != a.lastScreenH
 	a.lastScreenW = w
 	a.lastScreenH = h
 	consumed := a.pendingSync.CompareAndSwap(true, false)
-	if sizeChanged || consumed {
-		// Always log so a debugger can confirm Sync ran in response to the
-		// matching `[tui] force redraw: ...` entry above. Without this entry,
-		// the deferred Sync is invisible in ux.log — only the request side
-		// shows up — making it hard to verify the architecture worked when
-		// chasing a tearing regression.
-		switch {
-		case sizeChanged && consumed:
-			uxlog.Log("[tui] afterDraw sync: size %dx%d (resize + forceRedraw)", w, h)
-		case sizeChanged:
-			uxlog.Log("[tui] afterDraw sync: size %dx%d (resize)", w, h)
-		default:
-			uxlog.Log("[tui] afterDraw sync: forceRedraw consumed")
-		}
-		screen.Sync()
+	if !sizeChanged && !consumed && !a.forceSync.Load() {
+		return
 	}
+	// Log every non-routine Sync so a debugger can confirm one ran in response
+	// to the matching `[tui] force redraw: ...` entry above. Suppress logging
+	// when only forceSync triggered (no resize, no forceRedraw): the per-frame
+	// log would drown ux.log and the Sync is by-construction expected.
+	switch {
+	case sizeChanged && consumed:
+		uxlog.Log("[tui] afterDraw sync: size %dx%d (resize + forceRedraw)", w, h)
+	case sizeChanged:
+		uxlog.Log("[tui] afterDraw sync: size %dx%d (resize)", w, h)
+	case consumed:
+		uxlog.Log("[tui] afterDraw sync: forceRedraw consumed")
+	}
+	screen.Sync()
 }
 
 // SetDaemonStale records that the connected daemon's binary differs from the
