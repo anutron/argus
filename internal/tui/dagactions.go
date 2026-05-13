@@ -5,36 +5,96 @@ import (
 	"strconv"
 
 	"github.com/drn/argus/internal/agent"
+	"github.com/drn/argus/internal/model"
 	"github.com/drn/argus/internal/orch"
 	"github.com/drn/argus/internal/tui/dagview"
 	"github.com/drn/argus/internal/uxlog"
 )
 
 // refreshDAG rebuilds the DAG widget's node set from the current DB
-// snapshot. Called when the DAG tab is opened and whenever the tick loop
-// notices a task mutation (status change, new task, archive flip).
+// snapshot. Called when the DAG tab is opened and after a halt cascade
+// completes (see confirmHaltDownstream). Not currently driven by the
+// tick loop — task-list mutations refresh on tab entry instead.
 //
-// Project filter intentionally not applied here — the widget shows every
-// task with at least one link plus orphans. A future iteration can scope
-// to a single project via a dropdown without touching this entry point.
+// Filter rules — see dagNodesFromTasks: archived rows are dropped, and
+// pure orphans (no parents AND not referenced as a parent) are dropped.
+// The DAG tab is for inspecting linked stacks; including every standalone
+// task pushes the connected graph off-screen.
 func (a *App) refreshDAG() {
 	tasks, err := a.db.Tasks()
 	if err != nil {
 		uxlog.Log("[tui] refreshDAG: %v", err)
 		return
 	}
-	nodes := make([]dagview.Node, 0, len(tasks))
+	nodes := dagNodesFromTasks(tasks)
+	uxlog.Log("[tui] refreshDAG: %d tasks → %d nodes (%d filtered)", len(tasks), len(nodes), len(tasks)-len(nodes))
+	a.dagWidget.SetNodes(nodes)
+}
+
+// dagNodesFromTasks projects the task list into the DAG widget's input set,
+// applying the TUI's filter contract:
+//
+//  1. Archived tasks are dropped. The web UI exposes a toggle to include
+//     them; the TUI does not yet — when it does, this is the seam to wire it.
+//  2. Pure orphans (no DependsOn and not referenced as a parent by any
+//     surviving task) are dropped. They contribute no edges and pile up at
+//     layer 0, drowning the connected graph in unrelated boxes.
+//
+// A task whose only parents are stale (archived or deleted) is dropped
+// if it also has no live children — i.e. it would render as an isolated
+// box at layer 0. If it still has at least one live child, it's kept and
+// renders as a source node, since dropping it would vanish a real link
+// from the middle of someone's stack.
+//
+// The filter is intentionally cycle-agnostic: orch.Link / orch.FindCycle
+// prevent cycles at link time, so by the time Tasks() returns the DAG is
+// already acyclic. A defective input with a self-loop or a mutual cycle
+// passes through here unchanged and the layout's cycle guard handles it.
+func dagNodesFromTasks(tasks []*model.Task) []dagview.Node {
+	live := make(map[string]*model.Task, len(tasks))
 	for _, t := range tasks {
-		nodes = append(nodes, dagview.Node{
+		if t.Archived {
+			continue
+		}
+		live[t.ID] = t
+	}
+	referenced := make(map[string]bool, len(live))
+	for _, t := range live {
+		for _, d := range t.DependsOn {
+			if _, ok := live[d]; ok {
+				referenced[d] = true
+			}
+		}
+	}
+	out := make([]dagview.Node, 0, len(live))
+	for _, t := range tasks {
+		if t.Archived {
+			continue
+		}
+		hasParent := false
+		for _, d := range t.DependsOn {
+			if _, ok := live[d]; ok {
+				hasParent = true
+				break
+			}
+		}
+		if !hasParent && !referenced[t.ID] {
+			continue
+		}
+		// Archived is always false here — archived rows were filtered
+		// above. The field stays in the projection so the widget's
+		// status palette can still render grey-dim if a future toggle
+		// opens up archived inclusion.
+		out = append(out, dagview.Node{
 			ID:        t.ID,
 			Name:      t.Name,
 			Status:    t.Status.String(),
-			Archived:  t.Archived,
+			Archived:  false,
 			Result:    t.Result,
 			DependsOn: append([]string(nil), t.DependsOn...),
 		})
 	}
-	a.dagWidget.SetNodes(nodes)
+	return out
 }
 
 // openAgentForTask is the DAG-side "jump to this task's agent view" hook.
