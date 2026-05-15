@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"sync"
@@ -12,6 +13,14 @@ import (
 )
 
 const defaultBufSize = 256 * 1024 // 256KB ring buffer; session log file handles full scrollback
+
+// pasteEndBytes is the bracketed-paste end sequence (CSI 201~). The inputLoop
+// drain treats it as a flush boundary so two back-to-back paste cycles never
+// get merged into one PTY write — merging lets the receiving terminal's
+// parser confuse them for a single paste, dropping the first cycle's
+// contents (visible as only the last of N drag-dropped files registering
+// in an interactive CLI).
+var pasteEndBytes = []byte("\x1b[201~")
 
 // Compile-time assertion.
 var _ agent.SessionHandle = (*RemoteSession)(nil)
@@ -49,17 +58,7 @@ func (rs *RemoteSession) inputLoop() {
 		// Block until at least one input arrives or session closes.
 		select {
 		case b := <-rs.inputCh:
-			// Drain any additional pending bytes to coalesce into one RPC.
-			buf := b
-			for {
-				select {
-				case more := <-rs.inputCh:
-					buf = append(buf, more...)
-				default:
-					goto send
-				}
-			}
-		send:
+			buf := drainInput(b, rs.inputCh)
 			var resp daemon.StatusResp
 			if err := rs.client.call("Daemon.WriteInput", &daemon.WriteReq{
 				TaskID: rs.taskID,
@@ -73,12 +72,40 @@ func (rs *RemoteSession) inputLoop() {
 	}
 }
 
+// drainInput coalesces additional pending messages from ch into initial,
+// returning the combined buffer ready for one RPC. Drain stops as soon as
+// either (a) the channel has no immediately-available message, or (b) the
+// buffer ends with a bracketed-paste end sequence — coalescing across that
+// boundary risks merging two `\x1b[200~..\x1b[201~` cycles into one PTY
+// write, which the receiver may parse as a single paste.
+func drainInput(initial []byte, ch <-chan []byte) []byte {
+	buf := initial
+	for !bytes.HasSuffix(buf, pasteEndBytes) {
+		select {
+		case more := <-ch:
+			buf = append(buf, more...)
+		default:
+			return buf
+		}
+	}
+	return buf
+}
+
 func (rs *RemoteSession) PID() int {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	return rs.pid
 }
 
+// WriteInput enqueues p onto the input channel; inputLoop drains the channel
+// and sends one or more RPCs to the daemon.
+//
+// Invariant relied on by drainInput: only PasteHandler writes data ending in
+// the bracketed-paste end sequence (\x1b[201~). drainInput uses that suffix
+// as a flush boundary so two back-to-back paste cycles never get coalesced
+// into one PTY write. Any future caller that writes bracketed-paste content
+// must wrap the whole cycle in a single WriteInput call (start sequence,
+// payload, and end sequence) — never split it across calls.
 func (rs *RemoteSession) WriteInput(p []byte) (int, error) {
 	// Copy so the caller can reuse the slice.
 	cp := make([]byte, len(p))

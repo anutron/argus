@@ -110,6 +110,71 @@ func TestH_WriteIn(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 }
 
+func TestDrainInput(t *testing.T) {
+	const pasteStart = "\x1b[200~"
+	const pasteEnd = "\x1b[201~"
+
+	t.Run("empty channel returns initial unchanged", func(t *testing.T) {
+		ch := make(chan []byte)
+		got := drainInput([]byte("hello"), ch)
+		testutil.Equal(t, string(got), "hello")
+	})
+
+	t.Run("plain typing coalesces all buffered messages", func(t *testing.T) {
+		ch := make(chan []byte, 8)
+		ch <- []byte("b")
+		ch <- []byte("c")
+		ch <- []byte("d")
+		got := drainInput([]byte("a"), ch)
+		testutil.Equal(t, string(got), "abcd")
+		testutil.Equal(t, len(ch), 0)
+	})
+
+	t.Run("initial ending in paste-end never reads channel", func(t *testing.T) {
+		ch := make(chan []byte, 4)
+		ch <- []byte("extra")
+		got := drainInput([]byte(pasteStart+"PATH"+pasteEnd), ch)
+		testutil.Equal(t, string(got), pasteStart+"PATH"+pasteEnd)
+		// The buffered message must still be in the channel — drainInput
+		// flushed at the paste boundary instead of merging across it.
+		testutil.Equal(t, len(ch), 1)
+		leftover := <-ch
+		testutil.Equal(t, string(leftover), "extra")
+	})
+
+	t.Run("flushes between two back-to-back pastes", func(t *testing.T) {
+		ch := make(chan []byte, 4)
+		ch <- []byte(pasteStart + "B" + pasteEnd)
+		ch <- []byte("trailing")
+		// First call drains only the first paste.
+		got1 := drainInput([]byte(pasteStart+"A"+pasteEnd), ch)
+		testutil.Equal(t, string(got1), pasteStart+"A"+pasteEnd)
+		// Second call drains the next paste, again stopping at its boundary.
+		got2 := drainInput(<-ch, ch)
+		testutil.Equal(t, string(got2), pasteStart+"B"+pasteEnd)
+		// Third call drains the trailing typing with nothing else pending.
+		got3 := drainInput(<-ch, ch)
+		testutil.Equal(t, string(got3), "trailing")
+	})
+
+	t.Run("coalesces up to first paste-end then stops", func(t *testing.T) {
+		ch := make(chan []byte, 4)
+		ch <- []byte("more-typing")
+		ch <- []byte(pasteStart + "X" + pasteEnd)
+		ch <- []byte("after-paste")
+		// Plain typing ahead of a paste is intentionally bundled WITH the
+		// paste cycle — the receiving parser handles leading non-paste
+		// bytes correctly, and merging them saves an RPC. What must NOT
+		// happen is coalescing across the trailing `\x1b[201~`: drain
+		// stops there so "after-paste" remains for the next call.
+		got := drainInput([]byte("typing"), ch)
+		testutil.Equal(t, string(got), "typing"+"more-typing"+pasteStart+"X"+pasteEnd)
+		testutil.Equal(t, len(ch), 1)
+		leftover := <-ch
+		testutil.Equal(t, string(leftover), "after-paste")
+	})
+}
+
 func TestH_WriteAfterClose(t *testing.T) {
 	_, sockPath, _ := testSetup(t)
 	c, err := Connect(sockPath)
