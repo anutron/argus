@@ -157,16 +157,18 @@ func TestDrainInput(t *testing.T) {
 		testutil.Equal(t, string(got3), "trailing")
 	})
 
-	t.Run("paste-end appearing mid-drain stops further coalescing", func(t *testing.T) {
+	t.Run("coalesces up to first paste-end then stops", func(t *testing.T) {
 		ch := make(chan []byte, 4)
 		ch <- []byte("more-typing")
 		ch <- []byte(pasteStart + "X" + pasteEnd)
 		ch <- []byte("after-paste")
-		// Initial does not end in paste-end, so drain consumes from ch
-		// until it hits a paste-end-terminated message; then stops.
+		// Plain typing ahead of a paste is intentionally bundled WITH the
+		// paste cycle — the receiving parser handles leading non-paste
+		// bytes correctly, and merging them saves an RPC. What must NOT
+		// happen is coalescing across the trailing `\x1b[201~`: drain
+		// stops there so "after-paste" remains for the next call.
 		got := drainInput([]byte("typing"), ch)
 		testutil.Equal(t, string(got), "typing"+"more-typing"+pasteStart+"X"+pasteEnd)
-		// "after-paste" must remain in the channel for the next call.
 		testutil.Equal(t, len(ch), 1)
 		leftover := <-ch
 		testutil.Equal(t, string(leftover), "after-paste")

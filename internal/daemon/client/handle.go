@@ -97,6 +97,15 @@ func (rs *RemoteSession) PID() int {
 	return rs.pid
 }
 
+// WriteInput enqueues p onto the input channel; inputLoop drains the channel
+// and sends one or more RPCs to the daemon.
+//
+// Invariant relied on by drainInput: only PasteHandler writes data ending in
+// the bracketed-paste end sequence (\x1b[201~). drainInput uses that suffix
+// as a flush boundary so two back-to-back paste cycles never get coalesced
+// into one PTY write. Any future caller that writes bracketed-paste content
+// must wrap the whole cycle in a single WriteInput call (start sequence,
+// payload, and end sequence) — never split it across calls.
 func (rs *RemoteSession) WriteInput(p []byte) (int, error) {
 	// Copy so the caller can reuse the slice.
 	cp := make([]byte, len(p))
