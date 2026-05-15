@@ -39,14 +39,6 @@ import (
 // ListSessions returns stale data after a daemon restart cascade.
 const recentStartGrace = 5 * time.Second
 
-// pasteSettleWindow is how long after a bracketed paste the agent-key
-// forwarder treats arriving keystrokes as suspicious — long enough to span
-// the inter-paste gap a terminal might introduce when splitting a multi-file
-// drop across two pastes, short enough to not catch ordinary typing.
-// Diagnostic only; remove with the rest of the `[paste]` instrumentation
-// once multi-attachment drag-drop is characterized and fixed.
-const pasteSettleWindow = 200 * time.Millisecond
-
 // viewMode identifies the active view.
 type viewMode int
 
@@ -1545,16 +1537,6 @@ func (a *App) handleAgentKey(event *tcell.EventKey) *tcell.EventKey {
 	if sess != nil && sess.Alive() {
 		b := tcellKeyToBytes(event)
 		if len(b) > 0 {
-			// TODO(diagnostic): remove with the rest of the `[paste]`
-			// instrumentation once multi-attachment drag-drop is fixed.
-			// Logs any key forwarded during pasteSettleWindow so we can
-			// see whether the outer terminal injects a stray Enter between
-			// two bracket-paste sequences (splitting a multi-file drop).
-			if lp := a.agentPane.LastPasteTime(); !lp.IsZero() {
-				if elapsed := time.Since(lp); elapsed < pasteSettleWindow {
-					uxlog.Log("[paste] key forwarded %dms after paste: %q (key=%v)", elapsed.Milliseconds(), string(b), event.Key())
-				}
-			}
 			if _, err := sess.WriteInput(b); err != nil {
 				uxlog.Log("[tui] write to PTY failed: %v", err)
 			}

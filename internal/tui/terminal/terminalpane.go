@@ -180,13 +180,6 @@ type TerminalPane struct {
 	// "No active session".
 	pending bool
 
-	// lastPasteTime is the wall-clock time of the most recent PasteHandler
-	// invocation. Used by the app-level key forwarder to detect non-paste
-	// keystrokes that arrive between two bracket-paste sequences — a pattern
-	// produced by some terminal emulators on multi-file drag-drop that splits
-	// the drop across two pastes with an intervening newline.
-	lastPasteTime time.Time
-
 	// OnClick is called when the user clicks on the terminal pane.
 	// The app wires this to switch agentFocus back to the terminal.
 	OnClick func()
@@ -790,13 +783,7 @@ func (tp *TerminalPane) PasteHandler() func(pastedText string, setFocus func(p t
 	return tp.WrapPasteHandler(func(pastedText string, setFocus func(p tview.Primitive)) {
 		tp.mu.Lock()
 		sess := tp.session
-		tp.lastPasteTime = time.Now()
 		tp.mu.Unlock()
-		// TODO(diagnostic): remove with the rest of the `[paste]`
-		// instrumentation once multi-attachment drag-drop is fixed.
-		// `[paste]` is intentionally a cross-file prefix (also fired from
-		// app.go) so `grep '\[paste\]' ux.log` collects the whole trace.
-		uxlog.Log("[paste] received %d bytes: %s", len(pastedText), quotePreview(pastedText, 256))
 		if sess != nil && sess.Alive() {
 			// Write the entire paste as a single PTY write, wrapped in
 			// bracket paste sequences so the agent's readline sees it as
@@ -805,27 +792,6 @@ func (tp *TerminalPane) PasteHandler() func(pastedText string, setFocus func(p t
 			sess.WriteInput([]byte(data))
 		}
 	})
-}
-
-// LastPasteTime returns the wall-clock time of the most recent PasteHandler
-// invocation, or the zero time if no paste has occurred. Used by the app key
-// forwarder to log keystrokes that arrive during the paste-settling window
-// while diagnosing multi-file drag-drop splitting.
-func (tp *TerminalPane) LastPasteTime() time.Time {
-	tp.mu.Lock()
-	defer tp.mu.Unlock()
-	return tp.lastPasteTime
-}
-
-// quotePreview returns a Go-quoted, length-bounded preview of s suitable for
-// logging arbitrary terminal byte sequences (escapes, control chars) without
-// corrupting the log. Byte-boundary truncation is intentional: fmt %q escapes
-// an orphaned UTF-8 lead byte as `\xNN` (no panic, slightly ugly log).
-func quotePreview(s string, max int) string {
-	if len(s) <= max {
-		return fmt.Sprintf("%q", s)
-	}
-	return fmt.Sprintf("%q…(+%d bytes)", s[:max], len(s)-max)
 }
 
 // --- Diff mode ---
