@@ -17,9 +17,9 @@ import (
 // tick loop — task-list mutations refresh on tab entry instead.
 //
 // Filter rules — see dagNodesFromTasks: archived rows are dropped, and
-// pure orphans (no parents AND not referenced as a parent) are dropped.
-// The DAG tab is for inspecting linked stacks; including every standalone
-// task pushes the connected graph off-screen.
+// pure orphans (no live parents AND not referenced as a parent) are
+// dropped. The DAG tab is for inspecting linked stacks; including every
+// standalone task pushes the connected graph off-screen.
 func (a *App) refreshDAG() {
 	tasks, err := a.db.Tasks()
 	if err != nil {
@@ -36,9 +36,13 @@ func (a *App) refreshDAG() {
 //
 //  1. Archived tasks are dropped. The web UI exposes a toggle to include
 //     them; the TUI does not yet — when it does, this is the seam to wire it.
-//  2. Pure orphans (no DependsOn and not referenced as a parent by any
-//     surviving task) are dropped. They contribute no edges and pile up at
-//     layer 0, drowning the connected graph in unrelated boxes.
+//  2. Pure orphans (no *live* parents AND not referenced as a parent by any
+//     surviving task) are dropped. "Live parent" means a DependsOn id that
+//     resolves to a non-archived task in the current snapshot — a task with
+//     `DependsOn: ["archived-or-deleted-id"]` counts as having no live
+//     parents and is dropped if nobody references it either. Pure orphans
+//     contribute no edges and pile up at layer 0, drowning the connected
+//     graph in unrelated boxes.
 //
 // A task whose only parents are stale (archived or deleted) is dropped
 // if it also has no live children — i.e. it would render as an isolated
@@ -181,12 +185,12 @@ func formatHaltCount(stopped, archived int) string {
 	}
 }
 
+// formatCount renders "N label" — e.g. "2 stopped". The label is a past
+// participle used adjectivally (the implicit noun is "tasks"), so it does
+// not pluralise. Earlier revisions appended "s" for n != 1 and produced
+// "2 stoppeds" / "3 archiveds"; that was a bug, not the intended shape.
 func formatCount(n int, label string) string {
-	suffix := ""
-	if n != 1 {
-		suffix = "s"
-	}
-	return strconv.Itoa(n) + " " + label + suffix
+	return strconv.Itoa(n) + " " + label
 }
 
 // Compile-time anchor for the dagview import so a refactor that drops

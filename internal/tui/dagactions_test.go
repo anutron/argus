@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/drn/argus/internal/model"
+	"github.com/drn/argus/internal/orch"
 	"github.com/drn/argus/internal/testutil"
 	"github.com/drn/argus/internal/tui/dagview"
 )
@@ -64,6 +65,28 @@ func TestDAGNodesFromTasks_FiltersOrphansAndArchived(t *testing.T) {
 				{ID: "b", Name: "b", Status: model.StatusPending, DependsOn: []string{"a"}},
 			},
 			want: want{ids: []string{"a", "b"}},
+		},
+		{
+			// A live parent satisfies hasParent on the first hit; the
+			// trailing stale id is ignored. Both nodes are kept.
+			name: "live parent + stale parent id mixed",
+			tasks: []*model.Task{
+				{ID: "live", Name: "live", Status: model.StatusPending},
+				{ID: "child", Name: "child", Status: model.StatusPending, DependsOn: []string{"live", "ghost"}},
+			},
+			want: want{ids: []string{"child", "live"}},
+		},
+		{
+			// Only an archived child points to the parent. Archived rows
+			// are stripped from `live` before the `referenced` map is
+			// built, so the parent is not referenced by anyone alive and
+			// drops out as a pure orphan.
+			name: "parent referenced only by archived child is dropped",
+			tasks: []*model.Task{
+				{ID: "parent", Name: "parent", Status: model.StatusPending},
+				{ID: "ac", Name: "ac", Status: model.StatusComplete, Archived: true, DependsOn: []string{"parent"}},
+			},
+			want: want{ids: nil},
 		},
 		{
 			name:  "empty input",
@@ -142,4 +165,40 @@ func TestDAGNodesFromTasks_PassthroughFields(t *testing.T) {
 	// projection must not leak into the widget's snapshot.
 	tasks[1].DependsOn[0] = "mutated"
 	testutil.DeepEqual(t, child.DependsOn, []string{"p"})
+}
+
+// TestSummarizeHalt covers the notice-string assembly used by the `h`
+// keybinding handler. The function is a pure projection of HaltReport, so
+// every branch is exercised by tiny in-memory inputs.
+func TestSummarizeHalt(t *testing.T) {
+	cases := []struct {
+		name string
+		in   orch.HaltReport
+		want string
+	}{
+		{"empty report", orch.HaltReport{}, "no downstream tasks"},
+		{"only stopped, singular", orch.HaltReport{Stopped: []string{"a"}}, "1 stopped"},
+		{"only stopped, plural", orch.HaltReport{Stopped: []string{"a", "b"}}, "2 stopped"},
+		{"only archived, singular", orch.HaltReport{Archived: []string{"x"}}, "1 archived"},
+		{"only archived, plural", orch.HaltReport{Archived: []string{"x", "y", "z"}}, "3 archived"},
+		{
+			"both populated",
+			orch.HaltReport{Stopped: []string{"a"}, Archived: []string{"x", "y"}},
+			"1 stopped, 2 archived",
+		},
+		{
+			// NotFound entries are tracked but intentionally excluded from
+			// the user-visible summary — they're sessions that exited
+			// between the snapshot and the stop call, and counting them
+			// would inflate the notice.
+			"NotFound is ignored in the summary",
+			orch.HaltReport{NotFound: []string{"ghost"}},
+			"no downstream tasks",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			testutil.Equal(t, summarizeHalt(tc.in), tc.want)
+		})
+	}
 }
