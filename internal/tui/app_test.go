@@ -1273,20 +1273,20 @@ func TestWorktreeSubdir(t *testing.T) {
 
 func TestPTYSizeFromHostTerm(t *testing.T) {
 	cases := []struct {
-		name              string
-		tw, th            int
-		err               error
-		wantRows, wantCol uint16
+		name               string
+		tw, th             int
+		err                error
+		wantRows, wantCols uint16
 	}{
-		{"typical wide", 320, 100, nil, 95, 190},
-		{"standard 80x24", 80, 24, nil, 19, 46},
+		{"typical wide", 320, 100, nil, 96, 190},
+		{"standard 80x24", 80, 24, nil, 20, 46},
 		// 50-col host: 50*3/5-2 = 28 ⇒ no clamp.
-		{"narrow 50x20", 50, 20, nil, 15, 28},
+		{"narrow 50x20", 50, 20, nil, 16, 28},
 		// Pathological tiny host triggers both clamps.
 		{"tiny clamps both floors", 30, 8, nil, 5, 20},
 		// Real-world reproduction of the original bug. Anything works as long
 		// as it isn't 20x8 — the PTY size that left Claude rendering narrow.
-		{"realistic iTerm2 split", 200, 60, nil, 55, 118},
+		{"realistic iTerm2 split", 200, 60, nil, 56, 118},
 		// Unusable signals: function must yield 0,0 so callers fall back.
 		{"err short-circuits", 320, 100, errFakeNoTTY, 0, 0},
 		{"zero width", 0, 100, nil, 0, 0},
@@ -1297,16 +1297,16 @@ func TestPTYSizeFromHostTerm(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			gotRows, gotCols := ptySizeFromHostTerm(tc.tw, tc.th, tc.err)
 			testutil.Equal(t, gotRows, tc.wantRows)
-			testutil.Equal(t, gotCols, tc.wantCol)
+			testutil.Equal(t, gotCols, tc.wantCols)
 		})
 	}
 }
 
 func TestPTYSizeFromPaneRect(t *testing.T) {
 	cases := []struct {
-		name              string
-		pw, ph            int
-		wantRows, wantCol uint16
+		name               string
+		pw, ph             int
+		wantRows, wantCols uint16
 	}{
 		// The bug: tview's NewBox returns 15x10 before Flex lays it out.
 		// Reading that as authoritative produced a 20x8 PTY.
@@ -1325,7 +1325,7 @@ func TestPTYSizeFromPaneRect(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			gotRows, gotCols := ptySizeFromPaneRect(tc.pw, tc.ph)
 			testutil.Equal(t, gotRows, tc.wantRows)
-			testutil.Equal(t, gotCols, tc.wantCol)
+			testutil.Equal(t, gotCols, tc.wantCols)
 		})
 	}
 }

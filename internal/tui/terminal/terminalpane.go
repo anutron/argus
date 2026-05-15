@@ -258,17 +258,33 @@ func (tp *TerminalPane) SetSession(sess agentview.TerminalAdapter) {
 	tp.emuFedTotal = 0
 	tp.scrollOffset = 0
 	tp.paintCacheValid = false
-	// Seed PTY size from panel dimensions — Draw() will refine on first render.
-	// Do NOT fall back to 80x24 when GetInnerRect returns zero (before first
-	// Draw); leave ptyCols/ptyRows at 0 so Draw() sets them to match the
-	// actual panel width. Falling back to 80 creates a mismatch with the PTY
-	// (which was started at the correct width), causing the emulator to wrap
-	// text at 80 cols even though the agent output is formatted wider.
+	// Seed PTY size from the visible inner rect — Draw() will refine on first
+	// render. GetInnerRect returns the pane's OUTER rect because TerminalPane
+	// is a bare tview.Box with no native border; DrawBorderedPanel paints a
+	// 1-cell custom border inside it, so the actual content area is 2 cells
+	// smaller in each dimension. Subtracting 2 keeps the seed aligned with
+	// what Draw() will compute, eliminating a spurious size-delta correction
+	// (and its resulting SIGWINCH-induced agent repaint) on the first frame
+	// after the agent attaches.
+	//
+	// The `w > 30 && h > 10` guard matches ptySizeFromPaneRect's threshold
+	// for rejecting tview's NewBox default rect (15x10) before Flex has laid
+	// the pane out — seeding from that default would produce a 20x8 PTY,
+	// not the actual pane dimensions. Falling back to ptyCols/ptyRows=0
+	// lets Draw set them on the first real frame.
+	//
+	// Goroutine safety: GetInnerRect reads the box's rect fields, which tview
+	// mutates via SetRect on the main goroutine. All current callers of
+	// SetSession run on the tview main goroutine (onTaskSelect via
+	// InputCapture; startSession directly on the main goroutine via
+	// InputCapture; the new-task CreateAndStart completion via
+	// QueueUpdateDraw). A future off-main caller would race with Draw; if
+	// you add one, snapshot the rect on the main goroutine first.
 	if sess != nil {
 		_, _, w, h := tp.GetInnerRect()
-		if w > 0 && h > 0 {
-			tp.ptyCols = max(w, 20)
-			tp.ptyRows = max(h, 5)
+		if w > 30 && h > 10 {
+			tp.ptyCols = max(w-2, 20)
+			tp.ptyRows = max(h-2, 5)
 		}
 	}
 	tp.mu.Unlock()
