@@ -163,24 +163,42 @@ func TestWriter_ReturnsLogFileWhenInitialized(t *testing.T) {
 // If a future refactor breaks the wiring (e.g., removes `uxlog.Writer()` or
 // changes slog.NewTextHandler's destination), this test fails before the
 // regression ships.
+//
+// Test-isolation contract: this test mutates THREE process globals —
+// `slog.Default()`, `log`'s default writer, and `os.Stderr`. All three are
+// captured up front and restored via `t.Cleanup` so subsequent tests in
+// the same binary run see the pre-test state. Without restoration, every
+// following test in the package (or any package run in the same `go test`
+// binary) would have its slog/log output redirected through this test's
+// pipe — which is closed mid-body — producing silent dropped logs and
+// confusing write-to-closed-fd errors. The unanimous BLOCKING finding
+// from /rereview iter 1 was specifically this restore gap.
 func TestSlogWithUxlogWriter_DoesNotReachStderr(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "test-ux.log")
 	if err := Init(logPath); err != nil {
 		t.Fatalf("Init failed: %v", err)
 	}
-	defer Close()
+
+	// Save process-global state we're about to mutate so subsequent tests
+	// see the pre-test defaults. `t.Cleanup` fires in LIFO order, after any
+	// `defer` in this test body — so cleanups run even on `t.Fatalf` panic.
+	origSlog := slog.Default()
+	origLog := log.Writer()
+	origStderr := os.Stderr
+	t.Cleanup(func() {
+		slog.SetDefault(origSlog)
+		log.SetOutput(origLog)
+		os.Stderr = origStderr
+		Close()
+	})
 
 	// Capture anything that hits stderr during this test.
-	origStderr := os.Stderr
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatalf("pipe: %v", err)
 	}
 	os.Stderr = w
-	defer func() {
-		os.Stderr = origStderr
-	}()
 
 	// Mirror runTUI's wiring exactly.
 	slog.SetDefault(slog.New(slog.NewTextHandler(Writer(), nil)))
@@ -203,8 +221,15 @@ func TestSlogWithUxlogWriter_DoesNotReachStderr(t *testing.T) {
 		t.Errorf("slog/log wrote to stderr after redirect: %q", string(captured))
 	}
 
-	// And verify the messages DID land in the uxlog file.
+	// Restore slog/log defaults BEFORE closing the uxlog file, so any
+	// late-firing slog calls in `t.Cleanup` (e.g., from goroutines leaked
+	// by earlier tests) write to the original destination, not the
+	// now-closed file. `t.Cleanup` restores os.Stderr and re-Closes uxlog
+	// — re-Close is safe because uxlog.Close is idempotent (nils file).
+	slog.SetDefault(origSlog)
+	log.SetOutput(origLog)
 	Close()
+
 	data, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatalf("read log: %v", err)

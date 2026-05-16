@@ -82,8 +82,9 @@ func runTUI() {
 	//   2. log.SetOutput — catches every stdlib `log.{Print*,Fatal*,Panic*}` call.
 	//   3. Once `app.Run()` starts (below), the alt-screen takes over and ANY
 	//      direct `fmt.Fprintf(os.Stderr, ...)` from inside argus is a bug.
-	//      CLAUDE.md hard rule 6 forbids it; `TestSlog_RedirectsToUxlog`
-	//      regression-tests the slog wiring.
+	//      CLAUDE.md hard rule 6 forbids it; the regression test
+	//      `TestSlogWithUxlogWriter_DoesNotReachStderr` in
+	//      `internal/uxlog/uxlog_test.go` pins the slog+log wiring.
 	//
 	// The daemon does this at line 174 of `runDaemon`. The TUI MUST mirror it.
 	// See CLAUDE.md hard rule and gotchas/ui-threading.md.
