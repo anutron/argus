@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"syscall"
 	"time"
 
 	"github.com/drn/argus/internal/agent"
@@ -92,37 +93,69 @@ func runTUI() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(uxlog.Writer(), nil)))
 	log.SetOutput(uxlog.Writer())
 
-	// Top-level panic recovery for THIS goroutine. If anything in app setup
-	// or app.Run panics, the Go runtime would otherwise spray the goroutine
-	// stack dump to fd 2 — the user's terminal — bypassing every redirect
-	// above (the runtime writes panic output directly via the runtime
-	// package, not via slog/log/os.Stderr). The dump corrupts tcell's
-	// display until process exit. This recovery captures the panic, logs
-	// the goroutine stack to uxlog, and re-panics ONLY after the alt-screen
-	// has been torn down by tview (which happens when app.Run() returns or
-	// when the tcell screen Fini's during the panic unwind).
-	//
-	// NB: this only catches panics in the main goroutine. Panics in
-	// goroutines spawned by the TUI (40+ across internal/tui/, internal/
-	// agent/, etc.) still spray to fd 2 — those are not caught here.
-	// CLAUDE.md rule 6 calls this out as a known residual; addressing
-	// it requires either a recover wrapper around every `go func()` or
-	// process-level signal handling for SIGSEGV. Out of scope for the
-	// slog-leak fix. The rule and gotchas/ui-threading.md document the gap.
+	// Top-level panic recovery for THIS goroutine. Logs the goroutine stack
+	// to uxlog before re-panicking so a panic during app setup or app.Run
+	// has its diagnostic info captured. tview's Application.Run installs its
+	// own deferred screen.Fini(), so by the time the re-panic propagates the
+	// alt-screen is restored and a brief panic message at the user's normal
+	// terminal is acceptable. (For panics in OTHER goroutines — 40+ across
+	// internal/tui, internal/agent — the OS-level fd 2 redirect just below
+	// handles them at the kernel level since the main-goroutine recover
+	// cannot reach them.)
 	defer func() {
 		if r := recover(); r != nil {
 			stack := debug.Stack()
 			uxlog.Log("[tui] PANIC in main goroutine: %v\n%s", r, stack)
-			// Re-panic so the runtime can do its normal exit-on-panic.
-			// By the time this fires, tview should have run its own
-			// deferred screen.Fini() — but to be safe under any future
-			// refactor of tview's panic handling, we accept the residual
-			// risk that the post-Fini panic message may still land on
-			// the terminal. That's correct behavior for a fatal error
-			// the user needs to see.
 			panic(r)
 		}
 	}()
+
+	// OS-level fd 2 redirect — the belt-and-braces guard for everything the
+	// slog/log defaults + main-goroutine recover above don't catch:
+	//
+	//   - Goroutine panic stack dumps. When ANY goroutine in the process
+	//     panics without recover, Go's runtime writes the stack trace
+	//     directly to fd 2 via the runtime package, bypassing slog, log,
+	//     os.Stderr's Go value, and the main goroutine's defer recover.
+	//     With this Dup2, those writes land in the uxlog file instead of
+	//     corrupting tcell's display.
+	//   - Subprocess fd 2 inheritance. Although Go's exec defaults nil
+	//     Stderr to /dev/null, any future code that explicitly passes
+	//     os.Stderr or that uses raw syscall.StartProcess inherits this
+	//     redirected fd 2 — failing safely toward the log file.
+	//   - Third-party libraries that write directly to fd 2.
+	//
+	// The original fd 2 is dup'd and restored when this function returns,
+	// so the post-app.Run error reporting (`fmt.Fprintf(os.Stderr, "error:
+	// %v\n", err)` after `app.Run()` returns) still reaches the user's
+	// terminal. fd 1 is intentionally NOT redirected because
+	// `computePTYSize` calls `term.GetSize(int(os.Stdout.Fd()))` and needs
+	// fd 1 to remain a TTY for the ioctl to succeed.
+	//
+	// tcell uses /dev/tty directly (opened via term/tty_unix.go in the
+	// tcell package), independent of fds 0/1/2 — so this redirect cannot
+	// disrupt tcell's input/output path.
+	if f, ok := uxlog.Writer().(*os.File); ok {
+		// fd values from *os.File.Fd() are guaranteed-small positive ints —
+		// the uintptr → int conversion can never overflow. Silence gosec G115.
+		stderrFd := int(os.Stderr.Fd()) //nolint:gosec // see comment
+		uxlogFd := int(f.Fd())          //nolint:gosec // see comment
+		origStderrFd, err := syscall.Dup(stderrFd)
+		if err == nil {
+			if dup2Err := syscall.Dup2(uxlogFd, stderrFd); dup2Err == nil {
+				defer func() {
+					_ = syscall.Dup2(origStderrFd, stderrFd)
+					_ = syscall.Close(origStderrFd)
+				}()
+				uxlog.Log("[tui] fd 2 redirected to uxlog (catches goroutine panics, subprocess fd 2 inherit, third-party stderr)")
+			} else {
+				_ = syscall.Close(origStderrFd)
+				uxlog.Log("[tui] fd 2 Dup2 failed: %v — goroutine panic stack dumps may still corrupt terminal", dup2Err)
+			}
+		} else {
+			uxlog.Log("[tui] fd 2 Dup (save original) failed: %v — skipped fd 2 redirect", err)
+		}
+	}
 
 	database, err := db.Open(db.DefaultPath())
 	if err != nil {

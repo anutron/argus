@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -243,5 +244,77 @@ func TestSlogWithUxlogWriter_DoesNotReachStderr(t *testing.T) {
 		if !strings.Contains(content, want) {
 			t.Errorf("expected %q in uxlog, got: %s", want, content)
 		}
+	}
+}
+
+// TestFd2RedirectViaDup2_CatchesRawSyscallWrites is the regression guard for
+// the OS-level fd 2 redirect that runTUI installs as belt-and-braces for
+// everything slog/log redirects can't catch — runtime panic stack dumps,
+// subprocess fd 2 inheritance, third-party library writes to fd 2. The
+// slog/log redirects only change the Go-level Writer that the standard
+// loggers use; they do NOT change the OS-level meaning of file descriptor 2.
+// Code that writes directly to fd 2 (e.g., via syscall.Write or via the Go
+// runtime's internal panic-printing path) bypasses every Writer-based
+// redirect.
+//
+// This test simulates a raw fd 2 write (the same syscall path the Go runtime
+// uses for panic stack dumps) and verifies that with the Dup2 in place,
+// those bytes land in the uxlog file instead of leaking to the terminal.
+//
+// Test-isolation: like the slog test above, this mutates the global fd 2
+// and restores it via t.Cleanup. No t.Parallel so cross-test races are
+// bounded to sequential package-test execution.
+func TestFd2RedirectViaDup2_CatchesRawSyscallWrites(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "test-ux.log")
+	if err := Init(logPath); err != nil {
+		t.Fatalf("Init failed: %v", err)
+	}
+
+	// Mirror runTUI's Dup2 + deferred restore wiring.
+	f, ok := Writer().(*os.File)
+	if !ok {
+		t.Fatalf("Writer() returned %T, expected *os.File", Writer())
+	}
+	// fd values from *os.File.Fd() are guaranteed-small positive ints — the
+	// uintptr → int conversion can never overflow. Silence gosec G115.
+	stderrFd := int(os.Stderr.Fd()) //nolint:gosec // see comment
+	uxlogFd := int(f.Fd())          //nolint:gosec // see comment
+
+	origStderrFd, err := syscall.Dup(stderrFd)
+	if err != nil {
+		t.Fatalf("Dup(stderr): %v", err)
+	}
+	if err := syscall.Dup2(uxlogFd, stderrFd); err != nil {
+		_ = syscall.Close(origStderrFd)
+		t.Fatalf("Dup2(uxlog → stderr): %v", err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Dup2(origStderrFd, stderrFd)
+		_ = syscall.Close(origStderrFd)
+		Close()
+	})
+
+	// Simulate the runtime's panic-printing path: write directly to fd 2
+	// via the raw syscall. If the Dup2 took effect, these bytes go to the
+	// uxlog file. If the redirect didn't work, they'd appear on the test's
+	// stderr (which Go's test runner inherits — so you'd see them in the
+	// `go test` output as garbage).
+	sentinel := []byte("FD2_RAW_WRITE_SENTINEL_via_syscall_Write\n")
+	if _, werr := syscall.Write(stderrFd, sentinel); werr != nil {
+		t.Fatalf("syscall.Write(fd 2): %v", werr)
+	}
+
+	// Force a flush by closing and re-reading. We close uxlog (idempotent;
+	// Cleanup re-closes) so the buffer is committed to disk before read.
+	Close()
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if !bytes.Contains(data, sentinel) {
+		t.Errorf("fd 2 Dup2 did not redirect raw syscall write to uxlog; "+
+			"sentinel missing. logfile=%s contents=%q", logPath, string(data))
 	}
 }
