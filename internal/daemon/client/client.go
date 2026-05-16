@@ -7,15 +7,13 @@ import (
 	"net/rpc"
 	"net/rpc/jsonrpc"
 	"os"
-	"os/exec"
-	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/drn/argus/internal/agent"
 	"github.com/drn/argus/internal/config"
 	"github.com/drn/argus/internal/daemon"
-	"github.com/drn/argus/internal/db"
 	"github.com/drn/argus/internal/model"
 	"github.com/drn/argus/internal/uxlog"
 )
@@ -27,6 +25,23 @@ const rpcTimeout = 2 * time.Second
 
 // ErrRPCTimeout is returned when an RPC call exceeds rpcTimeout.
 var ErrRPCTimeout = errors.New("daemon RPC call timed out")
+
+// ErrTestBinary is returned by AutoStart when invoked from a Go test binary.
+// AutoStart fork/execs os.Executable() with "daemon start" — under `go test`
+// that re-runs the entire test package as an orphaned child process, which
+// is both a fork bomb (each child re-hits the same test path) and trashes
+// the user's real ~/.argus/argusd symlink. The backstop is intentionally at
+// the AutoStart layer so any caller that accidentally reaches it from a test
+// is refused, not just the one we know about.
+var ErrTestBinary = errors.New("AutoStart refused: running under a Go test binary")
+
+// isTestBinary mirrors agent.isTestBinary (unexported there). Go's test
+// framework compiles binaries with a .test suffix or under a _test/ path.
+// Keep in sync with internal/agent/cleanup.go and internal/api/selfupdate.go.
+func isTestBinary() bool {
+	return strings.HasSuffix(os.Args[0], ".test") ||
+		strings.Contains(os.Args[0], "/_test/")
+}
 
 // Compile-time assertion.
 var _ agent.SessionProvider = (*Client)(nil)
@@ -374,48 +389,16 @@ func (c *Client) getOrCreateSession(taskID string) *RemoteSession {
 
 // AutoStart launches the daemon as a background process and waits for it to
 // be ready. Returns a connected client or an error.
+//
+// The body is delegated to autoStartFork (in autostart_fork.go) so the
+// test-binary backstop is the only branch exercised under `go test`.
+// autoStartFork is excluded from the coverage gate because exercising it
+// would re-create the exact fork bomb ErrTestBinary exists to prevent.
 func AutoStart(sockPath string) (*Client, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return nil, fmt.Errorf("resolve executable: %w", err)
+	if isTestBinary() {
+		return nil, ErrTestBinary
 	}
-
-	// Create a symlink named "argusd" so Activity Monitor shows that name
-	// instead of the generic binary name.
-	daemonExe := filepath.Join(db.DataDir(), "argusd")
-	target, _ := os.Readlink(daemonExe)
-	if target != exe {
-		os.Remove(daemonExe) //nolint:errcheck
-		if err := os.Symlink(exe, daemonExe); err != nil {
-			daemonExe = exe // fall back to original binary
-		}
-	}
-
-	cmd := exec.Command(daemonExe, "daemon", "start")
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	// Detach from parent process group so the daemon survives TUI exit.
-	cmd.SysProcAttr = daemonSysProcAttr()
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start daemon: %w", err)
-	}
-	// Release the child process so it isn't reaped when we exit.
-	cmd.Process.Release()
-
-	// Poll for the socket to become available.
-	const (
-		pollInterval = 50 * time.Millisecond
-		maxWait      = 3 * time.Second
-	)
-	deadline := time.Now().Add(maxWait)
-	for time.Now().Before(deadline) {
-		time.Sleep(pollInterval)
-		if client, err := Connect(sockPath); err == nil {
-			return client, nil
-		}
-	}
-
-	return nil, fmt.Errorf("daemon did not become ready within %s", maxWait)
+	return autoStartFork(sockPath)
 }
 
 // WaitForShutdown polls until the daemon socket is gone (up to timeout).

@@ -2,10 +2,10 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -98,23 +98,32 @@ func (s *Server) handleUpdateSelf(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
+// errSpawnFromTestBinary is returned when spawnSuccessorDaemon is invoked
+// from a *.test binary. The fork target would be the test binary itself,
+// and Go's test framework treats "daemon start" as positional args and
+// re-runs every test in the package — a fork bomb.
+var errSpawnFromTestBinary = errors.New("spawnSuccessorDaemon refused: running under a Go test binary")
+
+// isTestBinary mirrors the same check in internal/daemon/client. Go's test
+// framework compiles binaries with a .test suffix or under a _test/ path.
+// Keep in sync with internal/agent/cleanup.go and internal/daemon/client/client.go.
+func isTestBinary() bool {
+	return strings.HasSuffix(os.Args[0], ".test") ||
+		strings.Contains(os.Args[0], "/_test/")
+}
+
 // spawnSuccessorDaemon starts a fresh `argus daemon` process detached from
 // this one. The new daemon's startup kills the existing daemon via the PID
 // file and rebinds the Unix socket.
+//
+// The body is delegated to spawnSuccessorDaemonFork (in spawn_fork.go) so
+// the test-binary backstop is the only branch exercised under `go test`.
+// spawnSuccessorDaemonFork is excluded from the coverage gate because
+// exercising it would re-create the exact fork bomb errSpawnFromTestBinary
+// exists to prevent.
 func spawnSuccessorDaemon() error {
-	exe, err := os.Executable()
-	if err != nil {
-		return err
+	if isTestBinary() {
+		return errSpawnFromTestBinary
 	}
-	// exe comes from os.Executable() — i.e. the path the daemon itself was
-	// started with, not user-supplied input.
-	cmd := exec.Command(exe, "daemon", "start") //nolint:gosec // exe is os.Executable()
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	cmd.SysProcAttr = daemonSysProcAttr()
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	// Detach the child so we don't wait/reap it.
-	return cmd.Process.Release()
+	return spawnSuccessorDaemonFork()
 }
