@@ -179,6 +179,18 @@ type App struct {
 	clipboardPending     string
 	clipboardPendingTask string // task ID the cached payload belongs to
 
+	// OS clipboard writer. `New()` always populates it with `pbcopyWriter`,
+	// which shells out to the real `pbcopy` and clobbers the developer's
+	// clipboard. Any test whose code path can reach `copyToClipboard` (via
+	// `OnCopyPrompt`, ctrl+y → `copyStagedClipboard`, or a direct call) MUST
+	// overwrite this field with a no-op (`func(string) error { return nil }`)
+	// immediately after `New()` — otherwise the test writes its sample text to
+	// the host's real clipboard. There is no nil-fallback or in-test auto-stub;
+	// if you bypass `New()` via a zero-value struct literal, calling the field
+	// will nil-panic inside `copyToClipboard`'s goroutine — the panic location
+	// in the stack trace points back here.
+	clipboardWriter func(text string) error
+
 	// Screen wrapper. lazyScreen is a passthrough today (see its doc for
 	// history); the named type is retained so smoke tests can inject a
 	// SimulationScreen through the same indirection production uses.
@@ -218,6 +230,7 @@ func New(database *db.DB, runner agent.SessionProvider, daemonConnected bool) *A
 		viewedWhileAgent:       make(map[string]bool),
 		pendingRerenderRestart: make(map[string]bool),
 		wtRoot:                 filepath.Join(db.DataDir(), "worktrees"),
+		clipboardWriter:        pbcopyWriter,
 	}
 	if dc, ok := runner.(*dclient.Client); ok {
 		app.daemonClient = dc
