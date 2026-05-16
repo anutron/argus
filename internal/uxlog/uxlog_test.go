@@ -218,7 +218,7 @@ func TestSlogWithUxlogWriter_DoesNotReachStderr(t *testing.T) {
 	if rerr != nil {
 		t.Fatalf("read captured stderr: %v", rerr)
 	}
-	if !bytes.Equal(captured, []byte{}) {
+	if len(captured) != 0 {
 		t.Errorf("slog/log wrote to stderr after redirect: %q", string(captured))
 	}
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"sync"
 	"syscall"
 	"time"
 
@@ -110,53 +111,6 @@ func runTUI() {
 		}
 	}()
 
-	// OS-level fd 2 redirect — the belt-and-braces guard for everything the
-	// slog/log defaults + main-goroutine recover above don't catch:
-	//
-	//   - Goroutine panic stack dumps. When ANY goroutine in the process
-	//     panics without recover, Go's runtime writes the stack trace
-	//     directly to fd 2 via the runtime package, bypassing slog, log,
-	//     os.Stderr's Go value, and the main goroutine's defer recover.
-	//     With this Dup2, those writes land in the uxlog file instead of
-	//     corrupting tcell's display.
-	//   - Subprocess fd 2 inheritance. Although Go's exec defaults nil
-	//     Stderr to /dev/null, any future code that explicitly passes
-	//     os.Stderr or that uses raw syscall.StartProcess inherits this
-	//     redirected fd 2 — failing safely toward the log file.
-	//   - Third-party libraries that write directly to fd 2.
-	//
-	// The original fd 2 is dup'd and restored when this function returns,
-	// so the post-app.Run error reporting (`fmt.Fprintf(os.Stderr, "error:
-	// %v\n", err)` after `app.Run()` returns) still reaches the user's
-	// terminal. fd 1 is intentionally NOT redirected because
-	// `computePTYSize` calls `term.GetSize(int(os.Stdout.Fd()))` and needs
-	// fd 1 to remain a TTY for the ioctl to succeed.
-	//
-	// tcell uses /dev/tty directly (opened via term/tty_unix.go in the
-	// tcell package), independent of fds 0/1/2 — so this redirect cannot
-	// disrupt tcell's input/output path.
-	if f, ok := uxlog.Writer().(*os.File); ok {
-		// fd values from *os.File.Fd() are guaranteed-small positive ints —
-		// the uintptr → int conversion can never overflow. Silence gosec G115.
-		stderrFd := int(os.Stderr.Fd()) //nolint:gosec // see comment
-		uxlogFd := int(f.Fd())          //nolint:gosec // see comment
-		origStderrFd, err := syscall.Dup(stderrFd)
-		if err == nil {
-			if dup2Err := syscall.Dup2(uxlogFd, stderrFd); dup2Err == nil {
-				defer func() {
-					_ = syscall.Dup2(origStderrFd, stderrFd)
-					_ = syscall.Close(origStderrFd)
-				}()
-				uxlog.Log("[tui] fd 2 redirected to uxlog (catches goroutine panics, subprocess fd 2 inherit, third-party stderr)")
-			} else {
-				_ = syscall.Close(origStderrFd)
-				uxlog.Log("[tui] fd 2 Dup2 failed: %v — goroutine panic stack dumps may still corrupt terminal", dup2Err)
-			}
-		} else {
-			uxlog.Log("[tui] fd 2 Dup (save original) failed: %v — skipped fd 2 redirect", err)
-		}
-	}
-
 	database, err := db.Open(db.DefaultPath())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error opening database: %v\n", err)
@@ -222,8 +176,75 @@ func runTUI() {
 	app.SetDaemonStale(daemonStale)
 	appRef = app
 	appRef2 = app
-	if err := app.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+
+	// OS-level fd 2 redirect — installed RIGHT BEFORE app.Run() because
+	// tcell only takes over the terminal once Run starts, so direct fd 2
+	// writes don't corrupt anything until that moment. Setup-time errors
+	// above (db.Open, daemon connect) wrote to the user's terminal as
+	// intended via fmt.Fprintf(os.Stderr, ...). From here forward, ANY
+	// direct fd 2 write would corrupt tcell's display, so we redirect.
+	//
+	// This catches what the slog/log Writer redirects can't:
+	//   - Goroutine panic stack dumps (the Go runtime emits panic output
+	//     directly to fd 2 via the runtime package, bypassing every
+	//     Writer-based redirect and the main-goroutine defer recover).
+	//   - Subprocess fd 2 inheritance — Go's exec defaults nil Stderr to
+	//     /dev/null, but any future code that explicitly passes os.Stderr
+	//     inherits this redirected fd 2 and fails safely toward uxlog.
+	//   - Third-party libraries that write directly to fd 2.
+	//
+	// The original fd 2 is dup'd and restored EXPLICITLY right after
+	// app.Run() returns (sync.Once guards against double-restore from the
+	// deferred call). Without explicit restore before the post-Run error
+	// branch below, `fmt.Fprintf(os.Stderr, "error: %v", err) + os.Exit(1)`
+	// would silently swallow the error message into uxlog — os.Exit does
+	// not run deferred functions.
+	//
+	// fd 1 is intentionally NOT redirected because computePTYSize calls
+	// term.GetSize(int(os.Stdout.Fd())) and needs fd 1 to remain a TTY.
+	// tcell uses /dev/tty directly so its I/O path is independent of fds.
+	var restoreFd2 func()
+	if f, ok := uxlog.Writer().(*os.File); ok {
+		// fd values from *os.File.Fd() are guaranteed-small positive ints —
+		// the uintptr → int conversion can never overflow. Silence gosec G115.
+		stderrFd := int(os.Stderr.Fd()) //nolint:gosec // see comment
+		uxlogFd := int(f.Fd())          //nolint:gosec // see comment
+		origStderrFd, dupErr := syscall.Dup(stderrFd)
+		if dupErr == nil {
+			if d2Err := syscall.Dup2(uxlogFd, stderrFd); d2Err == nil {
+				var once sync.Once
+				restoreFd2 = func() {
+					once.Do(func() {
+						_ = syscall.Dup2(origStderrFd, stderrFd)
+						_ = syscall.Close(origStderrFd)
+					})
+				}
+				// Deferred restore covers panic paths (defers run during
+				// panic unwind; os.Exit does not). Explicit restore below
+				// (after app.Run returns) covers the normal-return error
+				// path — sync.Once makes the second call a no-op.
+				defer restoreFd2()
+				uxlog.Log("[tui] fd 2 redirected to uxlog (catches goroutine panics, subprocess fd 2 inherit, third-party stderr)")
+			} else {
+				_ = syscall.Close(origStderrFd)
+				uxlog.Log("[tui] fd 2 Dup2 failed: %v — goroutine panic stack dumps may still corrupt terminal", d2Err)
+			}
+		} else {
+			uxlog.Log("[tui] fd 2 Dup (save original) failed: %v — skipped fd 2 redirect", dupErr)
+		}
+	}
+	if restoreFd2 == nil {
+		restoreFd2 = func() {}
+	}
+
+	runErr := app.Run()
+	// EXPLICIT restore — must run before any fmt.Fprintf(os.Stderr, ...)
+	// because os.Exit (below) does not run deferred functions and would
+	// otherwise leave the error message in uxlog instead of the user's
+	// terminal.
+	restoreFd2()
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", runErr)
 		os.Exit(1)
 	}
 	// If a daemon restart occurred, close the new client.
