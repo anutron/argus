@@ -8,6 +8,7 @@ import (
 	"net/rpc/jsonrpc"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"time"
 
 	"github.com/drn/argus/internal/agent"
@@ -90,6 +91,38 @@ func runTUI() {
 	// See CLAUDE.md hard rule and gotchas/ui-threading.md.
 	slog.SetDefault(slog.New(slog.NewTextHandler(uxlog.Writer(), nil)))
 	log.SetOutput(uxlog.Writer())
+
+	// Top-level panic recovery for THIS goroutine. If anything in app setup
+	// or app.Run panics, the Go runtime would otherwise spray the goroutine
+	// stack dump to fd 2 — the user's terminal — bypassing every redirect
+	// above (the runtime writes panic output directly via the runtime
+	// package, not via slog/log/os.Stderr). The dump corrupts tcell's
+	// display until process exit. This recovery captures the panic, logs
+	// the goroutine stack to uxlog, and re-panics ONLY after the alt-screen
+	// has been torn down by tview (which happens when app.Run() returns or
+	// when the tcell screen Fini's during the panic unwind).
+	//
+	// NB: this only catches panics in the main goroutine. Panics in
+	// goroutines spawned by the TUI (40+ across internal/tui/, internal/
+	// agent/, etc.) still spray to fd 2 — those are not caught here.
+	// CLAUDE.md rule 6 calls this out as a known residual; addressing
+	// it requires either a recover wrapper around every `go func()` or
+	// process-level signal handling for SIGSEGV. Out of scope for the
+	// slog-leak fix. The rule and gotchas/ui-threading.md document the gap.
+	defer func() {
+		if r := recover(); r != nil {
+			stack := debug.Stack()
+			uxlog.Log("[tui] PANIC in main goroutine: %v\n%s", r, stack)
+			// Re-panic so the runtime can do its normal exit-on-panic.
+			// By the time this fires, tview should have run its own
+			// deferred screen.Fini() — but to be safe under any future
+			// refactor of tview's panic handling, we accept the residual
+			// risk that the post-Fini panic message may still land on
+			// the terminal. That's correct behavior for a fatal error
+			// the user needs to see.
+			panic(r)
+		}
+	}()
 
 	database, err := db.Open(db.DefaultPath())
 	if err != nil {
