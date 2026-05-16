@@ -62,6 +62,34 @@ func runTUI() {
 	defer uxlog.Close()
 	uxlog.Log("=== argus TUI starting ===")
 
+	// Redirect EVERY default logger that could write to the user's terminal
+	// at the program level, NOT by editing the 30+ slog/log call sites that
+	// run in the TUI process.
+	//
+	// WITHOUT these redirects, `slog.*` and stdlib `log.*` calls from anywhere
+	// in the TUI process (autorename, agent.Runner, push notifications,
+	// orchestration, scheduler, kb indexer, mcp server, etc.) write to
+	// `os.Stderr`, which IS the user's terminal. tcell does NOT route through
+	// os.Stderr, so those writes land at the cursor's current position,
+	// corrupt the displayed cell state out from under tcell's diff tracker,
+	// and survive on screen until the next `screen.Sync()` (Ctrl+L) repaints.
+	// Symptoms include torn cells, scattered log fragments, mis-positioned
+	// content, and stacked status bars — historically misdiagnosed as
+	// tcell/tmux drift.
+	//
+	// Belt-and-braces approach:
+	//   1. slog.SetDefault — catches every `slog.{Info,Error,Warn,Debug,...}` call.
+	//   2. log.SetOutput — catches every stdlib `log.{Print*,Fatal*,Panic*}` call.
+	//   3. Once `app.Run()` starts (below), the alt-screen takes over and ANY
+	//      direct `fmt.Fprintf(os.Stderr, ...)` from inside argus is a bug.
+	//      CLAUDE.md hard rule 6 forbids it; `TestSlog_RedirectsToUxlog`
+	//      regression-tests the slog wiring.
+	//
+	// The daemon does this at line 174 of `runDaemon`. The TUI MUST mirror it.
+	// See CLAUDE.md hard rule and gotchas/ui-threading.md.
+	slog.SetDefault(slog.New(slog.NewTextHandler(uxlog.Writer(), nil)))
+	log.SetOutput(uxlog.Writer())
+
 	database, err := db.Open(db.DefaultPath())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error opening database: %v\n", err)

@@ -6,6 +6,7 @@ package uxlog
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -58,4 +59,29 @@ func Log(format string, args ...any) {
 // Path returns the default UX log path for the given data directory.
 func Path(dataDir string) string {
 	return dataDir + "/ux.log"
+}
+
+// Writer returns an io.Writer for the underlying log file, or io.Discard if
+// Init has not been called.
+//
+// **Critical use case:** the TUI process must redirect `slog`'s default handler
+// to this writer at startup, otherwise every `slog.Info`/`slog.Error` call
+// anywhere in argus's TUI-process code paths (autorename, runner, push,
+// orchestration, scheduler, etc.) writes to os.Stderr — which is the live
+// terminal. tcell does NOT route through os.Stderr, so those writes land at
+// the terminal's current cursor position, leaving stale cells until tcell's
+// next emit happens to overwrite them. Visible as torn cells, log fragments
+// scattered across the screen, mis-positioned content, etc. — and these
+// artifacts are only cleared by `screen.Sync()` (Ctrl+L).
+//
+// The daemon does this redirect at `cmd/argus/main.go:runDaemon`; the TUI
+// must mirror it via `runTUI`. See CLAUDE.md hard rule "no direct stderr
+// writes from TUI-process code".
+func Writer() io.Writer {
+	mu.Lock()
+	defer mu.Unlock()
+	if file == nil {
+		return io.Discard
+	}
+	return file
 }
