@@ -32,6 +32,23 @@ func TestBuildSettingsUpdates(t *testing.T) {
 		testutil.Equal(t, got["sandbox.extra_write"], "")
 	})
 
+	t.Run("sandbox allow_apple_events validates and joins", func(t *testing.T) {
+		allow := []string{"com.apple.iChat", " com.apple.finder ", "bad)(rule", ""}
+		got := buildSettingsUpdates(updateSettingsReq{
+			Sandbox: &sandboxUpdate{AllowAppleEvents: &allow},
+		})
+		// Invalid entries dropped; whitespace trimmed; valid entries joined.
+		testutil.Equal(t, got["sandbox.allow_apple_events"], "com.apple.iChat,com.apple.finder")
+	})
+
+	t.Run("sandbox allow_apple_events empty clears", func(t *testing.T) {
+		empty := []string{}
+		got := buildSettingsUpdates(updateSettingsReq{
+			Sandbox: &sandboxUpdate{AllowAppleEvents: &empty},
+		})
+		testutil.Equal(t, got["sandbox.allow_apple_events"], "")
+	})
+
 	t.Run("defaults flow through", func(t *testing.T) {
 		backend := "claude"
 		got := buildSettingsUpdates(updateSettingsReq{
@@ -47,6 +64,7 @@ func TestHandleSettings_GetReturnsCurrentValues(t *testing.T) {
 
 	testutil.NoError(t, d.SetConfigValue("sandbox.enabled", "true"))
 	testutil.NoError(t, d.SetConfigValue("sandbox.deny_read", "/secrets,~/.aws"))
+	testutil.NoError(t, d.SetConfigValue("sandbox.allow_apple_events", "com.apple.iChat"))
 	testutil.NoError(t, d.SetConfigValue("kb.enabled", "true"))
 
 	w := httptest.NewRecorder()
@@ -57,6 +75,7 @@ func TestHandleSettings_GetReturnsCurrentValues(t *testing.T) {
 	testutil.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	testutil.Equal(t, resp.Sandbox.Enabled, true)
 	testutil.DeepEqual(t, resp.Sandbox.DenyRead, []string{"/secrets", "~/.aws"})
+	testutil.DeepEqual(t, resp.Sandbox.AllowAppleEvents, []string{"com.apple.iChat"})
 	testutil.Equal(t, resp.KB.Enabled, true)
 }
 
@@ -163,7 +182,12 @@ func TestHandleProjects_RoundTripsSandboxOverride(t *testing.T) {
 	  "name": "alpha",
 	  "path": "/tmp/alpha",
 	  "branch": "main",
-	  "sandbox": {"enabled": false, "deny_read": ["/secrets"], "extra_write": ["~/.npm"]}
+	  "sandbox": {
+	    "enabled": false,
+	    "deny_read": ["/secrets"],
+	    "extra_write": ["~/.npm"],
+	    "allow_apple_events": ["com.apple.iChat", "bad)injection"]
+	  }
 	}`
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, authedReq("POST", "/api/projects", body))
@@ -190,6 +214,9 @@ func TestHandleProjects_RoundTripsSandboxOverride(t *testing.T) {
 	}
 	testutil.DeepEqual(t, p.Sandbox.DenyRead, []string{"/secrets"})
 	testutil.DeepEqual(t, p.Sandbox.ExtraWrite, []string{"~/.npm"})
+	// Invalid bundle ID dropped at the API boundary so the persisted CSV
+	// doesn't lie about what's active in the generated SBPL profile.
+	testutil.DeepEqual(t, p.Sandbox.AllowAppleEvents, []string{"com.apple.iChat"})
 
 	// And the DB stored it via the existing config.Project shape.
 	projects, err := d.Projects()
@@ -200,6 +227,56 @@ func TestHandleProjects_RoundTripsSandboxOverride(t *testing.T) {
 		t.Fatalf("expected stored Sandbox.Enabled false, got %#v", stored.Sandbox.Enabled)
 	}
 	testutil.DeepEqual(t, stored.Sandbox.DenyRead, []string{"/secrets"})
+	testutil.DeepEqual(t, stored.Sandbox.AllowAppleEvents, []string{"com.apple.iChat"})
+}
+
+// TestHandleProjectsFull_AuthSymmetry pins the read/write auth split for the
+// projects CRUD group: master-only mutations (POST/PUT/DELETE), device-token
+// readable list (GET /api/projects/full). Matches the symmetry of
+// GET/PUT /api/settings — read is broad, write is master. Catches a future
+// regression that accidentally tightens or loosens either side.
+func TestHandleProjectsFull_AuthSymmetry(t *testing.T) {
+	srv, d := testServer(t)
+	handler := authMiddleware(srv.token, d, nil, srv.routes())
+	plain, _, err := MintToken(d, "phone")
+	testutil.NoError(t, err)
+
+	// Seed one project so the GET response is non-trivial.
+	v := true
+	testutil.NoError(t, d.SetProject("alpha", config.Project{
+		Path: "/tmp/alpha",
+		Sandbox: config.ProjectSandboxConfig{
+			Enabled:          &v,
+			AllowAppleEvents: []string{"com.apple.iChat"},
+		},
+	}))
+
+	t.Run("device token can read", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/api/projects/full", nil)
+		req.Header.Set("Authorization", "Bearer "+plain)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusOK)
+		testutil.Contains(t, w.Body.String(), "com.apple.iChat")
+	})
+
+	t.Run("device token cannot create", func(t *testing.T) {
+		req := httptest.NewRequest("POST", "/api/projects",
+			strings.NewReader(`{"name":"beta","path":"/tmp/beta"}`))
+		req.Header.Set("Authorization", "Bearer "+plain)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusForbidden)
+	})
+
+	t.Run("device token cannot delete", func(t *testing.T) {
+		req := httptest.NewRequest("DELETE", "/api/projects/alpha", nil)
+		req.Header.Set("Authorization", "Bearer "+plain)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusForbidden)
+	})
 }
 
 func TestProjectFromJSON_NilSandboxStaysInherit(t *testing.T) {

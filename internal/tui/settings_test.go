@@ -792,9 +792,10 @@ func TestSettingsView_ProjectDetail_SandboxRoundTrip(t *testing.T) {
 	database.SetProject("proj", config.Project{
 		Path: "/tmp/proj",
 		Sandbox: config.ProjectSandboxConfig{
-			Enabled:    &v,
-			DenyRead:   []string{"/secret"},
-			ExtraWrite: []string{"/tmp/build"},
+			Enabled:          &v,
+			DenyRead:         []string{"/secret"},
+			ExtraWrite:       []string{"/tmp/build"},
+			AllowAppleEvents: []string{"com.apple.iChat"},
 		},
 	})
 	sv := NewSettingsView(database)
@@ -803,6 +804,113 @@ func TestSettingsView_ProjectDetail_SandboxRoundTrip(t *testing.T) {
 	pe := findProjectEntry(t, sv, "proj")
 	testutil.DeepEqual(t, pe.Project.Sandbox.DenyRead, []string{"/secret"})
 	testutil.DeepEqual(t, pe.Project.Sandbox.ExtraWrite, []string{"/tmp/build"})
+	testutil.DeepEqual(t, pe.Project.Sandbox.AllowAppleEvents, []string{"com.apple.iChat"})
+}
+
+func TestSettingsView_GlobalSandboxAllowAppleEvents(t *testing.T) {
+	database, _ := db.OpenInMemory()
+	// SettingsView reads cfg.Sandbox via db.Config(); push the value through
+	// the config key map so Refresh picks it up.
+	testutil.NoError(t, database.SetConfigValue("sandbox.allow_apple_events", "com.apple.iChat,com.apple.finder"))
+	sv := NewSettingsView(database)
+	sv.Refresh()
+	testutil.DeepEqual(t, sv.sandboxAllowAppleEvents, []string{"com.apple.iChat", "com.apple.finder"})
+}
+
+// readSettingsScreen renders the simulation screen to a single string for
+// substring assertions. The full contents are joined with newlines so tests
+// can match label lines without depending on exact pane height.
+func readSettingsScreen(t *testing.T, sv *SettingsView, w, h int) string {
+	t.Helper()
+	screen := tcell.NewSimulationScreen("")
+	testutil.NoError(t, screen.Init())
+	screen.SetSize(w, h)
+	sv.SetRect(0, 0, w, h)
+	sv.Draw(screen)
+	lines := make([]string, 0, h)
+	for row := range h {
+		var b strings.Builder
+		for col := range w {
+			s, _, _ := screen.Get(col, row)
+			b.WriteString(s)
+		}
+		lines = append(lines, b.String())
+	}
+	return strings.Join(lines, "\n")
+}
+
+// TestSettingsView_SandboxDetail_RendersAllowAppleEvents pins the Draw-path
+// rendering of the global sandbox AllowAppleEvents list, including the
+// section header and bullet-id rows. Without this, the conditional
+// `if len(sv.sandboxAllowAppleEvents) > 0` branch in renderSandboxDetail
+// would be untested at the screen-content level.
+func TestSettingsView_SandboxDetail_RendersAllowAppleEvents(t *testing.T) {
+	database, _ := db.OpenInMemory()
+	testutil.NoError(t, database.SetConfigValue("sandbox.allow_apple_events", "com.apple.iChat,com.apple.finder"))
+	sv := NewSettingsView(database)
+	sv.Refresh()
+	sv.setCategory(catSandbox)
+
+	out := readSettingsScreen(t, sv, 120, 40)
+	testutil.Contains(t, out, "Allow AppleEvents:")
+	testutil.Contains(t, out, "com.apple.iChat")
+	testutil.Contains(t, out, "com.apple.finder")
+}
+
+// TestSettingsView_SandboxDetail_RendersAllThreeListsTogether pins the
+// three-way spacing interaction in renderSandboxDetail when DenyRead,
+// ExtraWrite, AND AllowAppleEvents are all non-empty. DenyRead's trailing
+// row++ provides one separator; ExtraWrite intentionally omits its trailing
+// row++; AllowAppleEvents's conditional separator adds the second. The
+// combined case is the one the spacing comment's logic applies to —
+// individual-list tests don't exercise it.
+func TestSettingsView_SandboxDetail_RendersAllThreeListsTogether(t *testing.T) {
+	database, _ := db.OpenInMemory()
+	testutil.NoError(t, database.SetConfigValue("sandbox.deny_read", "/secrets"))
+	testutil.NoError(t, database.SetConfigValue("sandbox.extra_write", "/tmp/build"))
+	testutil.NoError(t, database.SetConfigValue("sandbox.allow_apple_events", "com.apple.iChat"))
+	sv := NewSettingsView(database)
+	sv.Refresh()
+	sv.setCategory(catSandbox)
+
+	out := readSettingsScreen(t, sv, 120, 40)
+	// All three section headers must render.
+	testutil.Contains(t, out, "Deny Read:")
+	testutil.Contains(t, out, "Extra Write:")
+	testutil.Contains(t, out, "Allow AppleEvents:")
+	// And each section's value.
+	testutil.Contains(t, out, "/secrets")
+	testutil.Contains(t, out, "/tmp/build")
+	testutil.Contains(t, out, "com.apple.iChat")
+}
+
+// TestSettingsView_ProjectDetail_RendersAllowAppleEvents pins the Draw-path
+// rendering of the per-project AllowAppleEvents list in the project detail
+// pane. Same coverage rationale as the global sandbox detail test.
+func TestSettingsView_ProjectDetail_RendersAllowAppleEvents(t *testing.T) {
+	database, _ := db.OpenInMemory()
+	v := true
+	testutil.NoError(t, database.SetProject("proj", config.Project{
+		Path: "/tmp/proj",
+		Sandbox: config.ProjectSandboxConfig{
+			Enabled:          &v,
+			AllowAppleEvents: []string{"com.apple.iChat"},
+		},
+	}))
+	sv := NewSettingsView(database)
+	sv.Refresh()
+	sv.setCategory(catProjects)
+	// Position cursor on the project row so renderProjectDetail picks it up.
+	for i, row := range sv.rows {
+		if row.key == "proj" {
+			sv.cursor = i
+			break
+		}
+	}
+
+	out := readSettingsScreen(t, sv, 120, 40)
+	testutil.Contains(t, out, "Allow AppleEvents:")
+	testutil.Contains(t, out, "com.apple.iChat")
 }
 
 func TestSettingsView_VaultPathEdit(t *testing.T) {

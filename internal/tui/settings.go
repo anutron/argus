@@ -150,10 +150,11 @@ type SettingsView struct {
 	taskCounts     map[string]statusCounts
 
 	// Sandbox.
-	sandboxEnabled    bool
-	sandboxAvailable  bool
-	sandboxDenyRead   []string
-	sandboxExtraWrite []string
+	sandboxEnabled          bool
+	sandboxAvailable        bool
+	sandboxDenyRead         []string
+	sandboxExtraWrite       []string
+	sandboxAllowAppleEvents []string
 
 	// KB.
 	kbEnabled         bool
@@ -269,6 +270,7 @@ func (sv *SettingsView) Refresh() {
 	sv.sandboxAvailable = agent.IsSandboxAvailable()
 	sv.sandboxDenyRead = cfg.Sandbox.DenyRead
 	sv.sandboxExtraWrite = cfg.Sandbox.ExtraWrite
+	sv.sandboxAllowAppleEvents = cfg.Sandbox.AllowAppleEvents
 
 	// Backends.
 	sv.defaultBackend = cfg.Defaults.Backend
@@ -1688,6 +1690,28 @@ func (sv *SettingsView) renderSandboxDetail(screen tcell.Screen, x, y, w, h int)
 		}
 	}
 
+	if len(sv.sandboxAllowAppleEvents) > 0 {
+		// Separator above this section only when ExtraWrite rendered. DenyRead
+		// already emits its own trailing row++ (so adding one here would
+		// double-space when DenyRead is shown but ExtraWrite is empty), and
+		// ExtraWrite intentionally omits its trailing row++ to preserve the
+		// pre-existing spacing footprint when AllowAppleEvents is empty
+		// (the "[enter] toggle" footer's row+2 < h guard relies on row being
+		// tight).
+		if len(sv.sandboxExtraWrite) > 0 {
+			row++
+		}
+		widget.DrawText(screen, x, y+row, w, "Allow AppleEvents:", tcell.StyleDefault.Foreground(theme.ColorTitle))
+		row++
+		for _, b := range sv.sandboxAllowAppleEvents {
+			if row >= h {
+				break
+			}
+			widget.DrawText(screen, x, y+row, w, "  "+b, theme.StyleDimmed)
+			row++
+		}
+	}
+
 	if row+2 < h {
 		widget.DrawText(screen, x, y+h-1, w, "[enter] toggle", theme.StyleDimmed)
 	}
@@ -1760,7 +1784,18 @@ func (sv *SettingsView) renderProjectDetail(screen tcell.Screen, x, y, w, h int,
 			r++
 		}
 	}
-	if len(pe.Project.Sandbox.DenyRead) > 0 || len(pe.Project.Sandbox.ExtraWrite) > 0 {
+	if len(pe.Project.Sandbox.AllowAppleEvents) > 0 && r < h {
+		widget.DrawText(screen, x, y+r, w, "  Allow AppleEvents:", theme.StyleDimmed)
+		r++
+		for _, b := range pe.Project.Sandbox.AllowAppleEvents {
+			if r >= h {
+				break
+			}
+			widget.DrawText(screen, x, y+r, w, "    "+b, theme.StyleDimmed)
+			r++
+		}
+	}
+	if len(pe.Project.Sandbox.DenyRead) > 0 || len(pe.Project.Sandbox.ExtraWrite) > 0 || len(pe.Project.Sandbox.AllowAppleEvents) > 0 {
 		r++
 	}
 
