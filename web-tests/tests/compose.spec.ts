@@ -423,9 +423,11 @@ test.describe('compose bar', () => {
   // bundled-prefix variant (`insertText 'word\n'`), it preventDefaults and
   // calls sendCompose itself — but `setRangeText` fires a synchronous post-
   // mutation `input` event per HTML spec. The fallback must NOT also call
-  // sendCompose on that event. The mechanism: `setRangeText` dispatches the
-  // input event with no inputType (or undefined), and `isInsertionForSubmit`
-  // bails on the `!inputType` guard. This test asserts exactly one POST fires.
+  // sendCompose on that event. The mechanism: setRangeText splices `'world'`
+  // (no newline) into the textarea, so when its synchronous input event fires
+  // the trailing-`\n` check (`/[\r\n]$/.test(v)`) bails — empty inputType is
+  // no longer the gate (denylist passes it). The trailing-newline check is
+  // load-bearing here. This test asserts exactly one POST fires.
   test('beforeinput-matched bundled prefix does NOT double-fire via input fallback', async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== 'iphone', 'compose bar is touch-gated');
     await login(page);
@@ -446,7 +448,9 @@ test.describe('compose bar', () => {
       el.setSelectionRange(el.value.length, el.value.length);
       // beforeinput matches → preventDefault + setRangeText('world', ...) +
       // sendCompose. setRangeText fires its own synchronous input event; the
-      // fallback must skip it (no inputType on the synthetic input).
+      // fallback must skip it because `setRangeText` splices only the prefix
+      // (no trailing newline), so the `/[\r\n]$/.test(v)` check bails. Empty
+      // inputType is no longer the gate (denylist passes it).
       el.dispatchEvent(new InputEvent('beforeinput', {
         inputType: 'insertText',
         data: 'world\n',
@@ -543,8 +547,8 @@ test.describe('compose bar', () => {
   });
 
   // Guard rail: paste of multi-line text must not auto-submit even though
-  // the textarea now ends in `\n`. The fallback's allowlist explicitly
-  // excludes `insertFromPaste`.
+  // the textarea now ends in `\n`. The fallback's denylist explicitly
+  // includes `insertFromPaste` (alongside other paste/drop/yank types).
   test('input fallback does NOT fire on paste with trailing newline', async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== 'iphone', 'compose bar is touch-gated');
     await login(page);
@@ -569,6 +573,289 @@ test.describe('compose bar', () => {
     await page.waitForTimeout(200);
     expect(posted).toBe(false);
     await expect(page.locator('#compose-input')).toHaveValue('hello\n');
+  });
+
+  // Guard rail: drop of multi-line text must not auto-submit. The fallback's
+  // denylist explicitly includes `insertFromDrop`. Pairs with the paste test
+  // — both share the `PASTE_DROP_INPUT_TYPES.has()` branch but are exercised
+  // individually so a future edit that removes `insertFromDrop` from the Set
+  // is caught.
+  test('input fallback does NOT fire on insertFromDrop with trailing newline', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'iphone', 'compose bar is touch-gated');
+    await login(page);
+
+    let posted = false;
+    page.on('request', req => {
+      if (req.url().includes('/input') && req.method() === 'POST') posted = true;
+    });
+    await page.locator('#compose-input').evaluate((el: HTMLTextAreaElement) => {
+      el.focus();
+      el.value = 'dropped\n';
+      el.dispatchEvent(new InputEvent('input', {
+        inputType: 'insertFromDrop',
+        data: 'dropped\n',
+        cancelable: false,
+        bubbles: true,
+      }));
+    });
+    await page.waitForTimeout(200);
+    expect(posted).toBe(false);
+    await expect(page.locator('#compose-input')).toHaveValue('dropped\n');
+  });
+
+  // Guard rail: paste-as-quotation must not auto-submit. Same denylist
+  // entry class as paste/drop/yank. Closes the per-entry coverage gap so
+  // every member of PASTE_DROP_INPUT_TYPES has its own regression test.
+  test('input fallback does NOT fire on insertFromPasteAsQuotation with trailing newline', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'iphone', 'compose bar is touch-gated');
+    await login(page);
+
+    let posted = false;
+    page.on('request', req => {
+      if (req.url().includes('/input') && req.method() === 'POST') posted = true;
+    });
+    await page.locator('#compose-input').evaluate((el: HTMLTextAreaElement) => {
+      el.focus();
+      el.value = 'quoted\n';
+      el.dispatchEvent(new InputEvent('input', {
+        inputType: 'insertFromPasteAsQuotation',
+        data: 'quoted\n',
+        cancelable: false,
+        bubbles: true,
+      }));
+    });
+    await page.waitForTimeout(200);
+    expect(posted).toBe(false);
+    await expect(page.locator('#compose-input')).toHaveValue('quoted\n');
+  });
+
+  // Guard rail: Emacs-style yank (kill-buffer paste) must not auto-submit.
+  // Same denylist entry as paste/drop.
+  test('input fallback does NOT fire on insertFromYank with trailing newline', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'iphone', 'compose bar is touch-gated');
+    await login(page);
+
+    let posted = false;
+    page.on('request', req => {
+      if (req.url().includes('/input') && req.method() === 'POST') posted = true;
+    });
+    await page.locator('#compose-input').evaluate((el: HTMLTextAreaElement) => {
+      el.focus();
+      el.value = 'yanked\n';
+      el.dispatchEvent(new InputEvent('input', {
+        inputType: 'insertFromYank',
+        data: 'yanked\n',
+        cancelable: false,
+        bubbles: true,
+      }));
+    });
+    await page.waitForTimeout(200);
+    expect(posted).toBe(false);
+    await expect(page.locator('#compose-input')).toHaveValue('yanked\n');
+  });
+
+  // Regression: dictation tools (Wispr Flow, Voice Control, third-party
+  // keyboards) often inject text by mutating `.value` directly — no
+  // `beforeinput` and no `input` event fires for the trailing `\n`. Neither
+  // defense layer ever runs. The user then taps the on-screen send button.
+  // Without sendCompose's own trailing-`\n` strip, the POST would be
+  // `"text\n\r"` — Claude Code interprets the leading `\n` as Shift+Enter,
+  // leaving the prompt drafted with a newline below it, NOT submitted.
+  test('sendCompose strips trailing newline (dictation injects \\n via .value, then tap send)', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'iphone', 'compose bar is touch-gated');
+    await login(page);
+
+    await page.locator('#compose-input').evaluate((el: HTMLTextAreaElement) => {
+      // Simulate Wispr-style injection: programmatic .value set fires no
+      // input/beforeinput events at all.
+      el.value = 'send this prompt to the agent\n';
+    });
+
+    const inputReq = page.waitForRequest(req =>
+      req.url().includes('/input') && req.method() === 'POST',
+      { timeout: 3000 }
+    );
+    await page.locator('#compose-send').tap();
+    const req = await inputReq;
+    // Trailing \n must be stripped before \r is appended. Otherwise the
+    // POST is "text\n\r" and Claude Code drafts-without-submitting.
+    expect(req.postData()).toBe('send this prompt to the agent\r');
+    await expect(page.locator('#compose-input')).toHaveValue('');
+  });
+
+  // Regression: iOS WebKit / Wispr Flow / Voice Control sometimes dispatch
+  // the line-break-bearing `input` event with `inputType: ''` (empty string)
+  // when WebKit can't classify the source. Old allowlist (`startsWith
+  // ('insert')`) bailed; denylist passes empty inputType, so the fallback's
+  // trailing-newline check is the actual gate.
+  test('input fallback: empty inputType with trailing newline still sends', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'iphone', 'compose bar is touch-gated');
+    await login(page);
+
+    await page.locator('#compose-input').fill('hello');
+
+    const inputReq = page.waitForRequest(req =>
+      req.url().includes('/input') && req.method() === 'POST',
+      { timeout: 3000 }
+    );
+    await page.locator('#compose-input').evaluate((el: HTMLTextAreaElement) => {
+      el.focus();
+      el.value = 'hello\n';
+      el.dispatchEvent(new InputEvent('input', {
+        inputType: '',
+        data: '\n',
+        cancelable: false,
+        bubbles: true,
+      }));
+    });
+    const req = await inputReq;
+    expect(req.postData()).toBe('hello\r');
+    await expect(page.locator('#compose-input')).toHaveValue('');
+  });
+
+  // Regression: a future inputType outside the `insert*` namespace entirely
+  // (e.g. `'beforeBreak'`, or anything iOS 19+ ships). Denylist passes it;
+  // trailing-newline check submits.
+  test('input fallback: non-insert inputType with trailing newline still sends', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'iphone', 'compose bar is touch-gated');
+    await login(page);
+
+    await page.locator('#compose-input').fill('hello');
+
+    const inputReq = page.waitForRequest(req =>
+      req.url().includes('/input') && req.method() === 'POST',
+      { timeout: 3000 }
+    );
+    await page.locator('#compose-input').evaluate((el: HTMLTextAreaElement) => {
+      el.focus();
+      el.value = 'hello\n';
+      el.dispatchEvent(new InputEvent('input', {
+        inputType: 'beforeBreak',
+        data: '\n',
+        cancelable: false,
+        bubbles: true,
+      }));
+    });
+    const req = await inputReq;
+    expect(req.postData()).toBe('hello\r');
+    await expect(page.locator('#compose-input')).toHaveValue('');
+  });
+
+  // Guard rail: backspacing into a multi-line draft leaves a trailing `\n`
+  // that the user is editing — must NOT auto-submit. The denylist
+  // explicitly excludes `delete*` inputTypes.
+  test('input fallback does NOT fire on deleteContentBackward leaving trailing newline', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'iphone', 'compose bar is touch-gated');
+    await login(page);
+
+    let posted = false;
+    page.on('request', req => {
+      if (req.url().includes('/input') && req.method() === 'POST') posted = true;
+    });
+    await page.locator('#compose-input').evaluate((el: HTMLTextAreaElement) => {
+      el.focus();
+      // User had "hello\nworld", deletes "world" → "hello\n". Fallback must
+      // bail (user is editing, not sending).
+      el.value = 'hello\n';
+      el.dispatchEvent(new InputEvent('input', {
+        inputType: 'deleteContentBackward',
+        cancelable: false,
+        bubbles: true,
+      }));
+    });
+    await page.waitForTimeout(200);
+    expect(posted).toBe(false);
+    await expect(page.locator('#compose-input')).toHaveValue('hello\n');
+  });
+
+  // Guard rail: undo/redo (history*) that lands a trailing `\n` (e.g. undoing
+  // back to a draft state that previously ended in a newline) must NOT
+  // auto-submit. The denylist's `startsWith('history')` branch.
+  test('input fallback does NOT fire on historyUndo leaving trailing newline', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'iphone', 'compose bar is touch-gated');
+    await login(page);
+
+    let posted = false;
+    page.on('request', req => {
+      if (req.url().includes('/input') && req.method() === 'POST') posted = true;
+    });
+    await page.locator('#compose-input').evaluate((el: HTMLTextAreaElement) => {
+      el.focus();
+      el.value = 'hello\n';
+      el.dispatchEvent(new InputEvent('input', {
+        inputType: 'historyUndo',
+        cancelable: false,
+        bubbles: true,
+      }));
+    });
+    await page.waitForTimeout(200);
+    expect(posted).toBe(false);
+    await expect(page.locator('#compose-input')).toHaveValue('hello\n');
+  });
+
+  // Guard rail: format edits (bold/italic/etc.) that happen to leave a
+  // trailing `\n` must NOT auto-submit. The denylist's `startsWith('format')`
+  // branch. Real-world likelihood near-zero for a plain textarea, but the
+  // branch should be locked in by a test.
+  test('input fallback does NOT fire on formatBold leaving trailing newline', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'iphone', 'compose bar is touch-gated');
+    await login(page);
+
+    let posted = false;
+    page.on('request', req => {
+      if (req.url().includes('/input') && req.method() === 'POST') posted = true;
+    });
+    await page.locator('#compose-input').evaluate((el: HTMLTextAreaElement) => {
+      el.focus();
+      el.value = 'hello\n';
+      el.dispatchEvent(new InputEvent('input', {
+        inputType: 'formatBold',
+        cancelable: false,
+        bubbles: true,
+      }));
+    });
+    await page.waitForTimeout(200);
+    expect(posted).toBe(false);
+    await expect(page.locator('#compose-input')).toHaveValue('hello\n');
+  });
+
+  // Regression: when layer 2 (input fallback) correctly bails on a
+  // denylisted event but leaves a trailing `\n` in the textarea, the user
+  // may then tap Send manually — layer 3 (sendCompose strip) must catch
+  // that `\n` before it reaches the POST. Without layer 3, the POST is
+  // `"text\n\r"` and Claude Code drafts the prompt with an embedded newline
+  // instead of submitting. Pairs with the dictation `.value`-injection test
+  // (which exercises layer 3 via a no-event path) to lock in layer-3 as
+  // both the dictation belt AND the post-deny safety net.
+  test('layer 3 sendCompose strip catches trailing \\n after denylisted input event + tap send', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'iphone', 'compose bar is touch-gated');
+    await login(page);
+
+    // Step 1: simulate a denylisted input event (paste) that leaves a
+    // trailing newline. Layer 2's input fallback bails (paste is denied),
+    // so the `\n` stays in the textarea.
+    await page.locator('#compose-input').evaluate((el: HTMLTextAreaElement) => {
+      el.focus();
+      el.value = 'pasted text\n';
+      el.dispatchEvent(new InputEvent('input', {
+        inputType: 'insertFromPaste',
+        data: 'pasted text\n',
+        cancelable: false,
+        bubbles: true,
+      }));
+    });
+    await expect(page.locator('#compose-input')).toHaveValue('pasted text\n');
+
+    // Step 2: user taps send. Layer 3 in sendCompose must strip the trailing
+    // `\n` so the POST is `"pasted text\r"` not `"pasted text\n\r"`.
+    const inputReq = page.waitForRequest(req =>
+      req.url().includes('/input') && req.method() === 'POST',
+      { timeout: 3000 }
+    );
+    await page.locator('#compose-send').tap();
+    const req = await inputReq;
+    expect(req.postData()).toBe('pasted text\r');
+    await expect(page.locator('#compose-input')).toHaveValue('');
   });
 
   test('Send while scrolled in history snaps viewport back to bottom', async ({ page }, testInfo) => {
