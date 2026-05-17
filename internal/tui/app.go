@@ -185,6 +185,18 @@ type App struct {
 	// re-renders the conversation history at the current (wider) PTY.
 	pendingRerenderRestart map[string]bool
 
+	// lastAttachCols caches the panel cols at which we most recently evaluated
+	// the rerender predicate for each task. The gate is "panel size unchanged
+	// since the last attach" — if the user closes the agent view and reopens
+	// it without resizing the terminal, the predicate would otherwise re-fire
+	// and (when the panel is meaningfully wider/narrower than the session's
+	// initialCols) kill an idle session. That destroys any in-flight
+	// interactive UI Claude is rendering (notably AskUserQuestion overlays)
+	// because the restart via --session-id rehydrates the conversation but
+	// not the ephemeral modal. Storing the cols per task lets reopen-at-same
+	// -size short-circuit, while genuine resizes still fall through.
+	lastAttachCols map[string]uint16
+
 	// Worktree root for orphan sweep (default: ~/.argus/worktrees/).
 	// Overridden in tests to avoid scanning real worktrees.
 	wtRoot string
@@ -246,6 +258,7 @@ func New(database *db.DB, runner agent.SessionProvider, daemonConnected bool) *A
 		idleUnvisited:          make(map[string]bool),
 		viewedWhileAgent:       make(map[string]bool),
 		pendingRerenderRestart: make(map[string]bool),
+		lastAttachCols:         make(map[string]uint16),
 		wtRoot:                 filepath.Join(db.DataDir(), "worktrees"),
 		clipboardWriter:        pbcopyWriter,
 	}
@@ -2242,14 +2255,23 @@ func (a *App) maybeKickRerender(task *model.Task, sess agent.SessionHandle) {
 	if task == nil || sess == nil || !sess.Alive() {
 		return
 	}
-	if task.SessionID == "" {
-		return // backend doesn't support --session-id resume; nothing to do
-	}
 	if a.pendingRerenderRestart[task.ID] {
 		return // a kick is already in flight for this task
 	}
 	taskID := task.ID
 	_, panelCols := a.computePTYSize() // safe: GetInnerRect on the main goroutine
+
+	// Cache gate runs before the SessionID check so Codex tasks (which
+	// have SessionID=="" and can never be kicked) still benefit from the
+	// short-circuit — matches the web side's ordering and avoids spawning
+	// an RPC goroutine on every Codex agent-view reopen.
+	if a.isRedundantAttach(taskID, panelCols) {
+		uxlog.Log("[tui] rerender: skipping kick task=%s — panel cols unchanged since last attach (%d)", taskID, panelCols)
+		return
+	}
+	if task.SessionID == "" {
+		return // backend doesn't support --session-id resume; nothing to do
+	}
 
 	go func() {
 		// RPC calls — must NOT happen on the tview main goroutine.
@@ -2266,6 +2288,9 @@ func (a *App) maybeKickRerender(task *model.Task, sess agent.SessionHandle) {
 			case agent.RerenderSkip:
 				return
 			case agent.RerenderDeferBusy:
+				// Agent is mid-tool-call — invalidate so the next
+				// same-cols reopen re-evaluates when the agent goes idle.
+				a.invalidateAttachCache(taskID)
 				uxlog.Log("[tui] rerender deferred: task=%s busy (init=%d panel=%d)", taskID, initCols, panelCols)
 				return
 			case agent.RerenderKick:
@@ -2275,11 +2300,40 @@ func (a *App) maybeKickRerender(task *model.Task, sess agent.SessionHandle) {
 				if err := sess.Stop(); err != nil {
 					uxlog.Log("[tui] rerender: stop failed task=%s err=%v", taskID, err)
 					delete(a.pendingRerenderRestart, taskID)
+					// Stop attempt failed — invalidate so the next
+					// same-cols reopen retries (mirrors DeferBusy).
+					a.invalidateAttachCache(taskID)
 					a.statusbar.ClearInfo()
 				}
 			}
 		})
 	}()
+}
+
+// isRedundantAttach returns true when the panel cols match the
+// most recent attach for this task — i.e., the user reopened the agent view
+// without resizing. The rerender kick would otherwise destroy any in-flight
+// Claude UI (e.g. AskUserQuestion overlays) because the --session-id restart
+// rehydrates the conversation but not ephemeral modals. When proceeding,
+// caches the current cols so a subsequent reopen at the same size short
+// -circuits. Genuine resizes fall through because panelCols differs from
+// the cached value, so the kick predicate still runs.
+func (a *App) isRedundantAttach(taskID string, panelCols uint16) bool {
+	if prev, ok := a.lastAttachCols[taskID]; ok && prev == panelCols {
+		return true
+	}
+	a.lastAttachCols[taskID] = panelCols
+	return false
+}
+
+// invalidateAttachCache clears the cached cols for taskID so the next
+// maybeKickRerender call at any panel size re-evaluates the predicate.
+// Called from every non-Skip "could have kicked but didn't" outcome (busy
+// session, kick attempt error) so subsequent reopens at the same cols retry
+// instead of permanently short-circuiting. Main-goroutine-only (lastAttachCols
+// has no mutex because every access path runs on the tview main goroutine).
+func (a *App) invalidateAttachCache(taskID string) {
+	delete(a.lastAttachCols, taskID)
 }
 
 // reapStaleRerenderRestart clears a leaked pendingRerenderRestart entry when the
@@ -3387,6 +3441,11 @@ func (a *App) deleteTask(t *model.Task) {
 	if err := a.db.Delete(t.ID); err != nil {
 		uxlog.Log("[tui] failed to delete task %s: %v", t.ID, err)
 	}
+	// Drop any per-task cache entries so deleted tasks don't accumulate
+	// in long-lived TUI sessions. Matches the cleanup pattern for
+	// pendingRerenderRestart (in handleSessionExitUI).
+	a.invalidateAttachCache(t.ID)
+	delete(a.pendingRerenderRestart, t.ID)
 	a.refreshTasksLocal()
 
 	// Clean up worktree and branch in background — git operations can take seconds.

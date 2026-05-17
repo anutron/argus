@@ -647,6 +647,56 @@ func TestHandleResize(t *testing.T) {
 	})
 }
 
+func TestIsRedundantResize(t *testing.T) {
+	// Regression: xterm.js fires /resize on every terminal mount even when
+	// the viewport hasn't changed. Without this gate, reopening the web
+	// agent view re-evaluates the rerender predicate and kills any
+	// in-flight Claude UI (e.g. AskUserQuestion) that the --session-id
+	// restart can't rehydrate. Genuine resizes must still fall through.
+	srv, _ := testServer(t)
+
+	const taskID = "resize-gate"
+
+	if srv.isRedundantResize(taskID, 120) {
+		t.Fatal("first resize should not skip — no cached cols yet")
+	}
+	if !srv.isRedundantResize(taskID, 120) {
+		t.Fatal("second resize at same cols should skip — gate failed")
+	}
+	if !srv.isRedundantResize(taskID, 120) {
+		t.Fatal("third resize at same cols should still skip")
+	}
+	if srv.isRedundantResize(taskID, 140) {
+		t.Fatal("resize to different cols should not skip")
+	}
+	if !srv.isRedundantResize(taskID, 140) {
+		t.Fatal("subsequent resize at 140 should skip after cache updated")
+	}
+	if srv.isRedundantResize("other-task", 140) {
+		t.Fatal("different task should not skip — separate cache entry")
+	}
+
+	// Invalidation API contract: every non-Skip "could have kicked but
+	// didn't" outcome in maybeKickRerender (!IsIdle, db.Get error,
+	// runner.KickRerender error) calls `invalidateColsCache(taskID)` so
+	// the next /resize at the same cols re-evaluates. Drive the helper
+	// directly to pin the invariant — if any production branch stops
+	// invoking invalidateColsCache, the cache will stay populated and
+	// the gate will incorrectly skip subsequent retries.
+	srv.invalidateColsCache(taskID)
+	if srv.isRedundantResize(taskID, 140) {
+		t.Fatal("after invalidateColsCache, resize at 140 should proceed (not skip)")
+	}
+	if !srv.isRedundantResize(taskID, 140) {
+		t.Fatal("after invalidate + re-cache, resize at 140 should skip again")
+	}
+	// invalidateColsCache is idempotent on a missing key.
+	srv.invalidateColsCache("never-cached")
+	if srv.isRedundantResize("never-cached", 200) {
+		t.Fatal("invalidating a never-cached entry should leave it absent (next call proceeds)")
+	}
+}
+
 func TestMaybeKickRerender_Gates(t *testing.T) {
 	// maybeKickRerender's predicate gating without a live session — covers
 	// the early-return paths (no session, no task, no SessionID). The

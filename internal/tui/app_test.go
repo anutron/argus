@@ -31,6 +31,65 @@ func testDB(t *testing.T) *db.DB {
 	return d
 }
 
+func TestIsRedundantAttach(t *testing.T) {
+	// Regression: reopening the agent view at the same panel cols must not
+	// re-trigger the rerender kick — otherwise Claude's in-flight
+	// AskUserQuestion UI is destroyed by the --session-id restart. Genuine
+	// resizes (different cols from the cached value) must still fall through
+	// to the predicate.
+	d := testDB(t)
+	runner := agent.NewRunner(nil)
+	app := New(d, runner, false)
+
+	const taskID = "rerender-gate"
+
+	// First attach at 120 cols: no cached value, must NOT skip.
+	if app.isRedundantAttach(taskID, 120) {
+		t.Fatal("first attach should not skip — no cached cols yet")
+	}
+	// Reopen at the same size: must skip.
+	if !app.isRedundantAttach(taskID, 120) {
+		t.Fatal("reopen at same cols (120) should skip — gate failed")
+	}
+	// Reopen again at the same size: still skip (gate is idempotent).
+	if !app.isRedundantAttach(taskID, 120) {
+		t.Fatal("reopen at same cols (120) should still skip on third call")
+	}
+	// Genuine resize to 140: must NOT skip; cache must update.
+	if app.isRedundantAttach(taskID, 140) {
+		t.Fatal("resize to 140 should not skip — cols changed")
+	}
+	// Reopen at 140: must skip now that 140 is cached.
+	if !app.isRedundantAttach(taskID, 140) {
+		t.Fatal("reopen at same cols (140) should skip after resize")
+	}
+	// Per-task isolation: a different task's cache is empty.
+	if app.isRedundantAttach("other-task", 140) {
+		t.Fatal("different task should not skip — separate cache entry")
+	}
+
+	// Invalidation API contract: every non-Skip "could have kicked but
+	// didn't" outcome in maybeKickRerender's goroutine (RerenderDeferBusy,
+	// sess.Stop() error) calls `invalidateAttachCache(taskID)` so the next
+	// reopen at the same cols re-evaluates instead of permanently short-
+	// circuiting. Drive the helper directly to pin the invariant — if any
+	// production branch stops invoking invalidateAttachCache, the cache
+	// will stay populated and the gate will incorrectly skip subsequent
+	// retries.
+	app.invalidateAttachCache(taskID)
+	if app.isRedundantAttach(taskID, 140) {
+		t.Fatal("after invalidateAttachCache, reopen at 140 should proceed (not skip)")
+	}
+	if !app.isRedundantAttach(taskID, 140) {
+		t.Fatal("after invalidate + re-cache, reopen at 140 should skip again")
+	}
+	// invalidateAttachCache is idempotent on a missing key.
+	app.invalidateAttachCache("never-cached")
+	if app.isRedundantAttach("never-cached", 200) {
+		t.Fatal("invalidating a never-cached entry should leave it absent (next call proceeds)")
+	}
+}
+
 func TestHandleSessionExitUI_SkipsTransitionWhenPendingRestart(t *testing.T) {
 	// Regression test for the TUI-during-API-kick race: if a kick-restart is
 	// in flight, handleSessionExitUI must not flip the row to InReview —
