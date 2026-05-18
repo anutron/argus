@@ -172,6 +172,23 @@ func EnsureDaemonSymlink(exe string) string {
 // `"` are legal on macOS and would otherwise produce a malformed plist that
 // launchctl silently rejects.
 func renderPlist(daemonExe, logPath, home string) string {
+	// launchd starts processes with a near-empty PATH (just
+	// `/usr/bin:/bin:/usr/sbin:/sbin`) and does NOT expand `$HOME` inside
+	// EnvironmentVariables, so we bake the home path in literally. Without
+	// this, the daemon's `sh -c 'claude ...'` resolves PATH to those four
+	// dirs and fails with exit 127 — the native claude binary installs to
+	// `~/.local/bin/`, homebrew uses `/opt/homebrew/bin` (Apple Silicon) or
+	// `/usr/local/bin` (Intel), and codex/pi/etc. are wherever the user put
+	// them. Cover all the usual locations so `--resume` works after a boot.
+	//
+	// Order matters: PATH is first-match-wins, so user-installed locations
+	// must precede the system dirs. `filepath.Join` normalizes a trailing
+	// slash in `home` (which `os.UserHomeDir()` shouldn't return on macOS
+	// but is cheap insurance); PATH segments themselves are `:`-separated,
+	// not platform separator, so we concat by hand after that.
+	pathEnv := filepath.Join(home, ".local", "bin") +
+		":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 	// KeepAlive { SuccessfulExit = false } means: restart the daemon if it
 	// exits non-zero (a crash), but honor a clean `argus daemon stop`.
 	return `<?xml version="1.0" encoding="UTF-8"?>
@@ -179,13 +196,18 @@ func renderPlist(daemonExe, logPath, home string) string {
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>` + Label + `</string>
+	<string>` + xmlEscape(Label) + `</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>` + xmlEscape(daemonExe) + `</string>
 		<string>daemon</string>
 		<string>start</string>
 	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>` + xmlEscape(pathEnv) + `</string>
+	</dict>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
