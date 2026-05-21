@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -72,6 +73,17 @@ func (r *Runner) Start(task *model.Task, cfg config.Config, rows, cols uint16, r
 	}
 
 	slog.Info("runner.Start", "task", task.ID, "session", task.SessionID, "resume", resume, "pty", fmt.Sprintf("%dx%d", cols, rows), "dir", task.Worktree)
+
+	// Backend-specific prelaunch: pi requires a local ollama daemon + qwen3:32b
+	// warmed before the agent exec. Runs synchronously — Runner.Start is the
+	// single chokepoint shared by both new-task create and resume/restart, so
+	// one hook here covers every launch path. On failure, free the reservation
+	// before returning so a retry can reuse the task ID.
+	if err := ensurePrelaunchFn(context.Background(), task, cfg); err != nil {
+		slog.Error("runner.Start: prelaunch failed", "task", task.ID, "err", err)
+		cleanup()
+		return nil, err
+	}
 
 	cmd, sandboxCleanup, err := BuildCmd(task, cfg, resume)
 	if err != nil {
