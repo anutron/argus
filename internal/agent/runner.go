@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,17 +32,27 @@ type Runner struct {
 	stopped        map[string]bool // tracks task IDs where Stop was explicitly called
 	pendingRestart map[string]*pendingRestart
 	onFinish       func(taskID string, err error, stopped bool, lastOutput []byte)
+
+	// shutdownCtx is cancelled by StopAll so any long-running pre-launch
+	// work (e.g. ollama prelaunch on cold qwen3:32b load — up to 5 min)
+	// unblocks promptly when the daemon receives SIGTERM. Without this,
+	// a graceful shutdown would wait out the full prelaunch budget.
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
 }
 
 // NewRunner creates a Runner. The onFinish callback is called (in a goroutine)
 // when any managed session's process exits. lastOutput contains the final ring
 // buffer contents so callers can display error messages after the session is gone.
 func NewRunner(onFinish func(taskID string, err error, stopped bool, lastOutput []byte)) *Runner {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Runner{
 		sessions:       make(map[string]*Session),
 		stopped:        make(map[string]bool),
 		pendingRestart: make(map[string]*pendingRestart),
 		onFinish:       onFinish,
+		shutdownCtx:    ctx,
+		shutdownCancel: cancel,
 	}
 }
 
@@ -72,6 +83,19 @@ func (r *Runner) Start(task *model.Task, cfg config.Config, rows, cols uint16, r
 	}
 
 	slog.Info("runner.Start", "task", task.ID, "session", task.SessionID, "resume", resume, "pty", fmt.Sprintf("%dx%d", cols, rows), "dir", task.Worktree)
+
+	// Backend-specific prelaunch: pi requires a local ollama daemon + qwen3:32b
+	// warmed before the agent exec. Runs synchronously — Runner.Start is the
+	// single chokepoint shared by both new-task create and resume/restart, so
+	// one hook here covers every launch path. On failure, free the reservation
+	// before returning so a retry can reuse the task ID. The shutdownCtx is
+	// cancelled by StopAll so a daemon SIGTERM unblocks any in-flight prelaunch
+	// instead of waiting out the full 6-minute budget.
+	if err := ensurePrelaunchFn(r.shutdownCtx, task, cfg); err != nil {
+		slog.Error("runner.Start: prelaunch failed", "task", task.ID, "err", err)
+		cleanup()
+		return nil, err
+	}
 
 	cmd, sandboxCleanup, err := BuildCmd(task, cfg, resume)
 	if err != nil {
@@ -330,6 +354,12 @@ func (r *Runner) Stop(taskID string) error {
 
 // StopAll terminates all running sessions.
 func (r *Runner) StopAll() {
+	// Cancel the shutdown context first so any in-flight prelaunch
+	// (ollama brew start / cold model load) unblocks immediately. Doing
+	// this before iterating sessions means daemon shutdown doesn't sit
+	// on a 6-minute prelaunch budget waiting for the model to load.
+	r.shutdownCancel()
+
 	r.mu.Lock()
 	ids := make([]string, 0, len(r.sessions))
 	for id := range r.sessions {
