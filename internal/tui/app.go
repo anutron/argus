@@ -58,6 +58,7 @@ const (
 	modeConfirmDeleteProject
 	modeRestartDaemonPrompt
 	modeAppleEventsPicker
+	modeHelp
 )
 
 // agentFocus tracks which panel has focus in the agent view.
@@ -102,6 +103,10 @@ type App struct {
 	// Confirm delete modal (created on demand)
 	confirmDeleteModal        *modal.ConfirmDeleteModal
 	confirmDeleteProjectModal *modal.ConfirmDeleteProjectModal
+
+	// Help overlay (created on demand)
+	helpModal    *modal.HelpModal
+	helpPrevPage string
 
 	// Restart-daemon prompt (created on demand when binary mtime mismatch
 	// is detected at startup). daemonStale is set by main before Run() and
@@ -1260,6 +1265,12 @@ func (a *App) handleGlobalKey(event *tcell.EventKey) *tcell.EventKey {
 		return nil
 	}
 
+	// Help overlay — delegate everything to the modal
+	if a.mode == modeHelp && a.helpModal != nil {
+		a.handleHelpKey(event)
+		return nil
+	}
+
 	// Confirm delete project modal
 	if a.mode == modeConfirmDeleteProject && a.confirmDeleteProjectModal != nil {
 		a.handleConfirmDeleteProjectKey(event)
@@ -1458,6 +1469,11 @@ func (a *App) handleGlobalKey(event *tcell.EventKey) *tcell.EventKey {
 		case '3':
 			if a.mode != modeAgent {
 				a.switchTab(widget.TabSettings)
+				return nil
+			}
+		case '?':
+			if a.mode != modeAgent {
+				a.openHelp()
 				return nil
 			}
 		}
@@ -2844,6 +2860,52 @@ func (a *App) closeConfirmDelete() {
 	a.pages.RemovePage("confirmdelete")
 	a.pages.SwitchToPage("tasks")
 	a.tapp.SetFocus(a.tasklist)
+}
+
+// openHelp shows the keybindings help overlay. The previous active page is
+// remembered so closeHelp can restore the user's context (Tasks, DAG, or
+// Settings tab).
+func (a *App) openHelp() {
+	if a.helpModal != nil {
+		return
+	}
+	a.helpPrevPage, _ = a.pages.GetFrontPage()
+	a.helpModal = modal.NewHelpModal()
+	a.mode = modeHelp
+	a.pages.AddPage("help", a.helpModal, true, true)
+	a.pages.SwitchToPage("help")
+	a.tapp.SetFocus(a.helpModal)
+}
+
+// handleHelpKey processes keys in the help overlay.
+func (a *App) handleHelpKey(event *tcell.EventKey) {
+	handler := a.helpModal.InputHandler()
+	handler(event, func(p tview.Primitive) {})
+	if a.helpModal.Closed() {
+		a.closeHelp()
+	}
+}
+
+// closeHelp dismisses the help overlay and restores the prior page.
+func (a *App) closeHelp() {
+	a.mode = modeTaskList
+	a.helpModal = nil
+	a.pages.RemovePage("help")
+	prev := a.helpPrevPage
+	a.helpPrevPage = ""
+	if prev == "" || prev == "help" {
+		prev = "tasks"
+	}
+	a.pages.SwitchToPage(prev)
+	// Restore focus to whichever widget owns the visible tab.
+	switch a.header.ActiveTab() {
+	case widget.TabSettings:
+		a.tapp.SetFocus(a.settings)
+	case widget.TabDAG:
+		a.tapp.SetFocus(a.dagWidget)
+	default:
+		a.tapp.SetFocus(a.tasklist)
+	}
 }
 
 // --- Fork task ---
