@@ -39,11 +39,20 @@ test.describe('settings tab', () => {
     const input = page.locator('#ios-share-url');
     await expect(input).toBeVisible();
     const value = await input.inputValue();
-    // URL must contain origin + /share?text=[Shortcut Input] placeholder.
+    // URL must contain origin + /share?text=[Shortcut Input] placeholder, plus
+    // the current token so the Shortcut works from Safari (which has separate
+    // storage from the home-screen PWA on iOS).
     const origin = await page.evaluate(() => window.location.origin);
-    expect(value).toBe(`${origin}/share?text=[Shortcut Input]`);
+    expect(value).toBe(`${origin}/share?text=[Shortcut Input]&token=test-token`);
     // readonly so the user can't edit it but can still select+copy.
     await expect(input).toHaveAttribute('readonly', '');
+    // Credential warning must be visible alongside the URL field: the URL
+    // contains a live token and ships into the user's clipboard / Shortcut
+    // / iCloud-synced backup, so the user needs to know to treat it carefully.
+    const warning = page.locator('#ios-share-token-warning');
+    await expect(warning).toBeVisible();
+    await expect(warning).toContainText(/token/i);
+    await expect(warning).toContainText(/password/i);
   });
 
   test('iOS share help (?) icon toggles instructions including Shortcut Input variable', async ({ page }) => {
