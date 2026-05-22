@@ -98,7 +98,7 @@ test.describe('PWA', () => {
     expect(pending).toBeNull();
   });
 
-  test('/share?token=... persists the token to localStorage and authenticates', async ({ page }) => {
+  test('persists the shared token to localStorage on /share', async ({ page }) => {
     // iOS Safari and the home-screen PWA have separate storage on iOS, so the
     // Shortcut helper passes the device token in the URL. The capture IIFE must
     // stash it in localStorage before the rest of the SPA boots.
@@ -111,7 +111,7 @@ test.describe('PWA', () => {
     expect(new URL(page.url()).search).toBe('');
   });
 
-  test('/share?token=... only fires on the /share path', async ({ page }) => {
+  test('ignores ?token= on paths other than /share', async ({ page }) => {
     // Defensive: hitting / with a token query (e.g. accidental copy/paste of
     // the Shortcut URL into the address bar at root) should not silently
     // overwrite the saved token from a Shortcut-issued path. Only /share is
@@ -122,7 +122,7 @@ test.describe('PWA', () => {
     expect(saved).toBe('existing-token');
   });
 
-  test('/share?token=... is capped at 256 chars', async ({ page }) => {
+  test('rejects shared tokens longer than 256 chars', async ({ page }) => {
     // Pathological URLs shouldn't be able to push arbitrary blobs into
     // localStorage. The capture IIFE clamps to 256 bytes.
     const huge = 'x'.repeat(500);

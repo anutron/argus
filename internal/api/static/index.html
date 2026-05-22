@@ -1160,6 +1160,7 @@ textarea.settings-input { min-height: 70px; resize: vertical; }
           <button class="help-icon" type="button" onclick="toggleShareHelp()" aria-controls="ios-share-help" aria-expanded="false" aria-label="Setup instructions" id="ios-share-help-toggle">?</button>
         </div>
         <div class="meta">iOS Safari does not support PWA share targets directly. Build a Shortcut with this URL to put Argus in the share sheet.</div>
+        <div class="meta" id="ios-share-token-warning">⚠ This URL embeds your API token. Treat it like a password — it lands in your clipboard, the Shortcut definition, and any iCloud-synced backups of Shortcuts. Revoke and re-mint the token in the section below if you suspect it leaked.</div>
         <div style="display: flex; gap: 6px; align-items: stretch">
           <input class="settings-input mono" id="ios-share-url" readonly style="flex: 1">
           <button type="button" onclick="copyShareURL()">Copy</button>
@@ -1437,50 +1438,48 @@ textarea.settings-input { min-height: 70px; resize: vertical; }
 
 <script>
 const API = '';
-// Token can ride in on /share?token=... from the iOS Shortcut helper. Safari
-// and the home-screen PWA have separate localStorage, so a token saved in the
-// PWA isn't visible to Safari (where the Shortcut's Open URLs always lands).
-// Persist before TOKEN initialization so the rest of the boot uses it; the
-// /share capture IIFE below strips the URL so the token doesn't linger.
-(function captureSharedToken() {
-  if (location.pathname !== '/share') return;
-  const token = (new URLSearchParams(location.search).get('token') || '').trim();
-  if (token && token.length <= 256) {
-    localStorage.setItem('argus-token', token);
-  }
-})();
-let TOKEN = localStorage.getItem('argus-token') || '';
-let currentTask = null;
-let tasks = [];
-let actionBusy = false;
 
-// --- Web Share Target capture ---
+// --- /share landing capture ---
 // iOS/Android invoke the PWA share target by navigating to /share?title=...&text=...&url=...
-// (declared in manifest.webmanifest). We capture those params to sessionStorage
-// here, BEFORE auth, so they survive the token-entry flow. applyPendingShare()
-// later opens the New Task tab with the shared content prefilled.
-// Per-field cap on incoming share params. iOS shares are short (titles, URLs,
-// short selections); a malicious deep-link could try to push multi-MB into
-// sessionStorage. 4KB per field is generous for legitimate content.
+// (declared in manifest.webmanifest). The iOS Shortcut helper additionally
+// carries the API token via ?token=... because Safari and the home-screen PWA
+// use SEPARATE localStorage on iOS — Open URLs from a Shortcut always lands in
+// Safari, which can't see the token the PWA saved. We capture all share-target
+// params + token in a single pass BEFORE TOKEN initialization, then strip the
+// URL so the token doesn't linger in browser history.
+// Per-field cap on share params. iOS shares are short (titles, URLs, short
+// selections); a malicious deep-link could try to push multi-MB into storage.
+// 4KB per share field is generous; tokens are 64 chars (32-byte hex) so 256
+// is 4x the real size and matches the cap on capturePendingTaskOpen below.
 const SHARE_FIELD_MAX = 4096;
+const TOKEN_MAX_LEN = 256;
 function clampShareField(s) {
   if (typeof s !== 'string') return '';
   return s.slice(0, SHARE_FIELD_MAX).trim();
 }
 
-(function capturePendingShare() {
+(function captureShareLanding() {
   if (location.pathname !== '/share') return;
   const sp = new URLSearchParams(location.search);
+  const token = (sp.get('token') || '').trim();
+  if (token && token.length <= TOKEN_MAX_LEN) {
+    localStorage.setItem('argus-token', token);
+  }
   const title = clampShareField(sp.get('title'));
   const text = clampShareField(sp.get('text'));
   const url = clampShareField(sp.get('url'));
   if (title || text || url) {
     sessionStorage.setItem('argus-pending-share', JSON.stringify({ title, text, url }));
   }
-  // Strip /share from the URL so a refresh doesn't re-fire the share with the
-  // same content (the user would get the same prefill on every reload).
+  // Strip /share + query so refresh doesn't re-fire and the token doesn't
+  // linger in the address bar / browser history.
   history.replaceState(null, '', '/');
 })();
+
+let TOKEN = localStorage.getItem('argus-token') || '';
+let currentTask = null;
+let tasks = [];
+let actionBusy = false;
 
 // --- Push notification deep link ---
 // Notification clicks land here two ways:
@@ -4611,12 +4610,15 @@ async function loadSettings() {
 // it with the actual Shortcut Input variable in the editor. Keep the string
 // in lockstep with the Playwright assertion in settings-ui.spec.ts.
 const SHORTCUT_INPUT_PLACEHOLDER = '[Shortcut Input]';
+// WARNING: returns a URL containing the live API token when TOKEN is set.
+// Treat the return value as a credential — anything that surfaces it to the
+// user (UI fields, clipboard, logs) is leaking a token. Safari and the
+// home-screen PWA have separate localStorage on iOS, so the Shortcut needs to
+// carry the token in the URL — Safari (where Open URLs lands) won't otherwise
+// see the token the PWA saved. /share's capture IIFE persists it on arrival.
+// Append it only when one is loaded; the URL stays valid without it but the
+// user would land on the login screen.
 function shareShortcutURL() {
-  // Safari and the home-screen PWA have separate localStorage on iOS, so the
-  // Shortcut needs to carry the token in the URL — Safari (where Open URLs
-  // lands) won't otherwise see the token the PWA saved. /share's capture IIFE
-  // persists it on arrival. Append it only when one is loaded; the URL stays
-  // valid without it but the user would land on the login screen.
   const base = `${window.location.origin}/share?text=${SHORTCUT_INPUT_PLACEHOLDER}`;
   return TOKEN ? `${base}&token=${encodeURIComponent(TOKEN)}` : base;
 }
