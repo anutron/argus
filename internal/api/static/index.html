@@ -1437,6 +1437,18 @@ textarea.settings-input { min-height: 70px; resize: vertical; }
 
 <script>
 const API = '';
+// Token can ride in on /share?token=... from the iOS Shortcut helper. Safari
+// and the home-screen PWA have separate localStorage, so a token saved in the
+// PWA isn't visible to Safari (where the Shortcut's Open URLs always lands).
+// Persist before TOKEN initialization so the rest of the boot uses it; the
+// /share capture IIFE below strips the URL so the token doesn't linger.
+(function captureSharedToken() {
+  if (location.pathname !== '/share') return;
+  const token = (new URLSearchParams(location.search).get('token') || '').trim();
+  if (token && token.length <= 256) {
+    localStorage.setItem('argus-token', token);
+  }
+})();
 let TOKEN = localStorage.getItem('argus-token') || '';
 let currentTask = null;
 let tasks = [];
@@ -4600,7 +4612,13 @@ async function loadSettings() {
 // in lockstep with the Playwright assertion in settings-ui.spec.ts.
 const SHORTCUT_INPUT_PLACEHOLDER = '[Shortcut Input]';
 function shareShortcutURL() {
-  return `${window.location.origin}/share?text=${SHORTCUT_INPUT_PLACEHOLDER}`;
+  // Safari and the home-screen PWA have separate localStorage on iOS, so the
+  // Shortcut needs to carry the token in the URL — Safari (where Open URLs
+  // lands) won't otherwise see the token the PWA saved. /share's capture IIFE
+  // persists it on arrival. Append it only when one is loaded; the URL stays
+  // valid without it but the user would land on the login screen.
+  const base = `${window.location.origin}/share?text=${SHORTCUT_INPUT_PLACEHOLDER}`;
+  return TOKEN ? `${base}&token=${encodeURIComponent(TOKEN)}` : base;
 }
 async function populateShareURL() {
   const el = document.getElementById('ios-share-url');

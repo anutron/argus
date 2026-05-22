@@ -39,9 +39,11 @@ test.describe('settings tab', () => {
     const input = page.locator('#ios-share-url');
     await expect(input).toBeVisible();
     const value = await input.inputValue();
-    // URL must contain origin + /share?text=[Shortcut Input] placeholder.
+    // URL must contain origin + /share?text=[Shortcut Input] placeholder, plus
+    // the current token so the Shortcut works from Safari (which has separate
+    // storage from the home-screen PWA on iOS).
     const origin = await page.evaluate(() => window.location.origin);
-    expect(value).toBe(`${origin}/share?text=[Shortcut Input]`);
+    expect(value).toBe(`${origin}/share?text=[Shortcut Input]&token=test-token`);
     // readonly so the user can't edit it but can still select+copy.
     await expect(input).toHaveAttribute('readonly', '');
   });

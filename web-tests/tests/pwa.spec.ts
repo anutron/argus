@@ -98,6 +98,39 @@ test.describe('PWA', () => {
     expect(pending).toBeNull();
   });
 
+  test('/share?token=... persists the token to localStorage and authenticates', async ({ page }) => {
+    // iOS Safari and the home-screen PWA have separate storage on iOS, so the
+    // Shortcut helper passes the device token in the URL. The capture IIFE must
+    // stash it in localStorage before the rest of the SPA boots.
+    await page.goto('/share?token=test-token&text=Some%20text');
+    await expect(page.locator('#create-view')).toBeVisible();
+    const saved = await page.evaluate(() => localStorage.getItem('argus-token'));
+    expect(saved).toBe('test-token');
+    // URL should have been cleaned up so the token doesn't linger in history.
+    expect(new URL(page.url()).pathname).toBe('/');
+    expect(new URL(page.url()).search).toBe('');
+  });
+
+  test('/share?token=... only fires on the /share path', async ({ page }) => {
+    // Defensive: hitting / with a token query (e.g. accidental copy/paste of
+    // the Shortcut URL into the address bar at root) should not silently
+    // overwrite the saved token from a Shortcut-issued path. Only /share is
+    // a sanctioned entry point.
+    await page.addInitScript(() => localStorage.setItem('argus-token', 'existing-token'));
+    await page.goto('/?token=other-token');
+    const saved = await page.evaluate(() => localStorage.getItem('argus-token'));
+    expect(saved).toBe('existing-token');
+  });
+
+  test('/share?token=... is capped at 256 chars', async ({ page }) => {
+    // Pathological URLs shouldn't be able to push arbitrary blobs into
+    // localStorage. The capture IIFE clamps to 256 bytes.
+    const huge = 'x'.repeat(500);
+    await page.goto(`/share?token=${huge}`);
+    const saved = await page.evaluate(() => localStorage.getItem('argus-token'));
+    expect(saved).toBeNull();
+  });
+
   test('?task=<id> deep link opens the task detail view (push notification click)', async ({ page, request }) => {
     // Read the seeded task ID from the test server so we open something real.
     const tasksResp = await request.get('/api/tasks', {
