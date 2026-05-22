@@ -23,6 +23,16 @@ var prelaunchTimeout = 6 * time.Minute
 // brew/network calls.
 var ensurePrelaunchFn = EnsurePrelaunch
 
+// ModelForBackend returns the ollama model that should be preloaded for a
+// given pi-backend command. Today this always returns ollama.DefaultModel
+// (qwen3:32b — the model pi.dev's CLI is configured to use). When pi grows
+// per-instance model selection (e.g. via a `--model` flag in
+// Backend.Command or a new Backend.Model config field), this is the seam
+// to plumb that through.
+func ModelForBackend(_ config.Backend) string {
+	return ollama.DefaultModel
+}
+
 // SetPrelaunchForTest overrides the prelaunch function. Returns a restore func.
 func SetPrelaunchForTest(fn func(ctx context.Context, task *model.Task, cfg config.Config) error) func() {
 	old := ensurePrelaunchFn
@@ -54,13 +64,14 @@ func EnsurePrelaunch(ctx context.Context, task *model.Task, cfg config.Config) e
 		return nil
 	}
 
+	model := ModelForBackend(backend)
 	slog.Info("agent.EnsurePrelaunch: pi backend detected, ensuring ollama",
-		"task", task.ID, "model", ollama.DefaultModel)
+		"task", task.ID, "model", model)
 
 	ensureCtx, cancel := context.WithTimeout(ctx, prelaunchTimeout)
 	defer cancel()
 
-	if err := ollama.EnsureRunning(ensureCtx, ollama.DefaultModel); err != nil {
+	if err := ollama.EnsureRunning(ensureCtx, model); err != nil {
 		return fmt.Errorf("pi backend requires ollama: %w", err)
 	}
 	slog.Info("agent.EnsurePrelaunch: ollama ready", "task", task.ID)

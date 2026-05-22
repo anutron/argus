@@ -142,6 +142,54 @@ func TestRunner_Start_CallsPrelaunch(t *testing.T) {
 	testutil.Equal(t, atomic.LoadInt32(&calls), int32(1))
 }
 
+// TestRunner_StopAll_CancelsPrelaunchCtx pins the BLOCKING-2 fix: the ctx
+// Runner.Start passes to prelaunch must be derived from a shutdown context
+// that StopAll cancels, so a graceful daemon shutdown unblocks any in-flight
+// pre-launch (ollama brew start / cold model load — up to 6 min) immediately.
+func TestRunner_StopAll_CancelsPrelaunchCtx(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	var captured context.Context
+	defer SetPrelaunchForTest(func(ctx context.Context, task *model.Task, cfg config.Config) error {
+		captured = ctx
+		return nil
+	})()
+
+	cfg := config.Config{
+		Defaults: config.Defaults{Backend: "test"},
+		Backends: map[string]config.Backend{
+			"test": {Command: "echo hello", PromptFlag: ""},
+		},
+	}
+	runner := NewRunner(nil)
+	task := &model.Task{ID: "t-shutdown-ctx", Backend: "test", Worktree: t.TempDir()}
+
+	sess, err := runner.Start(task, cfg, 24, 80, false)
+	testutil.NoError(t, err)
+	defer func() { _ = sess.Stop() }()
+
+	if captured == nil {
+		t.Fatal("prelaunch did not run")
+	}
+	// Before StopAll, the captured ctx must NOT be cancelled.
+	if err := captured.Err(); err != nil {
+		t.Fatalf("ctx cancelled prematurely: %v", err)
+	}
+
+	runner.StopAll()
+
+	// StopAll must propagate cancellation to the captured prelaunch ctx.
+	// Allow a tiny grace window for the goroutine scheduler.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if captured.Err() != nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("prelaunch ctx not cancelled after StopAll: err=%v", captured.Err())
+}
+
 // TestRunner_Start_PrelaunchFailureAborts asserts that a prelaunch error
 // short-circuits Start, frees the slot reservation, and surfaces the error.
 func TestRunner_Start_PrelaunchFailureAborts(t *testing.T) {

@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os/exec"
+	"sync"
 	"time"
 )
 
@@ -52,9 +53,18 @@ var probeTimeout = 500 * time.Millisecond
 // pollInterval is how often StartDaemon re-probes /api/tags while waiting.
 var pollInterval = 200 * time.Millisecond
 
+// ensureMu serializes EnsureRunning so two concurrent pi-task launches
+// don't both shell out to `brew services start ollama` and both block for
+// up to 5min preloading the same model. Once the first caller finishes,
+// later callers find IsRunning==true and the model already loaded, so
+// PreloadModel returns quickly.
+var ensureMu sync.Mutex
+
 // SetForTest overrides package-level config for tests. Returns a restore func.
 //
-// Pass an empty endpoint or nil brewArgs to leave that field untouched.
+// Pass an empty endpoint or nil brewArgs to leave that field untouched. Zero
+// durations also leave the corresponding timeout unchanged — tests that need
+// to explicitly set a timeout to zero must mutate the package var directly.
 func SetForTest(endpoint string, brewArgs []string, startWait, preload time.Duration) func() {
 	oldEndpoint := Endpoint
 	oldBrew := brewCmd
@@ -121,14 +131,10 @@ func StartDaemon(ctx context.Context) error {
 
 	waitCtx, cancel := context.WithTimeout(ctx, startTimeout)
 	defer cancel()
-	deadline := time.Now().Add(startTimeout)
 	for {
 		if IsRunning(waitCtx) {
 			slog.Info("ollama: daemon ready")
 			return nil
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("ollama daemon not ready within %s after %v", startTimeout, brewCmd)
 		}
 		select {
 		case <-waitCtx.Done():
@@ -175,8 +181,16 @@ func PreloadModel(ctx context.Context, model string) error {
 }
 
 // EnsureRunning is the orchestrator: probe, start if down, then preload the
-// model. Blocks up to startTimeout + preloadTimeout on a cold daemon.
+// model. Bounded by the caller's context, or by `startTimeout + preloadTimeout`
+// if ctx has no deadline.
+//
+// Serialized via ensureMu — concurrent callers wait, then each runs a quick
+// IsRunning + (no-op) preload since the first caller already brought the
+// daemon up and loaded the model.
 func EnsureRunning(ctx context.Context, model string) error {
+	ensureMu.Lock()
+	defer ensureMu.Unlock()
+
 	if !IsRunning(ctx) {
 		if err := StartDaemon(ctx); err != nil {
 			return fmt.Errorf("start ollama daemon: %w", err)

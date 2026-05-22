@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,34 +21,11 @@ import (
 func writeBrewStub(t *testing.T, dir, name string, exitCode int) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
-	script := "#!/bin/sh\necho \"$@\"\nexit " + itoa(exitCode) + "\n"
+	script := "#!/bin/sh\necho \"$@\"\nexit " + strconv.Itoa(exitCode) + "\n"
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatalf("write stub: %v", err)
 	}
 	return path
-}
-
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	neg := false
-	if i < 0 {
-		neg = true
-		i = -i
-	}
-	var buf [12]byte
-	pos := len(buf)
-	for i > 0 {
-		pos--
-		buf[pos] = byte('0' + i%10)
-		i /= 10
-	}
-	if neg {
-		pos--
-		buf[pos] = '-'
-	}
-	return string(buf[pos:])
 }
 
 func TestIsRunning(t *testing.T) {
@@ -217,7 +196,6 @@ func TestPreloadModel(t *testing.T) {
 
 func TestEnsureRunning(t *testing.T) {
 	t.Run("daemon already up — skips brew", func(t *testing.T) {
-		var brewCalls int32
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte(`{"models":[]}`))
@@ -232,7 +210,6 @@ func TestEnsureRunning(t *testing.T) {
 		if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		_ = brewCalls // unused, file-based instead
 		defer SetForTest(srv.URL, []string{stub}, time.Second, time.Second)()
 
 		testutil.NoError(t, EnsureRunning(context.Background(), "qwen3:32b"))
@@ -307,4 +284,83 @@ func TestEnsureRunning(t *testing.T) {
 		}
 		testutil.Contains(t, err.Error(), "start ollama daemon")
 	})
+
+	t.Run("concurrent callers serialize — brew runs once", func(t *testing.T) {
+		// Tags probe returns 503 until the marker file appears (after first
+		// brew call). With the ensureMu serialization in place, only the
+		// first goroutine actually shells out; the rest see daemon up.
+		var ready atomic.Bool
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/tags":
+				if !ready.Load() {
+					w.WriteHeader(503)
+					return
+				}
+				w.WriteHeader(200)
+				_, _ = w.Write([]byte(`{"models":[{"name":"qwen3:32b"}]}`))
+			case "/api/generate":
+				// Tiny artificial delay so concurrent callers can pile up
+				// while the first one holds the mutex.
+				time.Sleep(50 * time.Millisecond)
+				w.WriteHeader(200)
+				_, _ = w.Write([]byte(`{"done":true}`))
+			}
+		}))
+		defer srv.Close()
+
+		dir := t.TempDir()
+		marker := filepath.Join(dir, "ready")
+		counter := filepath.Join(dir, "calls")
+		stub := filepath.Join(dir, "brew")
+		// Each brew invocation appends to the counter file so we can verify
+		// the call count after the fact, even though the variable is set
+		// inside the stub's process.
+		script := "#!/bin/sh\necho call >> " + counter + "\ntouch " + marker + "\nexit 0\n"
+		if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			for {
+				if _, err := os.Stat(marker); err == nil {
+					ready.Store(true)
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+		defer SetForTest(srv.URL, []string{stub}, 2*time.Second, time.Second)()
+
+		var wg sync.WaitGroup
+		const n = 5
+		errs := make([]error, n)
+		for i := range n {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				errs[idx] = EnsureRunning(context.Background(), "qwen3:32b")
+			}(i)
+		}
+		wg.Wait()
+
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("goroutine %d errored: %v", i, err)
+			}
+		}
+		b, _ := os.ReadFile(counter)
+		if got := bytesNewlineCount(b); got != 1 {
+			t.Fatalf("brew calls = %d, want 1 — ensureMu did not serialize EnsureRunning. Counter content: %q", got, string(b))
+		}
+	})
+}
+
+func bytesNewlineCount(b []byte) int {
+	n := 0
+	for _, c := range b {
+		if c == '\n' {
+			n++
+		}
+	}
+	return n
 }
