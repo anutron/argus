@@ -102,6 +102,11 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/tokens", s.handleListTokens)
 	mux.HandleFunc("POST /api/tokens", s.handleCreateToken)
 	mux.HandleFunc("DELETE /api/tokens/{id}", s.handleRevokeToken)
+	// Plugin substrate: runtime MCP tool registration (PR 4). Plugins
+	// (scope-tagged tokens) register and unregister their own tools; master
+	// can drop any tool for operator cleanup.
+	mux.HandleFunc("POST /api/mcp/tools", s.handleRegisterMCPTool)
+	mux.HandleFunc("DELETE /api/mcp/tools/{name}", s.handleUnregisterMCPTool)
 	mux.HandleFunc("GET /api/source-path", s.handleGetSourcePath)
 	mux.HandleFunc("PUT /api/source-path", s.handleSetSourcePath)
 	mux.HandleFunc("POST /api/update", s.handleUpdateSelf)

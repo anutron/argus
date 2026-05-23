@@ -16,6 +16,7 @@ import (
 	"github.com/drn/argus/internal/agent"
 	"github.com/drn/argus/internal/clipboard"
 	"github.com/drn/argus/internal/db"
+	"github.com/drn/argus/internal/mcp"
 	"github.com/drn/argus/internal/model"
 	"github.com/drn/argus/internal/push"
 )
@@ -29,14 +30,15 @@ type TaskCreator func(name, prompt, project, backend string, autoName bool) (*mo
 
 // Server is the HTTP REST API server.
 type Server struct {
-	db         *db.DB
-	runner     *agent.Runner
-	token      string
-	createTask TaskCreator
-	httpSrv    *http.Server
-	push       *push.Manager
-	scheduler  ScheduleRunner   // optional; set by SetScheduler before ListenAndServe
-	clipboard  *clipboard.Store // optional; set by SetClipboard before ListenAndServe
+	db          *db.DB
+	runner      *agent.Runner
+	token       string
+	createTask  TaskCreator
+	httpSrv     *http.Server
+	push        *push.Manager
+	scheduler   ScheduleRunner   // optional; set by SetScheduler before ListenAndServe
+	clipboard   *clipboard.Store // optional; set by SetClipboard before ListenAndServe
+	mcpRegistry *mcp.Registry    // optional; set by SetMCPRegistry before ListenAndServe
 
 	// stopCh is closed by Shutdown to signal background goroutines (idle
 	// watcher, push fan-out housekeeping) to terminate. Range over <-stopCh

@@ -101,6 +101,34 @@ func (d *DB) FindAPITokenByHash(hash string) (*APIToken, error) {
 	return &t, nil
 }
 
+// FindAPITokenByID returns a token by primary-key id, including revoked rows.
+// Returns (nil, nil) when no row matches. Used by the revoke handler to read
+// the scope BEFORE the row is marked revoked — the cascade-to-plugin-MCP
+// sweep needs the scope and FindAPITokenByHash hides revoked rows.
+func (d *DB) FindAPITokenByID(id int64) (*APIToken, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var t APIToken
+	var created, lastUsed, revoked int64
+	err := d.conn.QueryRow(
+		`SELECT id, label, hash, last4, scope, created_at, last_used, revoked_at
+		 FROM api_tokens WHERE id = ?`,
+		id,
+	).Scan(&t.ID, &t.Label, &t.Hash, &t.Last4, &t.Scope, &created, &lastUsed, &revoked)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	t.CreatedAt = time.Unix(created, 0)
+	if lastUsed > 0 {
+		t.LastUsed = time.Unix(lastUsed, 0)
+	}
+	t.Revoked = revoked > 0
+	return &t, nil
+}
+
 // RevokeAPIToken marks a token as revoked. Idempotent.
 func (d *DB) RevokeAPIToken(id int64) error {
 	d.mu.Lock()

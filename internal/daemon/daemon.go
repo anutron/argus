@@ -357,6 +357,38 @@ func (d *Daemon) Serve(sockPath string) error {
 	d.deps = dw
 	go dw.Start()
 
+	// Plugin substrate (PR 4): build the runtime MCP-tool registry up front
+	// so both the MCP server (which consults it on tools/list and tools/call)
+	// and the API server (which exposes POST/DELETE /api/mcp/tools) see the
+	// same persistent table. The registry itself has no goroutines — the
+	// sweep loop below is the only background work.
+	pluginRegistry := mcp.NewRegistry(d.db)
+
+	// Plugin-MCP idle sweep (PR 4). Tools whose plugin has gone silent for
+	// DefaultIdleWindow fall away on the next tick. The tick period is half
+	// the window so a tool's eviction lands within at most one full window
+	// of its last heartbeat. d.done gates the loop so daemon shutdown
+	// terminates the goroutine promptly.
+	go func() {
+		ticker := time.NewTicker(mcp.DefaultIdleWindow / 2)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-d.done:
+				return
+			case <-ticker.C:
+				swept, err := pluginRegistry.SweepIdle(mcp.DefaultIdleWindow)
+				if err != nil {
+					slog.Error("mcp idle sweep", "err", err)
+					continue
+				}
+				for _, t := range swept {
+					slog.Info("mcp idle sweep", "scope", t.Scope, "name", t.Name, "last_seen", t.LastSeenAt.UTC().Format(time.RFC3339))
+				}
+			}
+		}
+	}()
+
 	// Start MCP HTTP server and KB indexer (only when KB is enabled in settings).
 	if cfg.KB.Enabled {
 		mcpSrv := mcp.New(d.db, cfg.KB.HTTPPort, cfg.KB.MetisVaultPath)
@@ -378,6 +410,7 @@ func (d *Daemon) Serve(sockPath string) error {
 		mcpSrv.SetClipboard(d.clipboard)
 		mcpSrv.SetScheduleManager(d.db, sch)
 		mcpSrv.SetMessageManager(d.db, runnerNudger{runner: d.runner})
+		mcpSrv.SetPluginRegistry(pluginRegistry)
 		d.mcpServer = mcpSrv
 		actualPort, err := mcpSrv.ListenAndServe()
 		if err != nil {
@@ -436,6 +469,7 @@ func (d *Daemon) Serve(sockPath string) error {
 			}, pushMgr)
 			apiSrv.SetScheduler(sch)
 			apiSrv.SetClipboard(d.clipboard)
+			apiSrv.SetMCPRegistry(pluginRegistry)
 			d.apiServer = apiSrv
 			apiPort, err := apiSrv.ListenAndServe(cfg.API.HTTPPort)
 			if err != nil {

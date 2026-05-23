@@ -242,5 +242,31 @@ func (d *DB) createTables() error {
 	d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_msg_in_reply_to ON task_messages(in_reply_to)`)               //nolint:errcheck
 	d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_msg_from_created ON task_messages(from_task_id, created_at)`) //nolint:errcheck
 
+	// Runtime-registered MCP tools (PR 4 of the plugin substrate). Each row is
+	// a single proxied tool registered by a plugin via POST /api/mcp/tools.
+	// The MCP server consults this table alongside the built-in tool list at
+	// tools/list and dispatches tools/call invocations by HTTP-POSTing to
+	// callback_url. Persistence here is what makes registrations survive a
+	// daemon restart per the contract — without it, every restart would
+	// silently drop every plugin tool until the plugin re-registered.
+	if _, err := d.conn.Exec(`
+		CREATE TABLE IF NOT EXISTS plugin_mcp_tools (
+			name          TEXT PRIMARY KEY,
+			scope         TEXT NOT NULL,
+			description   TEXT NOT NULL DEFAULT '',
+			input_schema  TEXT NOT NULL DEFAULT '{}',
+			callback_url  TEXT NOT NULL,
+			auth_header   TEXT NOT NULL DEFAULT '',
+			registered_at INTEGER NOT NULL,
+			last_seen_at  INTEGER NOT NULL DEFAULT 0
+		)
+	`); err != nil {
+		return fmt.Errorf("creating plugin_mcp_tools table: %w", err)
+	}
+	// Scope index for cascade-on-revoke and the per-scope sweep operations;
+	// last_seen_at index for the idle sweeper's range scan.
+	d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_plugin_mcp_tools_scope     ON plugin_mcp_tools(scope)`)        //nolint:errcheck
+	d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_plugin_mcp_tools_last_seen ON plugin_mcp_tools(last_seen_at)`) //nolint:errcheck
+
 	return nil
 }
