@@ -89,6 +89,70 @@ func TestDB_FindAPITokenByHash(t *testing.T) {
 	})
 }
 
+func TestDB_AddAPITokenWithScope(t *testing.T) {
+	t.Run("persists scope on insert", func(t *testing.T) {
+		d := testDB(t)
+		id, err := d.AddAPITokenWithScope("ludwig token", "ludwig", "hash-1", "1234")
+		testutil.NoError(t, err)
+		if id <= 0 {
+			t.Errorf("expected positive id, got %d", id)
+		}
+
+		got, err := d.FindAPITokenByHash("hash-1")
+		testutil.NoError(t, err)
+		if got == nil {
+			t.Fatal("expected non-nil token")
+		}
+		testutil.Equal(t, got.Scope, "ludwig")
+		testutil.Equal(t, got.Label, "ludwig token")
+	})
+
+	t.Run("blank scope behaves like device token", func(t *testing.T) {
+		d := testDB(t)
+		_, err := d.AddAPITokenWithScope("iPhone", "", "hash-2", "5678")
+		testutil.NoError(t, err)
+
+		got, err := d.FindAPITokenByHash("hash-2")
+		testutil.NoError(t, err)
+		if got == nil {
+			t.Fatal("expected non-nil token")
+		}
+		testutil.Equal(t, got.Scope, "")
+	})
+
+	t.Run("existing AddAPIToken inserts empty scope", func(t *testing.T) {
+		d := testDB(t)
+		_, err := d.AddAPIToken("device-x", "hash-3", "9999")
+		testutil.NoError(t, err)
+
+		got, err := d.FindAPITokenByHash("hash-3")
+		testutil.NoError(t, err)
+		if got == nil {
+			t.Fatal("expected non-nil token")
+		}
+		testutil.Equal(t, got.Scope, "")
+	})
+
+	t.Run("APITokens returns scope alongside other fields", func(t *testing.T) {
+		d := testDB(t)
+		_, err := d.AddAPITokenWithScope("plugin a", "a", "h-a", "0001")
+		testutil.NoError(t, err)
+		_, err = d.AddAPIToken("device b", "h-b", "0002")
+		testutil.NoError(t, err)
+
+		toks, err := d.APITokens()
+		testutil.NoError(t, err)
+		testutil.Equal(t, len(toks), 2)
+
+		byHash := map[string]APIToken{}
+		for _, t := range toks {
+			byHash[t.Hash] = t
+		}
+		testutil.Equal(t, byHash["h-a"].Scope, "a")
+		testutil.Equal(t, byHash["h-b"].Scope, "")
+	})
+}
+
 func TestDB_RevokeAPIToken(t *testing.T) {
 	t.Run("marks token revoked", func(t *testing.T) {
 		d := testDB(t)

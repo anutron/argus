@@ -216,6 +216,109 @@ func TestAuthMiddleware_DeviceToken(t *testing.T) {
 	})
 }
 
+func TestMintTokenWithScope(t *testing.T) {
+	d, err := db.OpenInMemory()
+	testutil.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+
+	plain, id, err := MintTokenWithScope(d, "ludwig token", "ludwig")
+	testutil.NoError(t, err)
+	testutil.Equal(t, len(plain), tokenBytes*2)
+	if id <= 0 {
+		t.Fatalf("expected positive id, got %d", id)
+	}
+
+	got, err := d.FindAPITokenByHash(hashToken(plain))
+	testutil.NoError(t, err)
+	if got == nil {
+		t.Fatal("expected token round-trip")
+	}
+	testutil.Equal(t, got.Scope, "ludwig")
+	testutil.Equal(t, got.Label, "ludwig token")
+}
+
+func TestAuthMiddleware_PluginScopeToken(t *testing.T) {
+	d, err := db.OpenInMemory()
+	testutil.NoError(t, err)
+	t.Cleanup(func() { _ = d.Close() })
+
+	master := "master-secret"
+	pluginPlain, _, err := MintTokenWithScope(d, "ludwig", "ludwig")
+	testutil.NoError(t, err)
+	devicePlain, _, err := MintToken(d, "iPhone")
+	testutil.NoError(t, err)
+
+	var seenAuth string
+	handler := authMiddleware(master, d, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("X-Argus-Auth")
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	t.Run("plugin token tags X-Argus-Auth=scope:<name>", func(t *testing.T) {
+		seenAuth = ""
+		req := httptest.NewRequest("GET", "/api/status", nil)
+		req.Header.Set("Authorization", "Bearer "+pluginPlain)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusOK)
+		testutil.Equal(t, seenAuth, "scope:ludwig")
+	})
+
+	t.Run("device token still tags X-Argus-Auth=device", func(t *testing.T) {
+		seenAuth = ""
+		req := httptest.NewRequest("GET", "/api/status", nil)
+		req.Header.Set("Authorization", "Bearer "+devicePlain)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusOK)
+		testutil.Equal(t, seenAuth, "device")
+	})
+
+	t.Run("master token still tags X-Argus-Auth=master", func(t *testing.T) {
+		seenAuth = ""
+		req := httptest.NewRequest("GET", "/api/status", nil)
+		req.Header.Set("Authorization", "Bearer "+master)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusOK)
+		testutil.Equal(t, seenAuth, "master")
+	})
+
+	t.Run("revoked plugin token rejected", func(t *testing.T) {
+		burnerPlain, burnerID, err := MintTokenWithScope(d, "burner", "burner-plugin")
+		testutil.NoError(t, err)
+		testutil.NoError(t, d.RevokeAPIToken(burnerID))
+
+		req := httptest.NewRequest("GET", "/api/status", nil)
+		req.Header.Set("Authorization", "Bearer "+burnerPlain)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusUnauthorized)
+	})
+
+	t.Run("requireMaster rejects plugin scope token", func(t *testing.T) {
+		// Plugin tokens must not be able to call master-only endpoints
+		// (e.g. minting more tokens, revoking other tokens). The scope
+		// tag must not be aliased to master.
+		var allowed bool
+		h := authMiddleware(master, d, nil, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if requireMaster(w, r) {
+				return
+			}
+			allowed = true
+			w.WriteHeader(http.StatusOK)
+		}))
+		req := httptest.NewRequest("POST", "/api/tokens", nil)
+		req.Header.Set("Authorization", "Bearer "+pluginPlain)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		testutil.Equal(t, w.Code, http.StatusForbidden)
+		if allowed {
+			t.Error("plugin token must not satisfy requireMaster")
+		}
+	})
+}
+
 func TestVAPIDOriginFromRequest(t *testing.T) {
 	cases := []struct {
 		name       string
