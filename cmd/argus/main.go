@@ -54,7 +54,51 @@ func main() {
 		}
 	}
 
+	// --remote URL [--token TOKEN] points the TUI at a remote argus host
+	// instead of the local daemon. Token is also picked up from ARGUS_TOKEN.
+	remoteURL, token := parseRemoteFlags(os.Args[1:])
+	if remoteURL != "" {
+		runRemoteTUI(remoteURL, token)
+		return
+	}
+
 	runTUI()
+}
+
+// parseRemoteFlags scans args for --remote URL and --token TOKEN. Returns
+// the two values (token defaults to $ARGUS_TOKEN when unset). Anything else
+// is ignored — this is the only flag pair the TUI recognises today, so a
+// custom mini-parser avoids pulling in the `flag` package and the noisy
+// "unknown flag" exits it would emit for daemon subcommands above.
+//
+// Bare `--remote` / `--token` with no following value writes a diagnostic
+// to stderr and leaves the value empty so the caller's required-arg check
+// errors out cleanly. tokenFromFlag tracks whether --token came from the
+// command line (visible in `ps aux`) vs ARGUS_TOKEN env so callers can
+// nudge the user toward the safer path.
+func parseRemoteFlags(args []string) (remoteURL, token string) {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--remote", "-remote":
+			if i+1 < len(args) {
+				remoteURL = args[i+1]
+				i++
+			} else {
+				fmt.Fprintln(os.Stderr, "warning: --remote requires a URL")
+			}
+		case "--token", "-token":
+			if i+1 < len(args) {
+				token = args[i+1]
+				i++
+			} else {
+				fmt.Fprintln(os.Stderr, "warning: --token requires a value")
+			}
+		}
+	}
+	if token == "" {
+		token = os.Getenv("ARGUS_TOKEN")
+	}
+	return remoteURL, token
 }
 
 func runTUI() {

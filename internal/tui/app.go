@@ -29,6 +29,7 @@ import (
 	"github.com/drn/argus/internal/tui/dagview"
 	"github.com/drn/argus/internal/tui/gitpanel"
 	"github.com/drn/argus/internal/tui/modal"
+	"github.com/drn/argus/internal/tui/store"
 	"github.com/drn/argus/internal/tui/taskview"
 	"github.com/drn/argus/internal/tui/terminal"
 	"github.com/drn/argus/internal/tui/widget"
@@ -71,7 +72,7 @@ const (
 // App is the top-level tview application shell.
 type App struct {
 	tapp   *tview.Application
-	db     *db.DB
+	db     store.Store
 	runner agent.SessionProvider
 	mu     sync.Mutex
 
@@ -243,7 +244,7 @@ type App struct {
 // in-process startup in cmd/argus/main.go) — they sweep InProgress → InReview
 // before the TUI sees the DB, so the TUI's tick reconciler only handles
 // "session exited while we were watching" (always Complete).
-func New(database *db.DB, runner agent.SessionProvider, daemonConnected bool) *App {
+func New(database store.Store, runner agent.SessionProvider, daemonConnected bool) *App {
 	// Use the terminal's default background instead of tview's hard-coded black.
 	tview.Styles.PrimitiveBackgroundColor = tcell.ColorDefault
 
@@ -319,12 +320,18 @@ func (a *App) buildUI() {
 	}
 	a.tasklist.OnArchive = func(t *model.Task) {
 		uxlog.Log("[tui] archive toggle: task %s (%s) archived=%v", t.ID, t.Name, t.Archived)
-		a.db.Update(t) //nolint:errcheck // best-effort; display is source of truth
-		// Drop the task's queued messages so a stale recipient doesn't sit
-		// on the unread cap. Mirrors the MCP/REST archive flows.
-		if t.Archived {
-			a.db.DeleteMessagesForTask(t.ID) //nolint:errcheck // best-effort cleanup
-		}
+		// Route through SetArchived (partial column update) so:
+		//  - local mode: *db.DB.SetArchived also runs DeleteMessagesForTask
+		//    in the same transaction.
+		//  - remote mode: apistore.SetArchived hits /api/tasks/{id}/archive
+		//    on the server, which triggers handleArchiveTask's setArchive →
+		//    DeleteMessagesForTask cleanup.
+		// Either path keeps the archived-rows / messages invariant honored.
+		// Going through Update + DeleteMessagesForTask here would silently
+		// orphan messages in remote mode because apistore can't expose the
+		// DeleteMessagesForTask endpoint and PUT /api/tasks/{id}/raw doesn't
+		// trigger server-side cleanup.
+		a.db.SetArchived(t.ID, t.Archived) //nolint:errcheck // best-effort; display is source of truth
 		a.refreshTasksAsync()
 	}
 	a.tasklist.OnPin = func(t *model.Task) {
@@ -2443,7 +2450,15 @@ func (a *App) handleNewTaskKey(event *tcell.EventKey) {
 		}
 
 		go func() {
-			created, _, err := agent.CreateAndStart(a.db, a.runner, input)
+			d, ok := a.db.(*db.DB)
+			if !ok {
+				a.tapp.QueueUpdateDraw(func() {
+					a.statusbar.ClearInfo()
+					a.statusbar.SetError("Create failed: agent.CreateAndStart requires local mode (use POST /api/tasks remotely)")
+				})
+				return
+			}
+			created, _, err := agent.CreateAndStart(d, a.runner, input)
 			if err != nil {
 				a.tapp.QueueUpdateDraw(func() {
 					a.statusbar.ClearInfo()
@@ -3008,7 +3023,15 @@ func (a *App) executeFork(source *model.Task, targetProject string) {
 			AfterStart:  func() { a.startGen.Add(1) },
 		}
 
-		created, _, err := agent.CreateAndStart(a.db, a.runner, input)
+		d, ok := a.db.(*db.DB)
+		if !ok {
+			a.tapp.QueueUpdateDraw(func() {
+				a.statusbar.SetError("Fork failed: requires local mode (use POST /api/tasks/{id}/fork remotely)")
+			})
+			uxlog.Log("[fork] not available in remote mode")
+			return
+		}
+		created, _, err := agent.CreateAndStart(d, a.runner, input)
 		if err != nil {
 			a.tapp.QueueUpdateDraw(func() {
 				a.statusbar.SetError("Fork failed: " + err.Error())
@@ -3273,7 +3296,15 @@ func (a *App) runScheduleNow(id string) {
 		return
 	}
 	go func() {
-		task, _, err := agent.CreateAndStart(a.db, a.runner, agent.CreateInput{
+		d, ok := a.db.(*db.DB)
+		if !ok {
+			s.LastError = "schedule fire requires local mode"
+			s.LastRunAt = now
+			_ = a.db.UpdateSchedule(s)
+			uxlog.Log("[settings] run schedule %s: not available in remote mode", id)
+			return
+		}
+		task, _, err := agent.CreateAndStart(d, a.runner, agent.CreateInput{
 			Name:    scheduler.FireName(s.Name, now),
 			Prompt:  s.Prompt,
 			Project: s.Project,
@@ -3478,7 +3509,12 @@ func (a *App) pruneCompletedTasks() {
 
 	// Phase 1 — DB delete + session stop + log removal. Run synchronously so
 	// the task list refresh below shows the pruned rows already gone.
-	preview, err := agent.PrunePrepare(a.db, agent.PruneOptions{
+	d, ok := a.db.(*db.DB)
+	if !ok {
+		a.statusbar.SetError("Prune-completed requires local mode (use POST /api/maintenance/prune-completed remotely)")
+		return
+	}
+	preview, err := agent.PrunePrepare(d, agent.PruneOptions{
 		WtRoot:   a.wtRoot,
 		Projects: projects,
 		ResolveRepoDir: func(t *model.Task) string {
