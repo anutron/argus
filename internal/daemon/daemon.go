@@ -22,6 +22,7 @@ import (
 	"github.com/drn/argus/internal/clipboard"
 	"github.com/drn/argus/internal/db"
 	"github.com/drn/argus/internal/depswatcher"
+	"github.com/drn/argus/internal/events"
 	"github.com/drn/argus/internal/inject"
 	injectcodex "github.com/drn/argus/internal/inject/codex"
 	"github.com/drn/argus/internal/kb"
@@ -163,6 +164,15 @@ func New(database *db.DB) *Daemon {
 		// agent that staged it is gone, the user shouldn't see a stale
 		// copy button after the session ends.
 		d.clipboard.Clear(taskID)
+
+		// Surface session lifecycle to plugins. Fired AFTER the runner has
+		// removed the session and after the DB transition has run so an
+		// SSE subscriber waking on this event sees a coherent snapshot.
+		events.Emit(model.EventTypeSessionExited, taskID, map[string]any{
+			"stopped":         stopped,
+			"err":             errStr,
+			"pending_restart": pending,
+		})
 	})
 
 	return d
@@ -437,6 +447,11 @@ func (d *Daemon) Serve(sockPath string) error {
 			apiSrv.SetScheduler(sch)
 			apiSrv.SetClipboard(d.clipboard)
 			d.apiServer = apiSrv
+			// Wire the events.Sink to the API server's event bus so emission
+			// sites (db, orch, runner, this file) feed /api/events/stream.
+			// Cleared on daemon shutdown so a torn-down apiSrv can't be
+			// invoked after the listener is closed.
+			events.SetSink(apiSrv)
 			apiPort, err := apiSrv.ListenAndServe(cfg.API.HTTPPort)
 			if err != nil {
 				slog.Error("api server error", "err", err)
@@ -580,6 +595,10 @@ func (d *Daemon) cleanup() {
 
 	// Shut down the API HTTP server if running.
 	if d.apiServer != nil {
+		// Detach the events sink first so emission sites racing with
+		// shutdown (e.g. db.Update from the post-exit transition) don't
+		// hit a closed event bus.
+		events.SetSink(nil)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := d.apiServer.Shutdown(ctx); err != nil {
