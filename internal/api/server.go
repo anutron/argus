@@ -38,6 +38,11 @@ type Server struct {
 	scheduler  ScheduleRunner   // optional; set by SetScheduler before ListenAndServe
 	clipboard  *clipboard.Store // optional; set by SetClipboard before ListenAndServe
 
+	// eventBus broadcasts model.Events to attached SSE subscribers. Server
+	// implements events.Sink (see Emit) so the daemon can wire the global
+	// events.SetSink to the same broker that serves /api/events/stream.
+	eventBus *eventBus
+
 	// stopCh is closed by Shutdown to signal background goroutines (idle
 	// watcher, push fan-out housekeeping) to terminate. Range over <-stopCh
 	// in select-loops to honour shutdown.
@@ -64,13 +69,17 @@ func New(database *db.DB, runner *agent.Runner, token string, creator TaskCreato
 		token:          token,
 		createTask:     creator,
 		push:           pushMgr,
+		eventBus:       newEventBus(),
 		stopCh:         make(chan struct{}),
 		lastResizeCols: make(map[string]uint16),
 	}
-	if pushMgr != nil {
-		// Start idle watcher in the background.
-		go srv.idleWatcher()
-	} else {
+	// Start the idle watcher unconditionally. It fires session.idle events
+	// for the plugin substrate (PR 2) every tick, and ALSO triggers Web
+	// Push notifications when pushMgr is non-nil. Splitting the two
+	// responsibilities keeps plugins observing idle transitions even on
+	// daemons that opted out of push.
+	go srv.idleWatcher()
+	if pushMgr == nil {
 		log.Printf("api: push disabled (no push manager provided)")
 	}
 	return srv
