@@ -911,6 +911,11 @@ func (s *Server) handleWriteInput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Audit tag for /input as a stable plugin-callable surface (PR 5 of the
+	// plugin substrate). `origin` mirrors the auth middleware's tagging —
+	// `master`, `device`, or `scope:<plugin>` — so writes from a plugin token
+	// are attributable post-hoc.
+	uxlog.Log("[api] input task=%s origin=%s bytes=%d", id, authOrigin(r), len(data))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "bytes": strconv.Itoa(len(data))})
 }
 
