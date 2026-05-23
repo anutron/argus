@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/drn/argus/internal/db"
+	"github.com/drn/argus/internal/events"
 	"github.com/drn/argus/internal/model"
 	"github.com/drn/argus/internal/uxlog"
 )
@@ -134,15 +135,17 @@ func newIdleWatcherState() *idleWatcherState {
 	}
 }
 
-// idleWatcher periodically polls all running sessions and fires a push when a
-// session transitions from non-idle to idle. Coarse but cheap (5s tick).
+// idleWatcher periodically polls all running sessions and fires
+//   - a session.idle event (plugin substrate, PR 2) on every busy→idle
+//     transition, regardless of whether push is enabled, and
+//   - a Web Push notification on the same transition when push is enabled
+//     AND the per-task cycle gate allows it (see shouldFireIdlePush).
+//
+// 5s tick is the coarsest cadence that still feels responsive in the PWA.
 // Exits when s.stopCh is closed (Server.Shutdown).
 //
 // Single-goroutine: state is only touched here so no mutex is needed.
 func (s *Server) idleWatcher() {
-	if s.push == nil {
-		return
-	}
 	state := newIdleWatcherState()
 	tick := time.NewTicker(5 * time.Second)
 	defer tick.Stop()
@@ -155,6 +158,21 @@ func (s *Server) idleWatcher() {
 		}
 		s.idleWatcherTick(state)
 	}
+}
+
+// idleTransitioned reports whether (id, isIdle) is a busy→idle transition
+// relative to the prior tick. Used for session.idle event emission, which
+// fires regardless of push state. Does NOT mutate the state — the state
+// update happens inside the subsequent shouldFireIdlePush call.
+//
+// Returns false on the first observation of a session (so a watcher that
+// starts with already-idle sessions doesn't fire spurious events on boot)
+// and on idle→idle / busy→busy steady states.
+func idleTransitioned(state *idleWatcherState, id string, isIdle bool) bool {
+	if !state.seenBefore[id] {
+		return false
+	}
+	return isIdle && !state.idleNow[id]
 }
 
 // shouldFireIdlePush applies one observation to the per-task state and
@@ -240,7 +258,21 @@ func (s *Server) idleWatcherTick(state *idleWatcherState) {
 		if sess := s.runner.Get(id); sess != nil {
 			lastInput = sess.LastInput()
 		}
+		// Emit session.idle on every busy→idle transition (plugin
+		// substrate, PR 2). Independent of push gating — plugins want
+		// fine-grained visibility, push wants throttling. The state
+		// mutation happens inside shouldFireIdlePush below, so the
+		// transition check must read state BEFORE that call.
+		if idleTransitioned(state, id, idleSet[id]) {
+			events.Emit(model.EventTypeSessionIdle, id, nil)
+		}
 		if !shouldFireIdlePush(state, id, idleSet[id], lastInput, now) {
+			continue
+		}
+		// Push path is gated independently — every other emission path in
+		// this loop is plugin-visible, but push.Notify needs an actual
+		// push manager.
+		if s.push == nil {
 			continue
 		}
 		task, err := s.db.Get(id)
