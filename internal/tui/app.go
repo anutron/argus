@@ -1870,6 +1870,13 @@ func tcellKeyToBytes(ev *tcell.EventKey) []byte {
 
 	switch ev.Key() {
 	case tcell.KeyEnter:
+		// Shift+Enter / Alt+Enter → newline-insert (ESC + CR). TUIs
+		// running in the PTY (ink-based Claude Code, blessed, textual)
+		// treat CR as submit and ESC+CR as "insert newline" — the same
+		// sequence iTerm2 / Kitty emit for Shift+Enter when configured.
+		if ev.Modifiers()&(tcell.ModShift|tcell.ModAlt) != 0 {
+			return []byte{0x1b, '\r'}
+		}
 		return []byte{'\r'}
 	case tcell.KeyTab:
 		return []byte{'\t'}
