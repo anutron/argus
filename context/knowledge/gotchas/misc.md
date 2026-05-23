@@ -4,6 +4,8 @@
 - **`taskColumns` is the canonical column list.** Update `taskColumns`, `scanTask`, `Add`, and `Update` in lockstep.
 - **Backend default config must be self-healing.** `fixupBackends()` runs on every `Open()` to repair outdated configs. Any `DefaultConfig()` change must be mirrored there. The `--permission-mode plan` fixup **appends** to the existing command (preserving user customizations) rather than replacing. All Claude fixup checks use `name == "claude"` (not `strings.Contains(command, "claude")`) to avoid matching user-created backends.
 - **Map lookups returning `*T` become non-nil interfaces.** `Get()` must check `if sess == nil { return nil }` before returning as interface.
+- **`task_meta` cascade is asymmetric with archive.** `Delete` and `SetArchived(id, true)` wipe every `task_meta` row for the task; `SetArchived(id, false)` does NOT restore meta (there is none — the cleanup already ran at archive time). Same shape as `task_messages`. New cross-task tables that survive a task's lifecycle MUST hook both `Delete` and the on-archive leg of `SetArchived` or they accumulate orphan rows on the soft-archive path.
+- **`ListMeta(taskID, namespace="")` returns every namespace.** The empty-namespace branch is deliberate (CLI introspection and the future Settings → Plugins audit view both want it); callers that need a single namespace must pass a non-empty string. The HTTP `GET /api/tasks/:id/meta?namespace=` query mirrors the same semantics — omitted means all.
 
 ## Go Patterns
 
