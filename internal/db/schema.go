@@ -234,5 +234,25 @@ func (d *DB) createTables() error {
 	d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_msg_in_reply_to ON task_messages(in_reply_to)`)               //nolint:errcheck
 	d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_msg_from_created ON task_messages(from_task_id, created_at)`) //nolint:errcheck
 
+	// Per-task sidecar metadata. Composite PK (task_id, namespace, key) keeps
+	// each plugin's keys isolated under its own namespace prefix; ON
+	// CONFLICT(...) DO UPDATE in SetMeta upserts so a write never has to
+	// branch on existence. Cascades wired through Delete / SetArchived rather
+	// than via FK so the soft-archive flow can scope cleanup without forcing
+	// an ON DELETE CASCADE that wouldn't fire on the soft path.
+	if _, err := d.conn.Exec(`
+		CREATE TABLE IF NOT EXISTS task_meta (
+			task_id     TEXT NOT NULL,
+			namespace   TEXT NOT NULL,
+			key         TEXT NOT NULL,
+			value       TEXT NOT NULL DEFAULT '',
+			updated_at  TEXT NOT NULL,
+			PRIMARY KEY (task_id, namespace, key)
+		)
+	`); err != nil {
+		return fmt.Errorf("creating task_meta table: %w", err)
+	}
+	d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_task_meta_namespace ON task_meta(task_id, namespace)`) //nolint:errcheck
+
 	return nil
 }

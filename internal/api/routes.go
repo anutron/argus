@@ -120,6 +120,14 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/tasks/{id}/inbox/ack", s.handleAckInbox)
 	mux.HandleFunc("POST /api/tasks/{id}/messages", s.handleSendMessage)
 
+	// Per-task sidecar metadata. PR 3 of the plugin substrate plan: a generic
+	// k/v store keyed by (task_id, namespace, key) so plugins can annotate
+	// tasks without piling new columns onto the tasks schema. Reads are
+	// open to device tokens; writes are master-only until PR 1 (scope tokens)
+	// lands and allows plugin-scoped writes into the plugin's own namespace.
+	mux.HandleFunc("GET /api/tasks/{id}/meta", s.handleGetMeta)
+	mux.HandleFunc("PUT /api/tasks/{id}/meta", s.handlePutMeta)
+
 	return mux
 }
 

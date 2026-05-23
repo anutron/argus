@@ -289,6 +289,9 @@ func (d *DB) SetArchived(id string, archived bool) error {
 			if _, err := tx.Exec(`DELETE FROM task_messages WHERE from_task_id=? OR to_task_id=?`, id, id); err != nil {
 				return err
 			}
+			if _, err := tx.Exec(`DELETE FROM task_meta WHERE task_id=?`, id); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
@@ -332,6 +335,9 @@ func (d *DB) Delete(id string) error {
 		// (we'd need a delete trigger that the archived rows wouldn't fire);
 		// this is the app-level equivalent.
 		if _, err := tx.Exec(`DELETE FROM task_messages WHERE from_task_id=? OR to_task_id=?`, id, id); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM task_meta WHERE task_id=?`, id); err != nil {
 			return err
 		}
 		return nil
