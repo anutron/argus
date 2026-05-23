@@ -94,9 +94,18 @@ func hashToken(plain string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// MintToken generates a new device token, persists its hash, and returns the
-// plaintext (only available at this moment).
+// MintToken generates a new device token (empty scope), persists its hash,
+// and returns the plaintext (only available at this moment).
 func MintToken(d *db.DB, label string) (string, int64, error) {
+	return MintTokenWithScope(d, label, "")
+}
+
+// MintTokenWithScope generates a new token bound to a scope, persists its
+// hash, and returns the plaintext (only available at this moment). An empty
+// scope mints a device token, equivalent to MintToken; any non-empty scope
+// marks the token as a plugin token, surfaced to the auth middleware as
+// `X-Argus-Auth: scope:<name>`.
+func MintTokenWithScope(d *db.DB, label, scope string) (string, int64, error) {
 	plain, err := GenerateToken()
 	if err != nil {
 		return "", 0, err
@@ -106,7 +115,7 @@ func MintToken(d *db.DB, label string) (string, int64, error) {
 	if len(plain) >= 4 {
 		last4 = plain[len(plain)-4:]
 	}
-	id, err := d.AddAPIToken(label, hash, last4)
+	id, err := d.AddAPITokenWithScope(label, scope, hash, last4)
 	if err != nil {
 		return "", 0, err
 	}
@@ -162,10 +171,18 @@ func authMiddleware(token string, database *db.DB, pm *push.Manager, next http.H
 			next.ServeHTTP(w, r)
 			return
 		}
-		// Try device tokens.
+		// Try device + plugin-scoped tokens.
 		if database != nil {
 			if t, _ := database.FindAPITokenByHash(hashToken(provided)); t != nil {
-				r.Header.Set("X-Argus-Auth", "device")
+				// Tokens with a non-empty scope are plugin tokens; tag the
+				// request with `scope:<name>` so downstream handlers can gate
+				// on the plugin's identity. Empty scope keeps today's
+				// `device` tag for the existing per-device flow.
+				if t.Scope != "" {
+					r.Header.Set("X-Argus-Auth", "scope:"+t.Scope)
+				} else {
+					r.Header.Set("X-Argus-Auth", "device")
+				}
 				r.Header.Set("X-Argus-Token-Id", strconv.FormatInt(t.ID, 10))
 				recordVAPIDOrigin(pm, r)
 				next.ServeHTTP(w, r)

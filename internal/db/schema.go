@@ -158,12 +158,17 @@ func (d *DB) createTables() error {
 
 	// Per-device API tokens (Phase 6). Master token in ~/.argus/api-token still
 	// works as admin and is the only credential that can mint new tokens.
+	// scope: empty for device tokens (the original use case); non-empty for
+	// plugin-scoped tokens. The auth middleware tags scoped tokens as
+	// `scope:<name>` instead of `device`, and downstream plugin endpoints gate
+	// on that tag.
 	if _, err := d.conn.Exec(`
 		CREATE TABLE IF NOT EXISTS api_tokens (
 			id          INTEGER PRIMARY KEY AUTOINCREMENT,
 			label       TEXT NOT NULL DEFAULT '',
 			hash        TEXT NOT NULL UNIQUE,
 			last4       TEXT NOT NULL DEFAULT '',
+			scope       TEXT NOT NULL DEFAULT '',
 			created_at  INTEGER NOT NULL,
 			last_used   INTEGER NOT NULL DEFAULT 0,
 			revoked_at  INTEGER NOT NULL DEFAULT 0
@@ -171,6 +176,9 @@ func (d *DB) createTables() error {
 	`); err != nil {
 		return fmt.Errorf("creating api_tokens table: %w", err)
 	}
+
+	// Idempotent ALTER for databases created before the scope column was added.
+	d.conn.Exec(`ALTER TABLE api_tokens ADD COLUMN scope TEXT NOT NULL DEFAULT ''`) //nolint:errcheck
 
 	// KB pending tasks table for vault task imports awaiting approval.
 	if _, err := d.conn.Exec(`
