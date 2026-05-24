@@ -1,3 +1,11 @@
+## Layout Registry & Streampane (PR 6)
+
+- **The default layout's descriptor is data-only — the rendered three-panel tree is still the hardcoded `tview.NewFlex` chain in `app.buildUI`.** `layout.WithDefaults` registers a `tasks-default` Layout (panels: `task-list`, `git`, `task-preview`, `task-detail`) so PR 7's Settings UI can list it next to user layouts. Touching the registry today does NOT change what renders — the JSON is held for future use.
+- **User layouts at `~/.argus/layouts/*.json` are parsed at boot but inert in PR 6.** Bad files are logged via uxlog (`[tui] layout load error: ...`) and skipped; one malformed layout cannot block boot. The first thing that actually surfaces them is PR 7's Layouts settings section. Subdirectories under `~/.argus/layouts/` are ignored — only top-level `.json` files load.
+- **`PTYSizeForRect(Rect)` trusts its input.** No host-term fallback, no Box-default rejection. Use it for per-pane PTY sizing in multi-pane layouts where the caller already has an authoritative rect. The legacy `computePTYSize()` (host-term → pane rect → 24x80 default) stays the right entry point for the agent page until multi-pane rendering lands.
+- **StreamPane drops keystrokes when the input-back channel is full.** The widget's `send()` does a non-blocking `select` — matching the PTY writer backpressure pattern elsewhere in argus. Tests that pre-fill `back` and assert no drop will hang; assert "no panic / no second send" instead.
+- **StreamPane `Touched()` increments only on non-empty chunks.** Empty chunks are a no-op so callers can poll the counter for damage without spurious redraws when the source feeds heartbeat-style zero-byte signals.
+
 ## Database Patterns
 
 - **New columns use `ALTER TABLE ... ADD COLUMN ... DEFAULT ''` after `CREATE TABLE IF NOT EXISTS`.** Error for duplicate column silently ignored.
@@ -102,6 +110,15 @@
 - **API server only starts during daemon `Serve()` init — toggling `api.enabled` in Settings requires a daemon restart.** `SetDaemonRestarting(false)` resets `apiBootRecorded` so the "(restart required)" hint re-anchors after any restart path (manual or auto).
 - **`requireMaster` is a literal `== "master"` string check on `X-Argus-Auth`.** Plugin-scoped tokens are tagged `scope:<name>` and device tokens `device`, so they fall through to the 403 branch automatically — but only because the comparison is exact. If anyone ever switches to a prefix or substring match (e.g. to allow `"master-foo"`), plugin tokens with scope `master*` would silently gain admin rights. Keep it `==`. See `internal/api/auth.go:requireMaster`.
 - **`argus token` CLI opens `~/.argus/data.sql` directly via `db.Open` — no daemon required.** Safe because the DB runs in WAL mode (`journal_mode(wal)` in `db.Open`), which lets a CLI writer coexist with the daemon's reader. If WAL ever gets disabled, the CLI must move behind a daemon RPC (`Daemon.MintToken`/etc) to avoid `database is locked`.
+
+## Plugin settings registry (PR 7)
+
+- **Plugin settings sections persist to SQLite (`plugin_settings` table), not just an in-memory registry.** Both the daemon (HTTP register/unregister) and the TUI (settings rail) need to see the same set; SQLite is the common substrate they already share. `api.Server.pluginSections` is a best-effort in-memory mirror for the daemon's own list paths — the DB is the source of truth, and `rehydratePluginSections` re-loads on every Server boot. If you ever add a code path that mutates the registry without going through the DB, the TUI's rail will silently miss the change.
+- **Section registration's scope comes from `X-Argus-Auth: scope:<name>` — NEVER from the request body.** The handler explicitly drops any body-level scope; plugins cannot register into another plugin's namespace. If you ever wire a "register on behalf of scope X" admin endpoint, gate it on `requireMaster` and route through `db.UpsertPluginSection` directly, not through `handleRegisterPluginSection`.
+- **`stream` section type is reserved but rejected.** `settings.ParseSection` returns `ErrInvalidType` for anything other than `form`. PR 7 explicitly defers stream content; when wiring it later, also update validation in `Registry.Register` AND `validateSection` (both call sites).
+- **Layouts rail entry hides when only `tasks-default` is registered.** `hasUserLayouts` excludes the default by name (`layout.DefaultLayoutName`); if you ever add another "built-in" layout, it must also be excluded explicitly or the rail entry surfaces on every fresh install.
+- **The TUI's plugin section UI is "draft locally, POST on save" — values are NOT persisted.** Each form field's draft lives only in `SettingsView.pluginValues` (in memory). On Refresh that map is pruned to live sections only (so an unregistered plugin's draft doesn't leak). If the user kills the TUI mid-edit, the draft is lost — by design. A persisted-draft column on `plugin_settings` is a future enhancement.
+- **Submit path centralizes egress in the daemon (`POST /api/plugins/settings/sections/{scope}/{title}/submit`) but the TUI also POSTs directly to the plugin's callback URL.** Local mode works through either route; `--remote` mode currently uses the direct path which can't reach a plugin behind the daemon's LAN. Wire `apiclient.SubmitPluginSection` and switch `App.submitPluginSection` over to the daemon proxy when remote-mode plugin sections become a real need.
 
 ## Quick Add Projects
 

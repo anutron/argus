@@ -16,6 +16,8 @@ import (
 	"github.com/drn/argus/internal/launchagent"
 	"github.com/drn/argus/internal/model"
 	"github.com/drn/argus/internal/spinner"
+	"github.com/drn/argus/internal/tui/layout"
+	pluginsettings "github.com/drn/argus/internal/tui/settings"
 	"github.com/drn/argus/internal/tui/store"
 	"github.com/drn/argus/internal/tui/theme"
 	"github.com/drn/argus/internal/tui/widget"
@@ -46,9 +48,18 @@ const (
 	srSourcePath
 	srSchedule
 	srAutoStart
+	srLayout
+	srPluginField
+	srPluginSubmit
 )
 
 // settingsCategory groups related settings rows into a left-rail entry.
+//
+// Built-in categories are identified by the typed constants below; plugin-
+// registered sections live under [catPlugin] with the section's (scope, title)
+// stored in [SettingsView.activePluginSection]. The split exists because
+// plugin sections come and go at runtime — encoding them as enum values
+// would mean the enum changes shape on every register/unregister.
 type settingsCategory int
 
 const (
@@ -61,6 +72,16 @@ const (
 	catRemoteAPI
 	catAppearance
 	catLogs
+	// catLayouts is the built-in "Layouts" section. The rail entry hides
+	// when only the default layout (`tasks-default`) is registered — i.e.
+	// when the user has no user-supplied layouts in ~/.argus/layouts/ —
+	// per the substrate plan's "hide on empty" requirement.
+	catLayouts
+	// catPlugin is a sentinel: the rail can hold any number of plugin
+	// sections, each addressed by [pluginKey{scope, title}] rather than by
+	// a fixed enum value. See [SettingsView.pluginKeyForCategory] for the
+	// resolution from active category back to the registered section.
+	catPlugin
 )
 
 // Label returns the human-readable name shown in the left rail.
@@ -84,14 +105,24 @@ func (c settingsCategory) Label() string {
 		return "Appearance"
 	case catLogs:
 		return "Logs"
+	case catLayouts:
+		return "Layouts"
+	case catPlugin:
+		// Plugin sections render their own title (the registered Section's
+		// Title); the catPlugin sentinel itself has no rail-rendered label.
+		return ""
 	}
 	return "?"
 }
 
-// allCategories is the fixed left-rail order.
-var allCategories = []settingsCategory{
+// builtinCategories is the fixed top portion of the rail. Plugins, when
+// present, render after a "Plugins" header below this list. catLayouts is
+// included here because it's a built-in even though it hides on empty —
+// hide-on-empty is enforced in [SettingsView.railEntries] rather than by
+// removing the enum entry.
+var builtinCategories = []settingsCategory{
 	catSystem, catSandbox, catProjects, catBackends, catSchedules,
-	catKnowledgeBase, catRemoteAPI, catAppearance, catLogs,
+	catKnowledgeBase, catRemoteAPI, catAppearance, catLogs, catLayouts,
 }
 
 // settingsFocus is which sub-panel currently owns input within the settings view.
@@ -129,14 +160,25 @@ type settingsRow struct {
 	key   string // project/backend name for lookup
 }
 
+// pluginKey identifies a registered plugin section by its (scope, title)
+// composite. Stored on [SettingsView.activePlugin] when [SettingsView.category]
+// is [catPlugin] so the rail and pane renderers know which section's data to
+// pull from the cached `pluginSections` list. Empty for any non-plugin
+// category; resetting category to a built-in clears the field defensively.
+type pluginKey struct {
+	scope string
+	title string
+}
+
 // SettingsView is the tcell settings tab with two panels: a left rail of
 // category names and a right pane that renders the active category's rows
 // and the detail of the selected row.
 type SettingsView struct {
 	*tview.Box
 
-	category settingsCategory // active category in the left rail
-	focus    settingsFocus    // which sub-panel owns input
+	category     settingsCategory // active category in the left rail
+	activePlugin pluginKey        // identifies the plugin section when category == catPlugin
+	focus        settingsFocus    // which sub-panel owns input
 
 	rows      []settingsRow // rows for the active category only (no section headers)
 	cursor    int
@@ -203,6 +245,33 @@ type SettingsView struct {
 	updateStatus    string // last-result status line shown in detail panel
 	updateOutput    string // last go-install output (for detail panel)
 
+	// Layouts. Sourced from [App.layouts]; cached snapshot avoids racing the
+	// layout registry's RWMutex on every Draw. SetLayouts is the App's
+	// injection point.
+	layouts []layout.Layout
+
+	// Plugin settings sections. Mirrors the daemon's `plugin_settings` table
+	// via store.Store.PluginSections (the same path local and remote modes
+	// share). pluginValues holds the user-entered draft per (scope, title,
+	// field key) — initialized from the field defaults on first focus,
+	// updated by inline edits, POSTed on Save.
+	pluginSections []pluginsettings.Section
+	pluginValues   map[pluginKey]map[string]any
+
+	// Inline edit state for plugin-section string/int fields. activeEditKey
+	// is the field key (empty when not editing); editPluginBuf holds the
+	// in-progress text.
+	activeEditKey string
+	editPluginBuf string
+
+	// pluginSubmit is the test-friendly hook for posting plugin-section
+	// values. Defaults to a no-op when nil; the App wires it to a function
+	// that hits the local daemon's submit endpoint.
+	pluginSubmit func(scope, title string, values map[string]any) error
+	// pluginSubmitStatus is the last status line rendered in the Submit
+	// detail panel — "Saved", an error message, or empty.
+	pluginSubmitStatus map[pluginKey]string
+
 	// Callbacks.
 	OnRestartDaemon          func()
 	OnUpdateArgus            func()                        // triggered by the "Update Argus" row
@@ -252,12 +321,30 @@ type statusCounts struct {
 // immediately usable — pressing Left moves to the category rail.
 func NewSettingsView(database store.Store) *SettingsView {
 	return &SettingsView{
-		Box:        tview.NewBox(),
-		taskCounts: make(map[string]statusCounts),
-		database:   database,
-		category:   catSystem,
-		focus:      focusPane,
+		Box:                tview.NewBox(),
+		taskCounts:         make(map[string]statusCounts),
+		database:           database,
+		category:           catSystem,
+		focus:              focusPane,
+		pluginValues:       make(map[pluginKey]map[string]any),
+		pluginSubmitStatus: make(map[pluginKey]string),
 	}
+}
+
+// SetLayouts updates the cached list of registered layouts. The app calls
+// this on the tick goroutine — after a [LoadLayoutsDir] call or any boot
+// rehydrate — so the Layouts rail entry's hide-on-empty condition
+// reflects the live registry. Passing nil clears the cache.
+func (sv *SettingsView) SetLayouts(layouts []layout.Layout) {
+	sv.layouts = layouts
+}
+
+// SetPluginSubmit wires the hook that posts plugin-section values back to
+// the daemon's submit endpoint (which forwards to the plugin's callback
+// URL). Tests inject a stub; production binds to a closure over the local
+// /api/plugins/settings/sections/{scope}/{title}/submit route.
+func (sv *SettingsView) SetPluginSubmit(fn func(scope, title string, values map[string]any) error) {
+	sv.pluginSubmit = fn
 }
 
 // Refresh reloads all settings data from the database.
@@ -357,7 +444,41 @@ func (sv *SettingsView) Refresh() {
 	}
 	sv.schedules = schedules
 
+	// Plugin settings sections. Refresh pulls from the same store interface
+	// for both local and remote modes — *db.DB hits SQLite directly, the
+	// apistore proxies to GET /api/plugins/settings/sections.
+	pluginSecs, err := sv.database.PluginSections()
+	if err != nil {
+		uxlog.Log("[settings] failed to load plugin sections: %v", err)
+	}
+	sv.pluginSections = pluginSecs
+	sv.prunePluginValues()
+
 	sv.rebuildRows()
+}
+
+// prunePluginValues drops draft entries whose plugin no longer appears in
+// the live section list. Called on every Refresh so an unregistered plugin
+// doesn't leak its draft values forever, and the Refresh-resync after an
+// unregister surfaces an empty form if the plugin re-registers later.
+func (sv *SettingsView) prunePluginValues() {
+	if len(sv.pluginValues) == 0 {
+		return
+	}
+	live := make(map[pluginKey]bool, len(sv.pluginSections))
+	for _, sec := range sv.pluginSections {
+		live[pluginKey{scope: sec.Scope, title: sec.Title}] = true
+	}
+	for k := range sv.pluginValues {
+		if !live[k] {
+			delete(sv.pluginValues, k)
+		}
+	}
+	for k := range sv.pluginSubmitStatus {
+		if !live[k] {
+			delete(sv.pluginSubmitStatus, k)
+		}
+	}
 }
 
 func (sv *SettingsView) SetDaemonConnected(connected bool) {
@@ -386,6 +507,178 @@ func (sv *SettingsView) setTasks(tasks []*model.Task) {
 		}
 		sv.taskCounts[t.Project] = c
 	}
+}
+
+// railEntryKind discriminates the rail entry types in [SettingsView.railEntries].
+// Built-in and plugin entries are selectable; the separator and plugins-header
+// rows are rendered for visual grouping but never receive cursor focus.
+type railEntryKind int
+
+const (
+	railBuiltin railEntryKind = iota
+	railSeparator
+	railPluginsHeader
+	railPlugin
+)
+
+// railEntry is one row in the rail's dynamic list. Built using
+// [SettingsView.railEntries] every frame so plugin register/unregister and
+// layout hide-on-empty take effect without state plumbing.
+type railEntry struct {
+	kind railEntryKind
+	cat  settingsCategory // populated for railBuiltin and railPlugin
+	key  pluginKey        // populated for railPlugin
+	// label is the rail-rendered text. Empty for separator (renders blank
+	// line). Built-in entries always use [settingsCategory.Label]; plugin
+	// entries use the registered [pluginsettings.Section.Title].
+	label string
+}
+
+// selectable reports whether the cursor can land on this entry. Used by
+// keyboard navigation and click hit-testing to skip the separator and
+// "Plugins" header.
+func (e railEntry) selectable() bool {
+	switch e.kind {
+	case railBuiltin, railPlugin:
+		return true
+	}
+	return false
+}
+
+// railEntries returns the live rail list. Order matches the substrate
+// plan's "Section ordering" rule:
+//
+//  1. Built-in categories, in their fixed order.
+//  2. The Layouts entry is filtered out when no non-default layout is
+//     registered (hide-on-empty).
+//  3. Blank separator + "Plugins" header, both hidden when no plugin
+//     sections are registered.
+//  4. Plugin sections sorted alphabetically by title (ties broken by scope).
+//
+// This is the single source of truth for both rail rendering and cursor
+// navigation — keep render/handle code consuming this slice rather than
+// re-deriving the ordering.
+func (sv *SettingsView) railEntries() []railEntry {
+	out := make([]railEntry, 0, len(builtinCategories)+len(sv.pluginSections)+2)
+	for _, c := range builtinCategories {
+		// Hide Layouts when the user has no non-default layouts. The plan
+		// requires hide-on-empty for this section explicitly.
+		if c == catLayouts && !sv.hasUserLayouts() {
+			continue
+		}
+		out = append(out, railEntry{kind: railBuiltin, cat: c, label: c.Label()})
+	}
+	if len(sv.pluginSections) > 0 {
+		out = append(out, railEntry{kind: railSeparator})
+		out = append(out, railEntry{kind: railPluginsHeader, label: "Plugins"})
+		// Plugin sections are kept pre-sorted by the registry / DB list, but
+		// we re-sort defensively so the rail never assumes the upstream is
+		// ordered.
+		secs := make([]pluginsettings.Section, len(sv.pluginSections))
+		copy(secs, sv.pluginSections)
+		sort.Slice(secs, func(i, j int) bool {
+			if secs[i].Title != secs[j].Title {
+				return secs[i].Title < secs[j].Title
+			}
+			return secs[i].Scope < secs[j].Scope
+		})
+		for _, sec := range secs {
+			out = append(out, railEntry{
+				kind:  railPlugin,
+				cat:   catPlugin,
+				key:   pluginKey{scope: sec.Scope, title: sec.Title},
+				label: sec.Title,
+			})
+		}
+	}
+	return out
+}
+
+// hasUserLayouts reports whether the layout registry contains any layouts
+// beyond the built-in default. The plan ties the Layouts rail entry's
+// visibility to this — when the user hasn't dropped any *.json into
+// ~/.argus/layouts/, the section disappears entirely.
+func (sv *SettingsView) hasUserLayouts() bool {
+	for _, l := range sv.layouts {
+		if l.Name != layout.DefaultLayoutName {
+			return true
+		}
+	}
+	return false
+}
+
+// activeRailIdx returns the index of the rail entry matching the current
+// category (and active plugin, when category == catPlugin). Returns -1 when
+// no rail entry corresponds — possible after a plugin unregisters mid-
+// navigation, in which case callers should reset to catSystem.
+func (sv *SettingsView) activeRailIdx(entries []railEntry) int {
+	for i, e := range entries {
+		if e.cat != sv.category {
+			continue
+		}
+		if e.kind == railPlugin {
+			if e.key == sv.activePlugin {
+				return i
+			}
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
+// userLayouts returns just the non-default layouts. Stable order
+// (alphabetical by Name) so the Layouts rows render deterministically.
+func (sv *SettingsView) userLayouts() []layout.Layout {
+	out := make([]layout.Layout, 0, len(sv.layouts))
+	for _, l := range sv.layouts {
+		if l.Name == layout.DefaultLayoutName {
+			continue
+		}
+		out = append(out, l)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// activePluginSection returns the plugin section the cursor is currently
+// on (nil when category is not catPlugin or the section has been
+// unregistered). Used by rendering and key handling.
+func (sv *SettingsView) activePluginSection() *pluginsettings.Section {
+	if sv.category != catPlugin {
+		return nil
+	}
+	for i := range sv.pluginSections {
+		sec := &sv.pluginSections[i]
+		if sec.Scope == sv.activePlugin.scope && sec.Title == sv.activePlugin.title {
+			return sec
+		}
+	}
+	return nil
+}
+
+// pluginValueFor returns the user's current draft value for (key, title).
+// Falls back to the field's default when the user hasn't touched the field
+// yet — values map only stores diff-from-default rows so a redundant
+// keystroke doesn't bloat the registry.
+func (sv *SettingsView) pluginValueFor(sec *pluginsettings.Section, field *pluginsettings.FormField) any {
+	if values, ok := sv.pluginValues[pluginKey{scope: sec.Scope, title: sec.Title}]; ok {
+		if v, ok := values[field.Key]; ok {
+			return v
+		}
+	}
+	return field.DefaultValue()
+}
+
+// setPluginValue stores a draft value for (scope, title, key). Creating the
+// per-section map on first write keeps the values map sparse (no entry
+// until a field is touched).
+func (sv *SettingsView) setPluginValue(sec *pluginsettings.Section, key string, v any) {
+	k := pluginKey{scope: sec.Scope, title: sec.Title}
+	if sv.pluginValues[k] == nil {
+		sv.pluginValues[k] = make(map[string]any)
+	}
+	sv.pluginValues[k][key] = v
 }
 
 // rebuildRows rebuilds sv.rows for the active category only. The left rail
@@ -515,6 +808,36 @@ func (sv *SettingsView) rebuildRows() {
 	case catLogs:
 		sv.rows = append(sv.rows, settingsRow{kind: srLogs, label: "UX Log", key: "ux"})
 		sv.rows = append(sv.rows, settingsRow{kind: srLogs, label: "Daemon Log", key: "daemon"})
+
+	case catLayouts:
+		// The rail entry hides when the user has no non-default layouts, so
+		// reaching this arm always means at least one user layout exists.
+		// Listing the user layouts as rows lets the cursor walk through them
+		// to inspect each layout's title and JSON shape; activation (binding
+		// a hotkey / making one the boot default) is intentionally out of
+		// scope for PR 7 — the Layouts row in the rail is read-only here so
+		// PR 7's settings refactor stays bounded.
+		for _, l := range sv.userLayouts() {
+			sv.rows = append(sv.rows, settingsRow{kind: srLayout, label: l.Name, key: l.Name})
+		}
+
+	case catPlugin:
+		// One row per registered form field, plus a Save row that POSTs the
+		// current draft values back to the daemon (which proxies to the
+		// plugin's callback URL).
+		sec := sv.activePluginSection()
+		if sec == nil || sec.Spec == nil {
+			break
+		}
+		for i := range sec.Spec.Fields {
+			f := &sec.Spec.Fields[i]
+			sv.rows = append(sv.rows, settingsRow{
+				kind:  srPluginField,
+				label: pluginFieldRowLabel(sv, sec, f),
+				key:   f.Key,
+			})
+		}
+		sv.rows = append(sv.rows, settingsRow{kind: srPluginSubmit, label: "Save", key: "_submit"})
 	}
 
 	// Clamp cursor.
@@ -547,13 +870,16 @@ func (sv *SettingsView) PasteHandler() func(pastedText string, setFocus func(p t
 		} else if sv.editingSource {
 			sv.editSourceBuf += pastedText
 			sv.rebuildRows()
+		} else if sv.activeEditKey != "" {
+			sv.editPluginBuf += pastedText
+			sv.rebuildRows()
 		}
 	})
 }
 
 // IsEditing returns true when the user is inline-editing any field.
 func (sv *SettingsView) IsEditing() bool {
-	return sv.editingVault != "" || sv.editingSource
+	return sv.editingVault != "" || sv.editingSource || sv.activeEditKey != ""
 }
 
 // SelectedProject returns the project at the cursor, or nil.
@@ -593,6 +919,9 @@ func (sv *SettingsView) HandleKey(ev *tcell.EventKey) bool {
 	if sv.editingSource {
 		return sv.handleEditSourceKey(ev)
 	}
+	if sv.activeEditKey != "" {
+		return sv.handlePluginFieldEditKey(ev)
+	}
 	switch ev.Key() {
 	case tcell.KeyUp:
 		if sv.focus == focusRail {
@@ -617,6 +946,10 @@ func (sv *SettingsView) HandleKey(ev *tcell.EventKey) bool {
 		case srVaultPath:
 			sv.cycleVaultPath(-1)
 			return true
+		case srPluginField:
+			if sv.handlePluginCycle(-1) {
+				return true
+			}
 		}
 		sv.setFocus(focusRail)
 		return true
@@ -632,6 +965,10 @@ func (sv *SettingsView) HandleKey(ev *tcell.EventKey) bool {
 		case srVaultPath:
 			sv.cycleVaultPath(1)
 			return true
+		case srPluginField:
+			if sv.handlePluginCycle(1) {
+				return true
+			}
 		}
 		return false
 	case tcell.KeyEnter:
@@ -770,15 +1107,20 @@ func (sv *SettingsView) HandleClick(mx, my int) {
 	railW := computeRailW(width)
 
 	if mx < x+railW {
-		// Click landed in the rail — pick the category at that row.
+		// Click landed in the rail — pick the category at that row. Skip
+		// non-selectable rows (separator + Plugins header).
 		ix, iy := x+1, y+1
 		ih := height - 2
 		row := my - iy
 		if row < 0 || row >= ih || mx < ix {
 			return
 		}
-		if row < len(allCategories) {
-			sv.setCategory(allCategories[row])
+		entries := sv.railEntries()
+		if row < len(entries) {
+			e := entries[row]
+			if e.selectable() {
+				sv.setActiveFromRail(e)
+			}
 		}
 		sv.setFocus(focusRail)
 		return
@@ -786,6 +1128,36 @@ func (sv *SettingsView) HandleClick(mx, my int) {
 
 	// Pane click — move focus into the pane.
 	sv.setFocus(focusPane)
+}
+
+// setActiveFromRail moves the cursor to the rail entry e. For built-in
+// entries this is equivalent to setCategory; for plugin entries it also
+// records the plugin's (scope, title) so the pane renderer knows which
+// section's draft values to render.
+func (sv *SettingsView) setActiveFromRail(e railEntry) {
+	switch e.kind {
+	case railBuiltin:
+		sv.activePlugin = pluginKey{}
+		sv.setCategory(e.cat)
+	case railPlugin:
+		// Switching plugin sections is also a category change (catPlugin)
+		// but the activePlugin needs to update first so setCategory's
+		// rebuildRows() picks the right plugin.
+		if sv.category == catPlugin && sv.activePlugin == e.key {
+			return
+		}
+		sv.activePlugin = e.key
+		// Force a category change notification even when the old category
+		// was already catPlugin (different plugin section, same enum).
+		oldCat := sv.category
+		sv.category = catPlugin
+		sv.cursor = 0
+		sv.scrollOff = 0
+		sv.rebuildRows()
+		if oldCat != catPlugin {
+			sv.notifyBranchChange()
+		}
+	}
 }
 
 func (sv *SettingsView) moveCursor(dir int) {
@@ -808,29 +1180,38 @@ func (sv *SettingsView) moveCursor(dir int) {
 	}
 }
 
-// moveCategory shifts the active category. Returns true if the category
-// actually changed (so the caller can fire OnBranchChange).
+// moveCategory shifts the active rail entry in dir's direction, skipping
+// over non-selectable rows (separator + Plugins header). Returns true if
+// the cursor actually moved (so the caller can fire OnBranchChange).
 func (sv *SettingsView) moveCategory(dir int) bool {
-	idx := -1
-	for i, c := range allCategories {
-		if c == sv.category {
-			idx = i
-			break
-		}
-	}
+	entries := sv.railEntries()
+	idx := sv.activeRailIdx(entries)
 	if idx < 0 {
-		idx = 0
+		// Active category no longer present (e.g., the plugin section was
+		// unregistered). Reset to System so the rail isn't in a stuck state.
+		sv.activePlugin = pluginKey{}
+		sv.setCategory(catSystem)
+		return true
 	}
+	// Walk until we find a selectable entry. Returns false (bubbles up to
+	// global hotkeys) when no further selectable entry exists in dir.
 	next := idx + dir
-	if next < 0 || next >= len(allCategories) {
-		return false
+	for next >= 0 && next < len(entries) {
+		if entries[next].selectable() {
+			sv.setActiveFromRail(entries[next])
+			return true
+		}
+		next += dir
 	}
-	sv.setCategory(allCategories[next])
-	return true
+	return false
 }
 
 // setCategory switches the active category, resets cursor, and rebuilds rows.
 // Fires OnBranchChange when the category actually changes.
+//
+// Plugin sections (catPlugin) must be selected through setActiveFromRail so
+// activePlugin is updated alongside category. Calling setCategory(catPlugin)
+// directly is intentionally a no-op-on-rebuild when activePlugin is unset.
 func (sv *SettingsView) setCategory(c settingsCategory) {
 	if sv.category == c {
 		return
@@ -841,6 +1222,9 @@ func (sv *SettingsView) setCategory(c settingsCategory) {
 	sv.logScrollOff = 0
 	sv.logLines = nil
 	sv.logKey = ""
+	if c != catPlugin {
+		sv.activePlugin = pluginKey{}
+	}
 	sv.rebuildRows()
 	sv.notifyBranchChange()
 }
@@ -937,6 +1321,10 @@ func (sv *SettingsView) handleEnter() bool {
 	case srAutoStart:
 		sv.toggleAutoStart()
 		return true
+	case srPluginField:
+		return sv.handlePluginFieldEnter()
+	case srPluginSubmit:
+		return sv.handlePluginSubmit()
 	}
 	return false
 }
@@ -1270,7 +1658,9 @@ func (sv *SettingsView) Draw(screen tcell.Screen) {
 }
 
 // renderRail draws the left category list. The border is highlighted when the
-// rail owns focus.
+// rail owns focus. The rail is built from [SettingsView.railEntries] so
+// plugin sections and the Layouts hide-on-empty rule render consistently
+// with the navigation/click handlers.
 func (sv *SettingsView) renderRail(screen tcell.Screen, x, y, w, h int) {
 	border := theme.StyleBorder
 	if sv.focus == focusRail {
@@ -1283,21 +1673,44 @@ func (sv *SettingsView) renderRail(screen tcell.Screen, x, y, w, h int) {
 	}
 	widget.FillArea(screen, ix, iy, iw, ih, ' ', tcell.StyleDefault)
 
-	for i, c := range allCategories {
+	entries := sv.railEntries()
+	for i, e := range entries {
 		if i >= ih {
 			break
 		}
-		label := c.Label()
+		switch e.kind {
+		case railSeparator:
+			// A blank line is enough; no styling. The "Plugins" header
+			// on the next row carries the visual cue.
+			continue
+		case railPluginsHeader:
+			widget.DrawText(screen, ix, iy+i, iw, truncRunes("  "+e.label, iw), theme.StyleDimmed)
+			continue
+		}
 		style := theme.StyleDimmed
-		if c == sv.category {
+		active := sv.matchesActiveRail(e)
+		if active {
 			style = tcell.StyleDefault.Foreground(theme.ColorSelected).Bold(true)
 		}
 		prefix := "  "
-		if c == sv.category && sv.focus == focusRail {
+		if active && sv.focus == focusRail {
 			prefix = "▸ "
 		}
-		widget.DrawText(screen, ix, iy+i, iw, truncRunes(prefix+label, iw), style)
+		widget.DrawText(screen, ix, iy+i, iw, truncRunes(prefix+e.label, iw), style)
 	}
+}
+
+// matchesActiveRail is true when entry e is the currently-active rail row.
+// For plugin entries the pluginKey must also match — two plugins with the
+// same title (but different scopes) are distinct rail entries.
+func (sv *SettingsView) matchesActiveRail(e railEntry) bool {
+	if e.cat != sv.category {
+		return false
+	}
+	if e.kind == railPlugin {
+		return e.key == sv.activePlugin
+	}
+	return e.kind == railBuiltin
 }
 
 // renderPane draws the right pane for the active category. Layout:
@@ -1442,6 +1855,12 @@ func (sv *SettingsView) renderRowDetail(screen tcell.Screen, x, y, w, h int, row
 		sv.renderScheduleDetail(screen, x, y, w, h)
 	case srAutoStart:
 		sv.renderAutoStartDetail(screen, x, y, w, h)
+	case srLayout:
+		sv.renderLayoutDetail(screen, x, y, w, h, row)
+	case srPluginField:
+		sv.renderPluginFieldDetail(screen, x, y, w, h, row)
+	case srPluginSubmit:
+		sv.renderPluginSubmitDetail(screen, x, y, w, h)
 	}
 }
 

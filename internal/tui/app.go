@@ -1,7 +1,11 @@
 package tui
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,6 +32,7 @@ import (
 	"github.com/drn/argus/internal/scheduler"
 	"github.com/drn/argus/internal/tui/dagview"
 	"github.com/drn/argus/internal/tui/gitpanel"
+	"github.com/drn/argus/internal/tui/layout"
 	"github.com/drn/argus/internal/tui/modal"
 	"github.com/drn/argus/internal/tui/store"
 	"github.com/drn/argus/internal/tui/taskview"
@@ -146,6 +151,11 @@ type App struct {
 	taskPage  *taskview.TaskPage
 	agentPage *tview.Flex
 	pages     *tview.Pages
+
+	// layouts holds named layout descriptors. The built-in `tasks-default`
+	// is registered at boot; user layouts loaded from ~/.argus/layouts/
+	// are held but not yet rendered (PR 7 wires them through Settings).
+	layouts *layout.Registry
 
 	// State
 	mode               viewMode
@@ -267,6 +277,7 @@ func New(database store.Store, runner agent.SessionProvider, daemonConnected boo
 		lastAttachCols:         make(map[string]uint16),
 		wtRoot:                 filepath.Join(db.DataDir(), "worktrees"),
 		clipboardWriter:        pbcopyWriter,
+		layouts:                layout.WithDefaults(layout.NewRegistry()),
 	}
 	if dc, ok := runner.(*dclient.Client); ok {
 		app.daemonClient = dc
@@ -296,6 +307,8 @@ func New(database store.Store, runner agent.SessionProvider, daemonConnected boo
 	app.settings.OnDeleteSchedule = func(id string) { app.deleteSchedule(id) }
 	app.settings.OnRunSchedule = func(id string) { app.runScheduleNow(id) }
 	app.settings.OnBranchChange = func() { app.forceRedraw("settings branch changed") }
+	app.settings.SetLayouts(app.layouts.List())
+	app.settings.SetPluginSubmit(app.submitPluginSection)
 	app.settingsPage = NewSettingsPage(app.settings)
 
 	cfg := database.Config()
@@ -475,6 +488,81 @@ func (a *App) afterDraw(screen tcell.Screen) {
 // TUI's. Must be called before Run() — the flag is consumed there.
 func (a *App) SetDaemonStale(stale bool) {
 	a.daemonStale = stale
+}
+
+// Layouts exposes the layout registry for callers that need to inspect or
+// register layouts (PR 7 wires this into Settings).
+func (a *App) Layouts() *layout.Registry {
+	return a.layouts
+}
+
+// LoadLayoutsDir scans dir for *.json layout files and registers each valid
+// one. Missing dirs are no-ops. Parse / register errors are logged via
+// uxlog and ignored so a single malformed user layout cannot prevent boot.
+//
+// Wired by cmd/argus/main.go at startup against ~/.argus/layouts/. The
+// settings view is refreshed at the end so the Layouts rail entry's
+// hide-on-empty state reflects the post-load registry.
+func (a *App) LoadLayoutsDir(dir string) {
+	res := a.layouts.LoadDir(dir)
+	if res.Loaded > 0 {
+		uxlog.Log("[tui] loaded %d layout(s) from %s", res.Loaded, dir)
+	}
+	for _, err := range res.Errors {
+		uxlog.Log("[tui] layout load error: %v", err)
+	}
+	if a.settings != nil {
+		a.settings.SetLayouts(a.layouts.List())
+	}
+}
+
+// submitPluginSection is the production submit hook wired into the
+// SettingsView at App construction. It looks up the section's callback URL
+// from the live PluginSections list and POSTs the user-entered values map
+// there.
+//
+// Two-process limitation: in --remote mode the TUI is on a host that may
+// not reach the plugin's callback URL (the plugin server is typically on
+// the same LAN as the daemon, not the user's phone). The proper fix is to
+// proxy through the daemon's /submit endpoint, which a follow-up will
+// wire once the apiclient gains a SubmitPluginSection method. Local mode
+// — the common case — works today because both the TUI and the plugin
+// share localhost.
+func (a *App) submitPluginSection(scope, title string, values map[string]any) error {
+	sections, err := a.db.PluginSections()
+	if err != nil {
+		return err
+	}
+	var callbackURL string
+	for _, sec := range sections {
+		if sec.Scope == scope && sec.Title == title {
+			callbackURL = sec.CallbackURL
+			break
+		}
+	}
+	if callbackURL == "" {
+		return fmt.Errorf("plugin section %s/%s not found", scope, title)
+	}
+	body, err := json.Marshal(values)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, callbackURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("plugin returned %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // openRestartDaemonPrompt shows the modal asking whether to restart the
@@ -2623,6 +2711,29 @@ func ptySizeFromPaneRect(pw, ph int) (rows, cols uint16) {
 	// so the int → uint16 conversion cannot overflow; the max() floors also
 	// guarantee positive values. Silence gosec G115 for both fields.
 	return uint16(max(ph-agentViewColOverhead, 5)), uint16(max(pw-agentViewColOverhead, 20)) //nolint:gosec // see comment
+}
+
+// Rect is the agent-pane outer rectangle on screen, taken at face value.
+// Multi-pane layouts (PR 7 and later) pass per-pane rects here rather than
+// going through computePTYSize's host-term/box-default reasoning.
+type Rect struct {
+	X, Y, W, H int
+}
+
+// PTYSizeForRect returns the PTY (rows, cols) for an agent terminal whose
+// outer rect on screen is r. The 1-cell border on each side
+// (agentViewColOverhead) is subtracted; rows and cols are clamped to the
+// minimum useful floor (5 rows / 20 cols).
+//
+// Unlike [App.computePTYSize], the input rect is trusted: there is no
+// host-term fallback and no Box-default rejection. Callers driving the new
+// layout registry already know the authoritative pane rect.
+func PTYSizeForRect(r Rect) (rows, cols uint16) {
+	if r.W <= 0 || r.H <= 0 {
+		return 0, 0
+	}
+	// Realistic cell counts cap well under uint16; max() guarantees positive.
+	return uint16(max(r.H-agentViewColOverhead, 5)), uint16(max(r.W-agentViewColOverhead, 20)) //nolint:gosec // bounded by terminal cell count
 }
 
 // startSession starts a session for an *existing* task (Enter-to-restart or

@@ -308,5 +308,27 @@ func (d *DB) createTables() error {
 	d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_plugin_mcp_tools_scope     ON plugin_mcp_tools(scope)`)        //nolint:errcheck
 	d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_plugin_mcp_tools_last_seen ON plugin_mcp_tools(last_seen_at)`) //nolint:errcheck
 
+	// Plugin-registered settings sections (PR 7 of the plugin substrate).
+	// Composite UNIQUE(scope, title) lets a plugin upsert by re-registering
+	// the same key — the substrate plan caps a plugin at one section, and
+	// the (scope, title) uniqueness leaves room for future plans that allow
+	// many. spec_json holds the encoded [settings.FormSpec]; we deserialize
+	// on read rather than splitting fields across rows so the JSON shape
+	// stays the single source of truth.
+	if _, err := d.conn.Exec(`
+		CREATE TABLE IF NOT EXISTS plugin_settings (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			scope         TEXT NOT NULL,
+			title         TEXT NOT NULL,
+			type          TEXT NOT NULL DEFAULT 'form',
+			spec_json     TEXT NOT NULL DEFAULT '',
+			callback_url  TEXT NOT NULL,
+			created_at    TEXT NOT NULL,
+			UNIQUE(scope, title)
+		)
+	`); err != nil {
+		return fmt.Errorf("creating plugin_settings table: %w", err)
+	}
+
 	return nil
 }
