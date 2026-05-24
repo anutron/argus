@@ -1,0 +1,598 @@
+# Argus plugin contract (v1)
+
+This document describes the HTTP, MCP, and TUI extension surface a plugin can attach to. The surface is plugin-neutral — argus ships with no first-party plugins, and a stock build with no plugins installed behaves exactly like argus before the substrate landed.
+
+A plugin is any external process that holds an `argus token mint --scope <name>` token and talks to the daemon's HTTP API on `127.0.0.1:7743` (or the Tailscale IP). Argus does not manage plugin processes; lifecycle (start, restart, supervise) is the plugin author's problem.
+
+## Status
+
+Contract version: **v1**.
+
+Plugins should send `X-Argus-Plugin-Version: 1` on every request. Argus does not currently enforce the header — additive changes through the v1 window stay backwards compatible. A future major version bump will start rejecting requests without the header set, so wire it in now.
+
+Future breaking changes (event renames, endpoint relocations, schema changes that drop fields) bump the major. Additive changes (new event types, new endpoints, new optional fields) do not.
+
+## Authentication
+
+### Minting a token
+
+Mint a plugin token from the host running the daemon:
+
+```bash
+argus token mint --scope my-plugin
+```
+
+Scopes must match `[a-z0-9][a-z0-9_-]{0,63}`. Argus prints the plaintext token once. Store it on the plugin side; it is not recoverable.
+
+The CLI manages the local SQLite token table directly (WAL-mode SQLite accepts a writer alongside the daemon's readers), so plugin setup works before the daemon is installed as a service.
+
+Other CLI verbs:
+
+- `argus token list` — show every token with its type (`master` / `device` / `scope:<name>`), label, last4, created/last-used timestamps, and revoked flag.
+- `argus token revoke <id>` — revoke a token by its numeric id from `argus token list`.
+
+### Sending credentials
+
+Every request carries either:
+
+- `Authorization: Bearer <token>` — preferred.
+- `?token=<token>` query param — required for `EventSource`, which cannot set headers.
+
+### How the daemon tags requests
+
+The auth middleware sets one of three values on the inbound `X-Argus-Auth` request header before any handler runs:
+
+| Tag             | Origin                                            |
+| --------------- | ------------------------------------------------- |
+| `master`        | the master token loaded from `~/.argus/api-token` |
+| `device`        | a per-device token (scope is empty)               |
+| `scope:<name>`  | a plugin-scoped token                             |
+
+Handlers branch on this tag to gate destructive verbs and to derive a plugin's namespace.
+
+### Token capabilities (single-user trust model)
+
+A `scope:<name>` token can:
+
+- Read every event from `/api/events/stream` (events are not filtered per scope).
+- Register MCP tools under the `<name>_` prefix (any number, capped at 100 per scope).
+- Write task metadata in namespace `<name>`. Reads are open to all authenticated tokens; cross-namespace writes are rejected.
+- Inject input into any task via `POST /api/tasks/:id/input`. The audit log stamps `origin=scope:<name>` on the write.
+- Register exactly one settings section. Re-registering with the same title replaces the prior entry.
+- Drop a layout JSON into `~/.argus/layouts/` on the host (no HTTP surface — argus rescans on boot).
+
+A revoked token loses all of the above; argus cascades the revocation by dropping every MCP tool and settings section owned by the scope.
+
+## Endpoints
+
+| Endpoint                                                | Method     | Auth                          | Purpose                                |
+| ------------------------------------------------------- | ---------- | ----------------------------- | -------------------------------------- |
+| `/api/events/stream?since=<id>`                         | GET (SSE)  | any authenticated             | Subscribe to the daemon event stream   |
+| `/api/tasks/:id/meta?namespace=<ns>`                    | GET        | any authenticated             | Read task metadata                     |
+| `/api/tasks/:id/meta`                                   | PUT        | `master` (PR 3) [^meta-write] | Write task metadata                    |
+| `/api/tasks/:id/input`                                  | POST       | any authenticated             | Inject input bytes into a task PTY     |
+| `/api/mcp/tools`                                        | POST       | `scope:<name>`                | Register an MCP tool                   |
+| `/api/mcp/tools/:name`                                  | DELETE     | owning scope or `master`      | Unregister an MCP tool                 |
+| `/api/plugins/settings/sections`                        | GET        | any authenticated             | List registered plugin settings sections |
+| `/api/plugins/settings/sections`                        | POST       | `scope:<name>`                | Register a settings section            |
+| `/api/plugins/settings/sections/:scope/:title`          | DELETE     | owning scope or `master`      | Unregister a settings section          |
+
+[^meta-write]: Today `PUT /api/tasks/:id/meta` is master-only and takes `namespace` from the request body. The substrate plan intends scope-scoped writes (auto-namespace from the auth tag) as a follow-up; until that lands, plugins write metadata by proxying through a small server-side helper that holds the master token, or wait for the auto-namespacing PR. The contract for `GET` is already plugin-callable.
+
+All endpoints return JSON. Errors are `{"error": "..."}` with the appropriate HTTP status. Bodies are capped (1 MiB for metadata, 256 KiB for MCP tool registration and section registration, 64 KiB for input).
+
+### Plugin token version header
+
+```
+X-Argus-Plugin-Version: 1
+```
+
+Send on every request. Today the header is observed but not validated; expect future major versions to reject mismatches.
+
+## Event stream
+
+`GET /api/events/stream?since=<cursor>` is a Server-Sent Events channel. Each event arrives in the standard SSE block:
+
+```
+event: task.status_changed
+data: {"id":12345,"type":"task.status_changed","at":"2026-05-23T18:42:01Z","task_id":"abc123","payload":{"from":"pending","to":"in_progress"}}
+
+```
+
+The `event:` field carries the type so clients can dispatch with `addEventListener("task.status_changed", ...)` instead of parsing every `data:` line.
+
+### Cursor and replay
+
+`since=<id>` is **exclusive** — passing the last id you saw delivers everything after it. Pass `0` (or omit the query) to subscribe live only.
+
+The handler is fenced: it subscribes to the live bus BEFORE snapshotting the latest persisted id, then replays `[since+1, replayEnd]` from the DB, then resumes live, dropping any live event whose id falls within the replayed range. No event is delivered twice; no event is missed.
+
+### Resync
+
+Events live in a bounded ring (default 10,000 rows; the oldest is evicted on each insert). When `since` predates the oldest retained event, history has rotated out from under you. Argus emits a synthetic event before any replay:
+
+```
+event: resync
+data: {"id":0,"type":"resync","at":"2026-05-23T18:42:01Z","payload":{"reason":"cursor_older_than_ring","cursor":<your-cursor>,"oldest":<oldest-id>}}
+```
+
+`resync` is never persisted — clients seeing it should snapshot daemon state (`GET /api/tasks`, etc.) before resuming the stream.
+
+### Keepalives
+
+Argus sends `: ping` lines every 30 seconds so proxies and clients can detect dead connections.
+
+### Event types
+
+| Type                    | Payload                                              | Emission site                                |
+| ----------------------- | ---------------------------------------------------- | -------------------------------------------- |
+| `task.created`          | `{"name":"...","project":"...","status":"pending"}`  | `db.Add`                                     |
+| `task.status_changed`   | `{"from":"<status>","to":"<status>"}`                | `db.Update` when status changes              |
+| `task.completed`        | `null`                                               | `db.Update` when status transitions to `complete` |
+| `task.archived`         | `null`                                               | `db.Archive`                                 |
+| `task.renamed`          | `{"from":"<name>","to":"<name>"}`                    | `db.Rename` / `db.RenameIfName`              |
+| `task.forked`           | `{"from_task_id":"<id>","to_task_id":"<id>"}`        | `POST /api/tasks/:id/fork`                   |
+| `message.sent`          | `{"id":<n>,"from":"<id>","to":"<id>","kind":"..."}`  | `db.SendMessage`                             |
+| `message.acked`         | `{"count":<n>}`                                      | `db.AckMessages`                             |
+| `link.created`          | `{"child":"<id>","parent":"<id>"}`                   | `orch.Link`                                  |
+| `link.removed`          | `{"child":"<id>","parent":"<id>"}`                   | `orch.Unlink`                                |
+| `session.started`       | `{"pid":<n>,"resume":<bool>}`                        | `agent.Runner.Start`                         |
+| `session.exited`        | `{"stopped":<bool>,"err":"<str>","pending_restart":<bool>}` | session readLoop exit                  |
+| `session.idle`          | `null`                                               | push idle watcher                            |
+| `resync`                | `{"reason":"...","cursor":<n>,"oldest":<n>}`         | synthetic, SSE handler only                  |
+
+Payloads are stable. A future major version will rename or restructure them; v1 is append-only.
+
+Statuses cited in `task.status_changed` payloads are the canonical `model.Status` strings: `pending`, `in_progress`, `in_review`, `complete`.
+
+## Task metadata sidecar
+
+A free-form key/value sidecar table keyed by `(task_id, namespace, key)`. Plugins use it to annotate tasks without piling new columns onto the `tasks` schema.
+
+### Read
+
+```
+GET /api/tasks/<task-id>/meta?namespace=<ns>
+```
+
+Returns every row for the task, optionally filtered by namespace. The body shape:
+
+```json
+{
+  "entries": [
+    { "namespace": "my-plugin", "key": "role", "value": "coordinator", "updated_at": "2026-05-23T18:42:01Z" }
+  ]
+}
+```
+
+Reads are open to any authenticated token. Cross-namespace reads (no `?namespace=`) are allowed.
+
+### Write
+
+```
+PUT /api/tasks/<task-id>/meta
+Content-Type: application/json
+
+{ "namespace": "my-plugin", "key": "role", "value": "coordinator" }
+```
+
+Or in batch form:
+
+```json
+{ "namespace": "my-plugin", "entries": { "role": "coordinator", "thread_status": "open" } }
+```
+
+Exactly one of `(key, value)` or `entries` must be set. The handler rejects an empty namespace.
+
+Today the handler requires the master token (see footnote on the endpoint table above). Future work auto-derives the namespace from the auth tag for plugin-scoped writes.
+
+The HTTP body cap is 1 MiB. Per-key value size is otherwise unbounded.
+
+## MCP tool registration
+
+A plugin can extend argus's MCP surface at runtime. Argus proxies tool invocations from any connected Claude session through to the plugin's HTTP callback URL and returns the plugin's response to the client.
+
+### Register
+
+```
+POST /api/mcp/tools
+Authorization: Bearer <scope-token>
+Content-Type: application/json
+
+{
+  "name": "my-plugin_hello",
+  "description": "Say hello",
+  "input_schema": { "type": "object", "properties": { "name": { "type": "string" } } },
+  "callback_url": "http://127.0.0.1:9991/mcp/hello",
+  "auth_header": "Bearer <secret-shared-with-plugin>"
+}
+```
+
+**Name prefix is enforced.** The tool name MUST start with `<scope>_` (here, `my-plugin_`) — `name == prefix` (nothing after the underscore) is also rejected. The allowed character set is ASCII alphanumerics plus `_` and `-`, max 128 bytes.
+
+Other caps:
+
+- `description`: 4 KiB
+- `input_schema`: 64 KiB; must be valid JSON; defaults to `{}` when empty
+- `callback_url`: 2048 bytes, must be `http://` or `https://`
+- `auth_header`: 4 KiB
+- Per-scope tool count: 100
+
+A re-POST with an existing `name` (idempotent upsert) refreshes the row's `LastSeenAt` heartbeat. A re-POST with a `name` registered by a different scope is rejected.
+
+Response on success:
+
+```json
+{ "name": "my-plugin_hello", "scope": "my-plugin" }
+```
+
+`201 Created` on first registration, `200 OK` is reserved for the heartbeat path through the registry (the API currently returns `201` for upserts; clients should treat both as success).
+
+### Unregister
+
+```
+DELETE /api/mcp/tools/my-plugin_hello
+```
+
+Allowed for the owning scope, or for the master token (operator cleanup). A `device` token cannot unregister anything. Idempotent — deleting a missing name returns `200 OK`.
+
+### Lifecycle
+
+A registered tool is dropped when any of these happens:
+
+- The owning token is revoked. Cascade clears every tool under that scope.
+- The sweeper runs and finds `LastSeenAt` older than the idle window (default 10 minutes). Re-POST the registration on a cadence shorter than the window to keep the tool alive. Every successful invocation also refreshes the heartbeat.
+- The plugin explicitly deletes the tool.
+
+The registry persists in SQLite, so registrations survive a daemon restart.
+
+### Callback contract
+
+When a Claude session invokes the registered tool, argus POSTs to `callback_url`:
+
+```
+POST <callback_url>
+Authorization: <auth_header>          # exactly the string the plugin registered
+Content-Type: application/json
+
+{
+  "tool": "my-plugin_hello",
+  "input": { "name": "world" },
+  "context": { "task_id": "", "session_id": "" }
+}
+```
+
+`context.task_id` and `context.session_id` are stable wire fields but argus does not populate them today — the MCP protocol surface has no per-call identifier wired through. The fields are reserved so a future PR can populate them without breaking existing callbacks.
+
+The plugin must respond with the MCP-native tool result shape:
+
+```json
+{
+  "content": [ { "type": "text", "text": "hello, world" } ],
+  "isError": false
+}
+```
+
+Notes:
+
+- The HTTP timeout for a single callback is 30 seconds. Plugins that need longer should respond with an in-progress acknowledgement and stream completion via events.
+- Responses with status `>= 400` propagate to the MCP client as a tool error containing the response body (first 512 bytes).
+- Response bodies are capped at 4 MiB.
+
+## Input injection
+
+```
+POST /api/tasks/<task-id>/input
+Content-Type: text/plain
+
+<raw bytes — up to 64 KiB>
+```
+
+Bytes are written verbatim to the task's PTY. Audit log entries stamp `origin=<auth-tag>` (`master`, `device`, or `scope:<name>`) so writes from a plugin token are attributable post-hoc.
+
+Returns `{"status":"ok","bytes":<count>}`. Returns 404 with `{"error":"no active session"}` if the task has no running PTY.
+
+## Settings sections
+
+A plugin can register one settings section that appears in the TUI Settings page under a "Plugins" header. The TUI renders the section natively; plugin code never touches tcell.
+
+### Register
+
+```
+POST /api/plugins/settings/sections
+Authorization: Bearer <scope-token>
+Content-Type: application/json
+
+{
+  "title": "My plugin",
+  "type": "form",
+  "callback_url": "http://127.0.0.1:9991/settings/save",
+  "fields": [
+    { "key": "interval", "label": "Check interval (s)", "type": "int", "min": 60, "max": 3600, "default": 300 },
+    { "key": "enabled",  "label": "Enabled",            "type": "bool", "default": true },
+    { "key": "backend",  "label": "Default backend",    "type": "enum", "options": ["claude", "codex"], "default": "claude" },
+    { "key": "label",    "label": "Display label",      "type": "string", "default": "" }
+  ]
+}
+```
+
+The `spec` envelope (`"spec": { "fields": [...] }`) is also accepted; inline `fields` is the preferred shape.
+
+Validation:
+
+- `title` and `callback_url` are required.
+- `type` defaults to `form` when omitted; `stream` is reserved for a future PR and currently rejected at registration.
+- Field keys must be unique within the form.
+- `int` fields with both `min` and `max` require `min ≤ max`.
+- `enum` fields require a non-empty `options` array. Any `default` must appear in `options`.
+- Each `default` (when set) must match the field's declared type.
+
+Field types:
+
+| Type     | JSON shape    | Default | Extras                |
+| -------- | ------------- | ------- | --------------------- |
+| `bool`   | `true`/`false`| `false` | —                     |
+| `int`    | number        | `0`     | `min`, `max` (both optional) |
+| `string` | string        | `""`    | —                     |
+| `enum`   | string        | `""`    | `options` (required)  |
+
+Re-registering with the same `(scope, title)` replaces the prior row — plugins register exactly one section per scope.
+
+### Section type: `stream`
+
+Reserved. PR 7 of the substrate ships form-only; a follow-up adds the streaming variant. Plugins should not register `type: "stream"` today.
+
+When stream lands, the registered shape will be:
+
+```json
+{
+  "title": "My plugin live view",
+  "type": "stream",
+  "callback_url": "ws://127.0.0.1:9991/settings/stream"
+}
+```
+
+Argus will open a WebSocket; the plugin pushes ANSI bytes and argus pushes back focused-pane keystrokes through the streampane widget shared with the layout system.
+
+### List
+
+```
+GET /api/plugins/settings/sections
+```
+
+Open to any authenticated token. Returns:
+
+```json
+{
+  "sections": [
+    {
+      "scope": "my-plugin",
+      "title": "My plugin",
+      "type": "form",
+      "callback_url": "http://127.0.0.1:9991/settings/save",
+      "fields": [ ... ]
+    }
+  ]
+}
+```
+
+### Save flow
+
+When the user edits a section in the TUI and saves, argus POSTs the `{key: value, ...}` map to the plugin's `callback_url`:
+
+```
+POST <callback_url>
+Content-Type: application/json
+
+{ "interval": 600, "enabled": true, "backend": "claude", "label": "" }
+```
+
+The daemon proxies the save (the TUI in `--remote` mode is often on a phone with no LAN route to the plugin). The plugin's status and response body are returned verbatim to the TUI. Plugin response time is capped at 10 seconds.
+
+### Unregister
+
+```
+DELETE /api/plugins/settings/sections/<scope>/<title>
+```
+
+A plugin can unregister only its own section. The master token can drop any section (operator cleanup). The substrate's revocation cascade also clears every section owned by a scope when its token is revoked.
+
+### Ordering and hide-on-empty
+
+Built-in settings sections render first in their canonical order, followed by the `Layouts` section (when at least one non-default layout is registered) and then a blank-line separator and a `Plugins` header before alphabetically-sorted plugin sections. When no plugin sections exist, both the `Plugins` header and the preceding separator disappear; ditto for `Layouts` when only the default layout is loaded.
+
+## Layouts
+
+Argus scans `~/.argus/layouts/*.json` at boot and registers each parsed layout alongside the built-in `tasks-default`. Plugins do not have an HTTP-side registration channel for layouts — drop the file on the host filesystem and restart the daemon.
+
+### Layout JSON schema v1
+
+```json
+{
+  "name": "<unique-name>",
+  "title": "Human-readable title",
+  "root": {
+    "type": "split",
+    "direction": "horizontal",
+    "sizes": [1, 1],
+    "children": [
+      { "type": "terminal", "bind": "task:current", "cycle": false },
+      { "type": "terminal", "cycle": true }
+    ]
+  },
+  "hotkeys": {
+    "tab": "cycle right",
+    "ctrl-1": "focus first",
+    "ctrl-2": "focus second"
+  }
+}
+```
+
+Required:
+
+- `name` — unique registry key. The user picks layouts by name from Settings → Layouts.
+- `root` — the top of the tree.
+
+Node types:
+
+| Type            | Description                                            |
+| --------------- | ------------------------------------------------------ |
+| `split`         | Internal node. Has `direction`, `sizes`, `children`.   |
+| `terminal`      | Leaf: a PTY-backed agent terminal.                     |
+| `task-list`     | Leaf: the task list panel.                             |
+| `git`           | Leaf: git status / diff for the active task worktree.  |
+| `file`          | Leaf: file explorer for the active task worktree.      |
+| `streampane`    | Leaf: ANSI stream rendered from a callback or file.    |
+| `task-preview`  | Leaf: argus-internal preview panel (default layout only). |
+| `task-detail`   | Leaf: argus-internal detail panel (default layout only).  |
+
+Split nodes require:
+
+- `direction`: `horizontal` or `vertical`.
+- `sizes`: an array of positive integers, one per child. Sizes are ratios — `[1, 1]` is 50/50, `[2, 1]` is two-thirds/one-third.
+- `children`: at least two nodes. Sizes length must equal children length.
+
+Leaf attributes:
+
+- `terminal.bind` — pin the panel to a specific source. Accepted forms:
+  - `task:<id>` — pin to a literal task id
+  - `task:current` — pin to whatever the user has focused
+  - `meta:<key>=<value>` — pin to tasks matching a metadata predicate (e.g. `meta:my-plugin.role=coordinator`)
+- `terminal.cycle` — when true, the panel cycles through matching tasks rather than pinning to one.
+- `streampane.source` — accepted forms:
+  - `callback:<url>` — argus opens a WebSocket to the URL
+  - `file:<path>` — argus tails the file (e.g. `file:~/.argus/ux.log`)
+
+Hotkeys are free-form strings; the layout renderer interprets them. The contract reserves `tab`, `ctrl-1`..`ctrl-9`, and `esc`. Use lower-case keys.
+
+Out of scope for v1:
+
+- Borders / titles per panel.
+- Conditional rendering ("show this panel only if X").
+- User-resizable splits at runtime.
+
+### Examples
+
+`docs/examples/layouts/` ships four reference layouts that round-trip through the parser as part of `internal/tui/layout/examples_test.go`:
+
+- `split-horizontal.json` — terminal | terminal, left pinned via `bind`, right cycles.
+- `split-vertical.json` — terminal / terminal stacked, both cycle.
+- `logs.json` — terminal + streampane tailing `~/.argus/ux.log`.
+- `reshuffle.json` — terminal centered between file and git rails.
+
+Copy any of them into `~/.argus/layouts/` to test.
+
+## Versioning
+
+The plugin contract ships as `v1`. Plugins should send:
+
+```
+X-Argus-Plugin-Version: 1
+```
+
+on every request. Today the header is not enforced (the daemon accepts requests without it). A future major bump will start rejecting requests missing or mismatching the header; wire it in now and the upgrade is a single-line change.
+
+Additive changes through v1:
+
+- New event types (clients ignore unknown `event:` lines).
+- New endpoints under `/api/`.
+- New optional fields on existing JSON bodies.
+- New layout node types (older argus rejects unknown leaf types at parse, so layouts using newer types simply fail to load on older builds — not a breaking compat issue for the protocol).
+
+Breaking changes (require major bump):
+
+- Renaming or removing an event type.
+- Changing the field name or type within an event payload.
+- Removing or renaming an endpoint.
+- Removing or renaming a layout node type.
+- Changing the prefix-enforcement rule on MCP tool names.
+
+## A hello-world plugin
+
+The shortest plausible plugin that exercises the contract end-to-end:
+
+```pseudo
+# 1. One-time setup, run on the host that hosts argus:
+$ argus token mint --scope hello
+id:    7
+scope: hello
+label: hello
+token: <copy-this>
+
+Store this token now — it will not be shown again.
+
+# 2. Plugin process (run anywhere reachable from the daemon's network bind):
+
+ARGUS = "http://127.0.0.1:7743/api"
+TOKEN = "<the token from step 1>"
+
+def headers():
+    return {
+        "Authorization": f"Bearer {TOKEN}",
+        "X-Argus-Plugin-Version": "1",
+    }
+
+# 2a. Subscribe to events.
+async for ev in sse_connect(f"{ARGUS}/events/stream", headers=headers()):
+    if ev.type == "task.created":
+        log(f"new task {ev.data.task_id}")
+
+# 2b. Register a settings section.
+http.post(
+    f"{ARGUS}/plugins/settings/sections",
+    headers=headers(),
+    json={
+        "title": "Hello plugin",
+        "type":  "form",
+        "callback_url": "http://127.0.0.1:9991/settings/save",
+        "fields": [
+            { "key": "greeting", "label": "Greeting", "type": "string", "default": "hello" }
+        ],
+    },
+)
+
+# 2c. Register one MCP tool. The prefix MUST match the scope.
+http.post(
+    f"{ARGUS}/mcp/tools",
+    headers=headers(),
+    json={
+        "name":         "hello_say",
+        "description":  "Say hello",
+        "input_schema": { "type": "object", "properties": { "name": { "type": "string" } } },
+        "callback_url": "http://127.0.0.1:9991/mcp/say",
+        "auth_header":  "Bearer plugin-internal-secret",
+    },
+)
+
+# 2d. Serve the two callbacks.
+def on_settings_save(body):
+    # body is the {key: value} map argus POSTed.
+    return ok()
+
+def on_mcp_say(body):
+    # body is {"tool":..., "input":{"name":"world"}, "context":{...}}
+    name = body["input"].get("name", "world")
+    return {
+        "content": [{ "type": "text", "text": f"hello, {name}" }],
+        "isError": False,
+    }
+```
+
+That's the whole contract. Argus does the rest:
+
+- The Settings page now has a `Plugins` header with `Hello plugin` underneath.
+- Any Claude session in any worktree can call `hello_say` as an MCP tool.
+- The plugin sees every event the daemon emits and can react on a cadence of its choosing.
+
+## Where to look next
+
+- `internal/api/auth.go` — middleware, header tagging, token minting.
+- `internal/api/events_stream.go` — SSE handler, cursor fence, resync logic.
+- `internal/api/task_meta.go` — metadata read/write endpoints.
+- `internal/api/mcp_tools.go` — registration / unregistration handlers.
+- `internal/api/plugin_settings.go` — section registration and save proxy.
+- `internal/mcp/registry.go` — the persistent registry the MCP server consults alongside built-ins, plus the proxy logic.
+- `internal/tui/layout/parser.go` — layout JSON schema validator.
+- `internal/tui/settings/form.go` — settings section parser and validator.
+- `internal/model/event.go` — canonical event type strings (renames here are breaking changes).
+- `docs/examples/layouts/*.json` — reference layouts that double as executable schema tests.
