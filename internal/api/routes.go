@@ -120,6 +120,13 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/tasks/{id}/inbox/ack", s.handleAckInbox)
 	mux.HandleFunc("POST /api/tasks/{id}/messages", s.handleSendMessage)
 
+	// Plugin-registered top-level views. POST/GET/DELETE are master-only
+	// today; see internal/api/plugin_views.go for the post-PR-1 swap TODO
+	// that broadens auth to "master OR scope" once scope-tokens land.
+	mux.HandleFunc("POST /api/plugins/views", s.handleCreatePluginView)
+	mux.HandleFunc("GET /api/plugins/views", s.handleListPluginViews)
+	mux.HandleFunc("DELETE /api/plugins/views/{id}", s.handleDeletePluginView)
+
 	return mux
 }
 
