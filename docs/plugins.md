@@ -584,6 +584,28 @@ That's the whole contract. Argus does the rest:
 - Any Claude session in any worktree can call `hello_say` as an MCP tool.
 - The plugin sees every event the daemon emits and can react on a cadence of its choosing.
 
+## Known divergences from PLAN.md
+
+The substrate was specified up front in `PLAN.md` and implemented across seven independent PRs. A handful of things shifted between plan and ship. Plugin authors should code against this document; the divergences below are recorded so a reader who started from the plan can recalibrate.
+
+- **`X-Argus-Plugin-Version` is observed, not enforced.** The plan says "Argus rejects requests with unsupported versions." The middleware does not check the header today. The recommendation to send `X-Argus-Plugin-Version: 1` stands — when enforcement lands as part of a major bump, that line keeps every existing plugin working.
+
+- **`PUT /api/tasks/:id/meta` is master-only and takes an explicit `namespace` in the body.** The plan called for namespaces to be auto-derived from the auth scope and for plugin-scoped writes to be accepted. Reads are already scope-friendly (any authenticated token); writes are deferred to a follow-up PR. Until then, plugins that need to write metadata either ask the user to run the write under master credentials or route through a small server-side helper.
+
+- **Settings section type `stream` is reserved and rejected at registration.** PR 7 of the substrate ships `form` only. The plan describes a WebSocket-backed stream variant; that wiring follows the streampane widget integration in a later PR. The doc keeps the `stream` shape so plugin authors can preview the contract, but `type: "stream"` will fail validation today.
+
+- **MCP callback `context.task_id` and `context.session_id` are always empty.** The plan's contract reference includes them as populated identifiers. The fields are reserved on the wire; the MCP protocol surface in argus today has no per-call identifier to thread through. Plugins should not depend on the values being present in v1.
+
+- **MCP tool registration responds `201 Created` even on the heartbeat upsert path.** The plan implied `200 OK` on idempotent re-registration. The API currently returns `201` for both first-create and refresh; the registry distinguishes the two internally but the HTTP layer does not. Clients should treat both as success.
+
+- **Schema migration ordering.** Open question 3 in the plan asked whether to pre-allocate migration numbers in PR 1. We did not; migrations landed in merge order. No external contract impact, but anyone scanning `internal/db/schema.go` should know the version numbers reflect what merged when, not the order in the plan.
+
+- **No `argus plugin` CLI subcommand.** Open question 5 in the plan. Plugins manage themselves; `argus token mint --scope` is the only CLI surface argus offers a plugin author. Listing registered tools and sections is HTTP-only (`GET /api/plugins/settings/sections`; no `/api/mcp/tools` GET endpoint today — query the database directly via `argus daemon` introspection if you need it during development).
+
+- **No `default-layout` config knob.** Open question 10 in the plan. Boot is hardcoded to `tasks-default`; switching layouts goes through Settings → Layouts at runtime.
+
+If a divergence above bothers you for a specific plugin, file an argus issue — the contract is additive within v1, so a new opt-in field is usually the right shape.
+
 ## Where to look next
 
 - `internal/api/auth.go` — middleware, header tagging, token minting.
