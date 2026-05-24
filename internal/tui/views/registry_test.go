@@ -218,6 +218,35 @@ func TestUnregister_PropagatesDBError(t *testing.T) {
 	}
 }
 
+func TestParseHotkey(t *testing.T) {
+	for _, tc := range []struct {
+		in       string
+		wantKey  int
+		wantOK   bool
+		wantName string
+	}{
+		// tcell uses uppercase-letter ASCII for Ctrl+letter constants:
+		// KeyCtrlA = 'A' = 65, KeyCtrlL = 'L' = 76, KeyCtrlZ = 'Z' = 90.
+		{"ctrl+l", 76, true, "ctrl+l (lowercase)"},
+		{"CTRL+L", 76, true, "CTRL+L (uppercase)"},
+		{"Ctrl+a", 65, true, "ctrl+a"},
+		{"ctrl+z", 90, true, "ctrl+z"},
+		{"ctrl+", 0, false, "ctrl+ trailing nothing"},
+		{"ctrl+ll", 0, false, "ctrl+ multi-letter"},
+		{"ctrl+1", 0, false, "ctrl+digit"},
+		{"alt+l", 0, false, "alt unsupported"},
+		{"l", 0, false, "missing ctrl+"},
+		{"", 0, false, "empty"},
+		{"   ", 0, false, "whitespace"},
+	} {
+		t.Run(tc.wantName, func(t *testing.T) {
+			k, ok := ParseHotkey(tc.in)
+			testutil.Equal(t, ok, tc.wantOK)
+			testutil.Equal(t, int(k), tc.wantKey)
+		})
+	}
+}
+
 func TestRevokeScope_PropagatesDBError(t *testing.T) {
 	database, err := db.OpenInMemory()
 	testutil.NoError(t, err)

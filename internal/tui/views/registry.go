@@ -113,6 +113,37 @@ func (r *Registry) RevokeScope(scope string) error {
 	return err
 }
 
+// ParseHotkey turns a stored hotkey string (eg "ctrl+l") into a tcell.Key
+// constant. Only "ctrl+<letter>" is supported today, matching the substrate's
+// minimum-viable shape. Returns (key, true) on hit; (0, false) on miss.
+//
+// Letters are case-insensitive. "ctrl+l" and "Ctrl+L" both map to
+// tcell.KeyCtrlL.
+func ParseHotkey(s string) (tcellKey, bool) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if !strings.HasPrefix(s, "ctrl+") {
+		return 0, false
+	}
+	rest := s[len("ctrl+"):]
+	if len(rest) != 1 {
+		return 0, false
+	}
+	c := rest[0]
+	if c < 'a' || c > 'z' {
+		return 0, false
+	}
+	// tcell encodes Ctrl+letter keys with the uppercase-letter ASCII value:
+	// KeyCtrlA == 'A' == 65, KeyCtrlB == 'B' == 66, ..., KeyCtrlZ == 'Z' == 90.
+	// NOT the C0 control codes (1..26) — those are the byte values the TTY
+	// emits, but tcell's Key constants are a different encoding. Confirmed
+	// by running `tcell.NewEventKey(tcell.KeyCtrlL, 0, 0).Key()` → 76.
+	return tcellKey(c - 'a' + 'A'), true
+}
+
+// tcellKey aliases the tcell.Key int so the views package doesn't pull tcell
+// into its public API. Callers compare against tcell.KeyCtrlA etc by raw int.
+type tcellKey int16
+
 func toView(row db.PluginView) *View {
 	return &View{
 		ID:          row.ID,

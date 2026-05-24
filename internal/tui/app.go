@@ -59,6 +59,7 @@ const (
 	modeConfirmDeleteProject
 	modeRestartDaemonPrompt
 	modeAppleEventsPicker
+	modePluginView
 )
 
 // agentFocus tracks which panel has focus in the agent view.
@@ -236,6 +237,15 @@ type App struct {
 	// driven, so the one CSI 2J flash per resize is the right tradeoff.
 	lastScreenW int
 	lastScreenH int
+
+	// Plugin-registered top-level views. See plugin_views.go for the
+	// mount/activate/deactivate lifecycle. pluginConnFactory is overridable
+	// so smoke tests can replace the real WebSocket dialer with an in-
+	// process stub.
+	pluginMounts      []*pluginViewMount
+	pluginHotkeys     map[tcell.Key]*pluginViewMount
+	activePlugin      *pluginViewMount
+	pluginConnFactory pluginConnectorFactory
 }
 
 // New creates the tui application shell.
@@ -413,6 +423,7 @@ func (a *App) buildUI() {
 		AddPage("agent", a.agentPage, true, false).
 		AddPage("dag", a.dagPage, true, false).
 		AddPage("settings", a.settingsPage, true, false)
+	a.loadPluginViews()
 	// Every Pages mutation (AddPage / RemovePage / SwitchToPage / Show / Hide)
 	// is a layout change that needs a tcell Sync to wipe ghost cells under
 	// tmux/iTerm2. Wiring it once here covers every modal open/close, every
@@ -464,6 +475,9 @@ func (a *App) afterDraw(screen tcell.Screen) {
 	a.lastScreenH = h
 	uxlog.Log("[tui] afterDraw resize %dx%d — Sync", w, h)
 	screen.Sync()
+	// Forward the resize to the active plugin view (if any). Best-effort —
+	// errors land in uxlog rather than the user's terminal.
+	a.resizePluginViewIfActive()
 }
 
 // SetDaemonStale records that the connected daemon's binary differs from the
@@ -1255,6 +1269,29 @@ func (a *App) refreshTasksWithIDs(runningIDs, idleIDs []string) {
 
 // handleGlobalKey processes key events at the application level.
 func (a *App) handleGlobalKey(event *tcell.EventKey) *tcell.EventKey {
+	// Plugin-view mode — Esc exits, every other keystroke forwards to the
+	// plugin via the streampane's InputBack channel. The streampane's
+	// InputHandler does the actual forwarding; we just need to intercept
+	// Esc here before the streampane consumes it. See plugin_views.go.
+	if a.mode == modePluginView {
+		if event.Key() == tcell.KeyEscape {
+			a.deactivatePluginView()
+			return nil
+		}
+		return event
+	}
+
+	// Plugin-view hotkey activation — checked before form handlers so the
+	// hotkey works from any non-modal context. tview.Pages already routes
+	// the form modes via earlier branches below, so they get to absorb the
+	// keystroke first when active.
+	if event.Key() != tcell.KeyRune {
+		if m, ok := a.pluginHotkeys[event.Key()]; ok && a.mode == modeTaskList {
+			a.activatePluginView(m)
+			return nil
+		}
+	}
+
 	// New task form mode — delegate everything to the form
 	if a.mode == modeNewTask && a.newTaskForm != nil {
 		a.handleNewTaskKey(event)
