@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"testing"
 
 	"github.com/drn/argus/internal/testutil"
@@ -173,8 +172,4 @@ func TestPluginViews_DeleteRejectsNonMaster(t *testing.T) {
 	w := httptest.NewRecorder()
 	mux.ServeHTTP(w, req)
 	testutil.Equal(t, w.Code, http.StatusForbidden)
-}
-
-func itoa(n int64) string {
-	return strconv.FormatInt(n, 10)
 }

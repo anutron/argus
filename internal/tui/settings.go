@@ -16,7 +16,6 @@ import (
 	"github.com/drn/argus/internal/launchagent"
 	"github.com/drn/argus/internal/model"
 	"github.com/drn/argus/internal/spinner"
-	"github.com/drn/argus/internal/tui/layout"
 	pluginsettings "github.com/drn/argus/internal/tui/settings"
 	"github.com/drn/argus/internal/tui/store"
 	"github.com/drn/argus/internal/tui/theme"
@@ -48,7 +47,6 @@ const (
 	srSourcePath
 	srSchedule
 	srAutoStart
-	srLayout
 	srPluginField
 	srPluginSubmit
 )
@@ -72,11 +70,6 @@ const (
 	catRemoteAPI
 	catAppearance
 	catLogs
-	// catLayouts is the built-in "Layouts" section. The rail entry hides
-	// when only the default layout (`tasks-default`) is registered — i.e.
-	// when the user has no user-supplied layouts in ~/.argus/layouts/ —
-	// per the substrate plan's "hide on empty" requirement.
-	catLayouts
 	// catPlugin is a sentinel: the rail can hold any number of plugin
 	// sections, each addressed by [pluginKey{scope, title}] rather than by
 	// a fixed enum value. See [SettingsView.pluginKeyForCategory] for the
@@ -105,8 +98,6 @@ func (c settingsCategory) Label() string {
 		return "Appearance"
 	case catLogs:
 		return "Logs"
-	case catLayouts:
-		return "Layouts"
 	case catPlugin:
 		// Plugin sections render their own title (the registered Section's
 		// Title); the catPlugin sentinel itself has no rail-rendered label.
@@ -116,13 +107,10 @@ func (c settingsCategory) Label() string {
 }
 
 // builtinCategories is the fixed top portion of the rail. Plugins, when
-// present, render after a "Plugins" header below this list. catLayouts is
-// included here because it's a built-in even though it hides on empty —
-// hide-on-empty is enforced in [SettingsView.railEntries] rather than by
-// removing the enum entry.
+// present, render after a "Plugins" header below this list.
 var builtinCategories = []settingsCategory{
 	catSystem, catSandbox, catProjects, catBackends, catSchedules,
-	catKnowledgeBase, catRemoteAPI, catAppearance, catLogs, catLayouts,
+	catKnowledgeBase, catRemoteAPI, catAppearance, catLogs,
 }
 
 // settingsFocus is which sub-panel currently owns input within the settings view.
@@ -245,11 +233,6 @@ type SettingsView struct {
 	updateStatus    string // last-result status line shown in detail panel
 	updateOutput    string // last go-install output (for detail panel)
 
-	// Layouts. Sourced from [App.layouts]; cached snapshot avoids racing the
-	// layout registry's RWMutex on every Draw. SetLayouts is the App's
-	// injection point.
-	layouts []layout.Layout
-
 	// Plugin settings sections. Mirrors the daemon's `plugin_settings` table
 	// via store.Store.PluginSections (the same path local and remote modes
 	// share). pluginValues holds the user-entered draft per (scope, title,
@@ -329,14 +312,6 @@ func NewSettingsView(database store.Store) *SettingsView {
 		pluginValues:       make(map[pluginKey]map[string]any),
 		pluginSubmitStatus: make(map[pluginKey]string),
 	}
-}
-
-// SetLayouts updates the cached list of registered layouts. The app calls
-// this on the tick goroutine — after a [LoadLayoutsDir] call or any boot
-// rehydrate — so the Layouts rail entry's hide-on-empty condition
-// reflects the live registry. Passing nil clears the cache.
-func (sv *SettingsView) SetLayouts(layouts []layout.Layout) {
-	sv.layouts = layouts
 }
 
 // SetPluginSubmit wires the hook that posts plugin-section values back to
@@ -522,8 +497,8 @@ const (
 )
 
 // railEntry is one row in the rail's dynamic list. Built using
-// [SettingsView.railEntries] every frame so plugin register/unregister and
-// layout hide-on-empty take effect without state plumbing.
+// [SettingsView.railEntries] every frame so plugin register/unregister
+// takes effect without state plumbing.
 type railEntry struct {
 	kind railEntryKind
 	cat  settingsCategory // populated for railBuiltin and railPlugin
@@ -549,11 +524,9 @@ func (e railEntry) selectable() bool {
 // plan's "Section ordering" rule:
 //
 //  1. Built-in categories, in their fixed order.
-//  2. The Layouts entry is filtered out when no non-default layout is
-//     registered (hide-on-empty).
-//  3. Blank separator + "Plugins" header, both hidden when no plugin
+//  2. Blank separator + "Plugins" header, both hidden when no plugin
 //     sections are registered.
-//  4. Plugin sections sorted alphabetically by title (ties broken by scope).
+//  3. Plugin sections sorted alphabetically by title (ties broken by scope).
 //
 // This is the single source of truth for both rail rendering and cursor
 // navigation — keep render/handle code consuming this slice rather than
@@ -561,11 +534,6 @@ func (e railEntry) selectable() bool {
 func (sv *SettingsView) railEntries() []railEntry {
 	out := make([]railEntry, 0, len(builtinCategories)+len(sv.pluginSections)+2)
 	for _, c := range builtinCategories {
-		// Hide Layouts when the user has no non-default layouts. The plan
-		// requires hide-on-empty for this section explicitly.
-		if c == catLayouts && !sv.hasUserLayouts() {
-			continue
-		}
 		out = append(out, railEntry{kind: railBuiltin, cat: c, label: c.Label()})
 	}
 	if len(sv.pluginSections) > 0 {
@@ -594,19 +562,6 @@ func (sv *SettingsView) railEntries() []railEntry {
 	return out
 }
 
-// hasUserLayouts reports whether the layout registry contains any layouts
-// beyond the built-in default. The plan ties the Layouts rail entry's
-// visibility to this — when the user hasn't dropped any *.json into
-// ~/.argus/layouts/, the section disappears entirely.
-func (sv *SettingsView) hasUserLayouts() bool {
-	for _, l := range sv.layouts {
-		if l.Name != layout.DefaultLayoutName {
-			return true
-		}
-	}
-	return false
-}
-
 // activeRailIdx returns the index of the rail entry matching the current
 // category (and active plugin, when category == catPlugin). Returns -1 when
 // no rail entry corresponds — possible after a plugin unregisters mid-
@@ -625,20 +580,6 @@ func (sv *SettingsView) activeRailIdx(entries []railEntry) int {
 		return i
 	}
 	return -1
-}
-
-// userLayouts returns just the non-default layouts. Stable order
-// (alphabetical by Name) so the Layouts rows render deterministically.
-func (sv *SettingsView) userLayouts() []layout.Layout {
-	out := make([]layout.Layout, 0, len(sv.layouts))
-	for _, l := range sv.layouts {
-		if l.Name == layout.DefaultLayoutName {
-			continue
-		}
-		out = append(out, l)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
 }
 
 // activePluginSection returns the plugin section the cursor is currently
@@ -808,18 +749,6 @@ func (sv *SettingsView) rebuildRows() {
 	case catLogs:
 		sv.rows = append(sv.rows, settingsRow{kind: srLogs, label: "UX Log", key: "ux"})
 		sv.rows = append(sv.rows, settingsRow{kind: srLogs, label: "Daemon Log", key: "daemon"})
-
-	case catLayouts:
-		// The rail entry hides when the user has no non-default layouts, so
-		// reaching this arm always means at least one user layout exists.
-		// Listing the user layouts as rows lets the cursor walk through them
-		// to inspect each layout's title and JSON shape; activation (binding
-		// a hotkey / making one the boot default) is intentionally out of
-		// scope for PR 7 — the Layouts row in the rail is read-only here so
-		// PR 7's settings refactor stays bounded.
-		for _, l := range sv.userLayouts() {
-			sv.rows = append(sv.rows, settingsRow{kind: srLayout, label: l.Name, key: l.Name})
-		}
 
 	case catPlugin:
 		// One row per registered form field, plus a Save row that POSTs the
@@ -1855,8 +1784,6 @@ func (sv *SettingsView) renderRowDetail(screen tcell.Screen, x, y, w, h int, row
 		sv.renderScheduleDetail(screen, x, y, w, h)
 	case srAutoStart:
 		sv.renderAutoStartDetail(screen, x, y, w, h)
-	case srLayout:
-		sv.renderLayoutDetail(screen, x, y, w, h, row)
 	case srPluginField:
 		sv.renderPluginFieldDetail(screen, x, y, w, h, row)
 	case srPluginSubmit:

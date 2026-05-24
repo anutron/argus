@@ -9,7 +9,6 @@ import (
 
 	"github.com/drn/argus/internal/db"
 	"github.com/drn/argus/internal/testutil"
-	"github.com/drn/argus/internal/tui/layout"
 	pluginsettings "github.com/drn/argus/internal/tui/settings"
 )
 
@@ -36,43 +35,6 @@ func seedPluginSection(t *testing.T, d *db.DB, scope, title string) {
 	testutil.NoError(t, err)
 	_, err = d.UpsertPluginSection(row)
 	testutil.NoError(t, err)
-}
-
-func TestSettingsView_HidesLayoutsWhenOnlyDefault(t *testing.T) {
-	sv := testSettingsView(t)
-	// Seed only the default layout — should not appear in the rail.
-	sv.SetLayouts(nil)
-	entries := sv.railEntries()
-	for _, e := range entries {
-		if e.cat == catLayouts {
-			t.Fatal("Layouts entry should be hidden when only default layout registered")
-		}
-	}
-}
-
-func TestSettingsView_ShowsLayoutsWhenUserLayoutsPresent(t *testing.T) {
-	sv := testSettingsView(t)
-	sv.SetLayouts([]layout.Layout{
-		{Name: layout.DefaultLayoutName, Title: "Default"},
-		{Name: "split-horizontal", Title: "Horizontal", Root: layout.Node{Type: layout.NodeSplit, Direction: layout.DirHorizontal, Children: []layout.Node{{Type: layout.NodeTerminal}, {Type: layout.NodeTerminal}}}},
-	})
-	entries := sv.railEntries()
-	found := false
-	for _, e := range entries {
-		if e.cat == catLayouts {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("Layouts entry should appear when user layout is registered")
-	}
-
-	// Switching to catLayouts produces one row per user layout.
-	sv.setCategory(catLayouts)
-	if len(sv.rows) != 1 {
-		t.Fatalf("expected 1 layout row, got %d", len(sv.rows))
-	}
-	testutil.Equal(t, sv.rows[0].key, "split-horizontal")
 }
 
 func TestSettingsView_PluginsHeaderHiddenByDefault(t *testing.T) {
@@ -370,33 +332,6 @@ func TestSettingsView_PasteIntoPluginField(t *testing.T) {
 	if sv.editPluginBuf != "defaultpasted" {
 		t.Fatalf("paste did not append, got %q", sv.editPluginBuf)
 	}
-}
-
-func TestSettings_RenderLayoutDetail(t *testing.T) {
-	sv := testSettingsView(t)
-	sv.SetLayouts([]layout.Layout{
-		{Name: layout.DefaultLayoutName, Title: "Default"},
-		{
-			Name:  "split-horizontal",
-			Title: "Horizontal",
-			Root: layout.Node{
-				Type:      layout.NodeSplit,
-				Direction: layout.DirHorizontal,
-				Children:  []layout.Node{{Type: layout.NodeTerminal}, {Type: layout.NodeTerminal}},
-			},
-		},
-		{Name: "leaf-only", Root: layout.Node{Type: layout.NodeTerminal}},
-	})
-	sv.setCategory(catLayouts)
-	// Render every layout row to exercise both the split and leaf branches.
-	for i := range sv.rows {
-		sv.cursor = i
-		sv.SetRect(0, 0, 100, 30)
-		sv.Draw(drawSim(t))
-	}
-	// Bogus key path (defensive guard inside the renderer).
-	bogus := &settingsRow{kind: srLayout, key: "missing"}
-	sv.renderLayoutDetail(drawSim(t), 0, 0, 50, 10, bogus)
 }
 
 func TestSettings_RenderPluginFieldDetail(t *testing.T) {

@@ -91,12 +91,8 @@ func TestDocsPlugins_ExistsAndCoversContract(t *testing.T) {
 		}
 	})
 
-	t.Run("layout schema and settings section types are documented", func(t *testing.T) {
+	t.Run("settings section types are documented", func(t *testing.T) {
 		for _, tok := range []string{
-			// Layout panel types.
-			"terminal",
-			"streampane",
-			"task-list",
 			// Settings section types.
 			"form",
 			"stream",

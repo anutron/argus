@@ -8,68 +8,11 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 
-	"github.com/drn/argus/internal/tui/layout"
 	pluginsettings "github.com/drn/argus/internal/tui/settings"
 	"github.com/drn/argus/internal/tui/theme"
 	"github.com/drn/argus/internal/tui/widget"
 	"github.com/drn/argus/internal/uxlog"
 )
-
-// renderLayoutDetail draws the detail pane for one user-supplied layout. The
-// layout itself isn't activated by argus today (PR 6 deliberately binds no
-// hotkeys; PR 7 ships the read-only Layouts surface so the user can confirm
-// the JSON parsed). When activation lands in a follow-up the same row will
-// gain enable/hotkey controls.
-func (sv *SettingsView) renderLayoutDetail(screen tcell.Screen, x, y, w, h int, row *settingsRow) {
-	// Resolve the layout by name; the rail entry hides on empty so an
-	// active srLayout row implies at least one user layout exists, but the
-	// list can change between rebuildRows and Draw (rare; defensive only).
-	var picked *layout.Layout
-	for i := range sv.layouts {
-		if sv.layouts[i].Name == row.key {
-			picked = &sv.layouts[i]
-			break
-		}
-	}
-	widget.DrawText(screen, x, y, w, "Layout", theme.StyleTitle)
-	r := 2
-	if picked == nil {
-		widget.DrawText(screen, x, y+r, w, "(layout not found)", theme.StyleDimmed)
-		return
-	}
-
-	widget.DrawText(screen, x, y+r, w, "Name: "+picked.Name, tcell.StyleDefault.Foreground(theme.ColorTitle))
-	r++
-	if picked.Title != "" {
-		widget.DrawText(screen, x, y+r, w, "Title: "+picked.Title, theme.StyleDimmed)
-		r++
-	}
-	r++
-
-	if picked.Root.IsSplit() {
-		widget.DrawText(screen, x, y+r, w, "Root: split", tcell.StyleDefault.Foreground(theme.ColorTitle))
-		r++
-		widget.DrawText(screen, x, y+r, w, "  Direction: "+picked.Root.Direction, theme.StyleDimmed)
-		r++
-		widget.DrawText(screen, x, y+r, w, "  Panels: "+strconv.Itoa(len(picked.Root.Children)), theme.StyleDimmed)
-		r++
-	} else {
-		widget.DrawText(screen, x, y+r, w, "Root: "+picked.Root.Type, tcell.StyleDefault.Foreground(theme.ColorTitle))
-		r++
-	}
-	r++
-
-	if r < h-1 {
-		widget.DrawText(screen, x, y+r, w, "Layouts are loaded but not yet", theme.StyleDimmed)
-		r++
-		widget.DrawText(screen, x, y+r, w, "activated. A follow-up will wire", theme.StyleDimmed)
-		r++
-		widget.DrawText(screen, x, y+r, w, "hotkey binding here.", theme.StyleDimmed)
-	}
-	if h > 1 {
-		widget.DrawText(screen, x, y+h-1, w, "(read-only in this build)", theme.StyleDimmed)
-	}
-}
 
 // pluginFieldRowLabel formats one field row: "Label: value". value is the
 // current draft for the field, falling back to the field's default when the

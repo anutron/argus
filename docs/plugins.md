@@ -59,7 +59,6 @@ A `scope:<name>` token can:
 - Write task metadata in namespace `<name>`. Reads are open to all authenticated tokens; cross-namespace writes are rejected.
 - Inject input into any task via `POST /api/tasks/:id/input`. The audit log stamps `origin=scope:<name>` on the write.
 - Register exactly one settings section. Re-registering with the same title replaces the prior entry.
-- Drop a layout JSON into `~/.argus/layouts/` on the host (no HTTP surface — argus rescans on boot).
 
 A revoked token loses all of the above; argus cascades the revocation by dropping every MCP tool and settings section owned by the scope.
 
@@ -370,7 +369,7 @@ When stream lands, the registered shape will be:
 }
 ```
 
-Argus will open a WebSocket; the plugin pushes ANSI bytes and argus pushes back focused-pane keystrokes through the streampane widget shared with the layout system.
+Argus will open a WebSocket; the plugin pushes ANSI bytes and argus pushes back focused-pane keystrokes through the streampane widget.
 
 ### List
 
@@ -417,88 +416,7 @@ A plugin can unregister only its own section. The master token can drop any sect
 
 ### Ordering and hide-on-empty
 
-Built-in settings sections render first in their canonical order, followed by the `Layouts` section (when at least one non-default layout is registered) and then a blank-line separator and a `Plugins` header before alphabetically-sorted plugin sections. When no plugin sections exist, both the `Plugins` header and the preceding separator disappear; ditto for `Layouts` when only the default layout is loaded.
-
-## Layouts
-
-Argus scans `~/.argus/layouts/*.json` at boot and registers each parsed layout alongside the built-in `tasks-default`. Plugins do not have an HTTP-side registration channel for layouts — drop the file on the host filesystem and restart the daemon.
-
-### Layout JSON schema v1
-
-```json
-{
-  "name": "<unique-name>",
-  "title": "Human-readable title",
-  "root": {
-    "type": "split",
-    "direction": "horizontal",
-    "sizes": [1, 1],
-    "children": [
-      { "type": "terminal", "bind": "task:current", "cycle": false },
-      { "type": "terminal", "cycle": true }
-    ]
-  },
-  "hotkeys": {
-    "tab": "cycle right",
-    "ctrl-1": "focus first",
-    "ctrl-2": "focus second"
-  }
-}
-```
-
-Required:
-
-- `name` — unique registry key. The user picks layouts by name from Settings → Layouts.
-- `root` — the top of the tree.
-
-Node types:
-
-| Type            | Description                                            |
-| --------------- | ------------------------------------------------------ |
-| `split`         | Internal node. Has `direction`, `sizes`, `children`.   |
-| `terminal`      | Leaf: a PTY-backed agent terminal.                     |
-| `task-list`     | Leaf: the task list panel.                             |
-| `git`           | Leaf: git status / diff for the active task worktree.  |
-| `file`          | Leaf: file explorer for the active task worktree.      |
-| `streampane`    | Leaf: ANSI stream rendered from a callback or file.    |
-| `task-preview`  | Leaf: argus-internal preview panel (default layout only). |
-| `task-detail`   | Leaf: argus-internal detail panel (default layout only).  |
-
-Split nodes require:
-
-- `direction`: `horizontal` or `vertical`.
-- `sizes`: an array of positive integers, one per child. Sizes are ratios — `[1, 1]` is 50/50, `[2, 1]` is two-thirds/one-third.
-- `children`: at least two nodes. Sizes length must equal children length.
-
-Leaf attributes:
-
-- `terminal.bind` — pin the panel to a specific source. Accepted forms:
-  - `task:<id>` — pin to a literal task id
-  - `task:current` — pin to whatever the user has focused
-  - `meta:<key>=<value>` — pin to tasks matching a metadata predicate (e.g. `meta:my-plugin.role=coordinator`)
-- `terminal.cycle` — when true, the panel cycles through matching tasks rather than pinning to one.
-- `streampane.source` — accepted forms:
-  - `callback:<url>` — argus opens a WebSocket to the URL
-  - `file:<path>` — argus tails the file (e.g. `file:~/.argus/ux.log`)
-
-Hotkeys are free-form strings; the layout renderer interprets them. The contract reserves `tab`, `ctrl-1`..`ctrl-9`, and `esc`. Use lower-case keys.
-
-Out of scope for v1:
-
-- Borders / titles per panel.
-- Conditional rendering ("show this panel only if X").
-- User-resizable splits at runtime.
-
-### Examples
-
-`docs/examples/layouts/` ships four reference layouts that round-trip through the parser as part of `internal/tui/layout/examples_test.go`:
-
-- `split-horizontal.json` — terminal | terminal, left pinned via `bind`, right cycles.
-- `split-vertical.json` — terminal / terminal stacked, both cycle.
-- `logs.json` — terminal + streampane tailing `~/.argus/ux.log`.
-- `reshuffle.json` — terminal centered between file and git rails.
-
-Copy any of them into `~/.argus/layouts/` to test.
+Built-in settings sections render first in their canonical order, followed by a blank-line separator and a `Plugins` header before alphabetically-sorted plugin sections. When no plugin sections exist, both the `Plugins` header and the preceding separator disappear.
 
 ## Versioning
 
@@ -515,14 +433,12 @@ Additive changes through v1:
 - New event types (clients ignore unknown `event:` lines).
 - New endpoints under `/api/`.
 - New optional fields on existing JSON bodies.
-- New layout node types (older argus rejects unknown leaf types at parse, so layouts using newer types simply fail to load on older builds — not a breaking compat issue for the protocol).
 
 Breaking changes (require major bump):
 
 - Renaming or removing an event type.
 - Changing the field name or type within an event payload.
 - Removing or renaming an endpoint.
-- Removing or renaming a layout node type.
 - Changing the prefix-enforcement rule on MCP tool names.
 
 ## A hello-world plugin
@@ -628,7 +544,7 @@ The substrate was specified up front in `PLAN.md` and implemented across seven i
 
 - **No `argus plugin` CLI subcommand.** Open question 5 in the plan. Plugins manage themselves; `argus token mint --scope` is the only CLI surface argus offers a plugin author. Listing registered tools and sections is HTTP-only (`GET /api/plugins/settings/sections`; no `/api/mcp/tools` GET endpoint today — query the database directly via `argus daemon` introspection if you need it during development).
 
-- **No `default-layout` config knob.** Open question 10 in the plan. Boot is hardcoded to `tasks-default`; switching layouts goes through Settings → Layouts at runtime.
+- **No JSON layouts.** The plan called for user-supplied JSON layouts under `~/.argus/layouts/` to recompose argus's built-in widgets. That story was superseded by plugin views (PR 9), which let a plugin register its own top-level page and render it via WebSocket. The `~/.argus/layouts/` directory is no longer scanned at boot.
 
 If a divergence above bothers you for a specific plugin, file an argus issue — the contract is additive within v1, so a new opt-in field is usually the right shape.
 
@@ -640,7 +556,5 @@ If a divergence above bothers you for a specific plugin, file an argus issue —
 - `internal/api/mcp_tools.go` — registration / unregistration handlers.
 - `internal/api/plugin_settings.go` — section registration and save proxy.
 - `internal/mcp/registry.go` — the persistent registry the MCP server consults alongside built-ins, plus the proxy logic.
-- `internal/tui/layout/parser.go` — layout JSON schema validator.
 - `internal/tui/settings/form.go` — settings section parser and validator.
 - `internal/model/event.go` — canonical event type strings (renames here are breaking changes).
-- `docs/examples/layouts/*.json` — reference layouts that double as executable schema tests.
