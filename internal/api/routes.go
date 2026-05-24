@@ -133,6 +133,18 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/tasks/{id}/meta", s.handleGetMeta)
 	mux.HandleFunc("PUT /api/tasks/{id}/meta", s.handlePutMeta)
 
+	// Plugin-registered settings sections (PR 7). POST takes a scope-tagged
+	// token (the scope becomes the section's namespace); GET is open to any
+	// authenticated request so the TUI can list registered sections. DELETE
+	// requires either the owning scope or the master token. The submit
+	// sub-route is the form-save proxy: the TUI POSTs the user-entered
+	// values here, and the daemon forwards them to the plugin's
+	// callback_url so cross-network egress is centralized.
+	mux.HandleFunc("GET /api/plugins/settings/sections", s.handleListPluginSections)
+	mux.HandleFunc("POST /api/plugins/settings/sections", s.handleRegisterPluginSection)
+	mux.HandleFunc("DELETE /api/plugins/settings/sections/{scope}/{title}", s.handleUnregisterPluginSection)
+	mux.HandleFunc("POST /api/plugins/settings/sections/{scope}/{title}/submit", s.handleSubmitPluginSectionValues)
+
 	return mux
 }
 

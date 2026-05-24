@@ -1,7 +1,11 @@
 package tui
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -303,6 +307,8 @@ func New(database store.Store, runner agent.SessionProvider, daemonConnected boo
 	app.settings.OnDeleteSchedule = func(id string) { app.deleteSchedule(id) }
 	app.settings.OnRunSchedule = func(id string) { app.runScheduleNow(id) }
 	app.settings.OnBranchChange = func() { app.forceRedraw("settings branch changed") }
+	app.settings.SetLayouts(app.layouts.List())
+	app.settings.SetPluginSubmit(app.submitPluginSection)
 	app.settingsPage = NewSettingsPage(app.settings)
 
 	cfg := database.Config()
@@ -494,7 +500,9 @@ func (a *App) Layouts() *layout.Registry {
 // one. Missing dirs are no-ops. Parse / register errors are logged via
 // uxlog and ignored so a single malformed user layout cannot prevent boot.
 //
-// Wired by cmd/argus/main.go at startup against ~/.argus/layouts/.
+// Wired by cmd/argus/main.go at startup against ~/.argus/layouts/. The
+// settings view is refreshed at the end so the Layouts rail entry's
+// hide-on-empty state reflects the post-load registry.
 func (a *App) LoadLayoutsDir(dir string) {
 	res := a.layouts.LoadDir(dir)
 	if res.Loaded > 0 {
@@ -503,6 +511,58 @@ func (a *App) LoadLayoutsDir(dir string) {
 	for _, err := range res.Errors {
 		uxlog.Log("[tui] layout load error: %v", err)
 	}
+	if a.settings != nil {
+		a.settings.SetLayouts(a.layouts.List())
+	}
+}
+
+// submitPluginSection is the production submit hook wired into the
+// SettingsView at App construction. It looks up the section's callback URL
+// from the live PluginSections list and POSTs the user-entered values map
+// there.
+//
+// Two-process limitation: in --remote mode the TUI is on a host that may
+// not reach the plugin's callback URL (the plugin server is typically on
+// the same LAN as the daemon, not the user's phone). The proper fix is to
+// proxy through the daemon's /submit endpoint, which a follow-up will
+// wire once the apiclient gains a SubmitPluginSection method. Local mode
+// — the common case — works today because both the TUI and the plugin
+// share localhost.
+func (a *App) submitPluginSection(scope, title string, values map[string]any) error {
+	sections, err := a.db.PluginSections()
+	if err != nil {
+		return err
+	}
+	var callbackURL string
+	for _, sec := range sections {
+		if sec.Scope == scope && sec.Title == title {
+			callbackURL = sec.CallbackURL
+			break
+		}
+	}
+	if callbackURL == "" {
+		return fmt.Errorf("plugin section %s/%s not found", scope, title)
+	}
+	body, err := json.Marshal(values)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, callbackURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("plugin returned %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // openRestartDaemonPrompt shows the modal asking whether to restart the
