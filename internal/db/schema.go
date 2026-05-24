@@ -262,5 +262,25 @@ func (d *DB) createTables() error {
 	}
 	d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_task_meta_namespace ON task_meta(task_id, namespace)`) //nolint:errcheck
 
+	// Events ring (PR 2 of the plugin substrate). Bounded — InsertEvent
+	// evicts the oldest rows once the row count exceeds MaxEventsRetained.
+	// id is INTEGER PRIMARY KEY AUTOINCREMENT so the cursor is monotonic
+	// even when rows are evicted (otherwise SQLite would recycle rowids and
+	// a since=<old> client could miss events whose ids landed below their
+	// cursor). type/at/task_id are indexed-eligible if downstream consumers
+	// need filtered replay, but the ring is small enough today that linear
+	// scans are fine.
+	if _, err := d.conn.Exec(`
+		CREATE TABLE IF NOT EXISTS events (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			type         TEXT NOT NULL,
+			at           TEXT NOT NULL,
+			task_id      TEXT NOT NULL DEFAULT '',
+			payload_json TEXT NOT NULL DEFAULT ''
+		)
+	`); err != nil {
+		return fmt.Errorf("creating events table: %w", err)
+	}
+
 	return nil
 }

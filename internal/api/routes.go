@@ -114,6 +114,11 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("DELETE /api/schedules/{id}", s.handleDeleteSchedule)
 	mux.HandleFunc("POST /api/schedules/{id}/run", s.handleRunSchedule)
 
+	// Plugin substrate (PR 2): event stream. Server-Sent Events with cursor
+	// replay + resync on overflow. Accepts any authenticated token (master
+	// or device); plugin-scoped tokens land here once PR 1 ships.
+	mux.HandleFunc("GET /api/events/stream", s.handleEventsStream)
+
 	// Inter-task messaging. Inbox read + ack are per-task scope (device
 	// tokens OK); sending is requireMaster.
 	mux.HandleFunc("GET /api/tasks/{id}/inbox", s.handleListInbox)

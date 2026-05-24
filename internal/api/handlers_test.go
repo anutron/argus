@@ -1763,8 +1763,11 @@ func TestIdleWatcher_StartAndStopGracefully(t *testing.T) {
 	testutil.NoError(t, srv.Shutdown(ctx))
 }
 
-// TestIdleWatcher_NilPushReturnsImmediately exercises the early-return path.
-func TestIdleWatcher_NilPushReturnsImmediately(t *testing.T) {
+// TestIdleWatcher_NilPushStillRuns is the regression test for the PR 2
+// (plugin substrate) change: idleWatcher must run regardless of whether
+// push is configured because it also drives session.idle event emission.
+// The goroutine should NOT return on its own — it terminates via stopCh.
+func TestIdleWatcher_NilPushStillRuns(t *testing.T) {
 	srv, _ := testServer(t)
 	srv.push = nil
 	done := make(chan struct{})
@@ -1772,10 +1775,19 @@ func TestIdleWatcher_NilPushReturnsImmediately(t *testing.T) {
 		srv.idleWatcher()
 		close(done)
 	}()
+	// 200ms is generous — if the watcher had the old "return on nil push"
+	// behaviour it would close `done` within microseconds. We then close
+	// stopCh to confirm the watcher honours the shutdown signal.
 	select {
 	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("idleWatcher with nil push should return immediately")
+		t.Fatal("idleWatcher with nil push exited early; should run until stopCh closes")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(srv.stopCh)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("idleWatcher did not exit after stopCh close")
 	}
 }
 

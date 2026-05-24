@@ -17,6 +17,7 @@ import (
 	"github.com/drn/argus/internal/agent"
 	"github.com/drn/argus/internal/config"
 	"github.com/drn/argus/internal/db"
+	"github.com/drn/argus/internal/events"
 	"github.com/drn/argus/internal/gitutil"
 	"github.com/drn/argus/internal/links"
 	"github.com/drn/argus/internal/model"
@@ -707,6 +708,13 @@ func (s *Server) handleForkTask(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	// task.forked is plugin-visible context — it carries the parent linkage
+	// the task.created emit (from db.Add inside createTask) cannot, so a
+	// fork-aware plugin doesn't have to reconstruct the parent by name.
+	events.Emit(model.EventTypeTaskForked, task.ID, map[string]string{
+		"from_task_id": src.ID,
+		"to_task_id":   task.ID,
+	})
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":     task.ID,
 		"name":   task.Name,

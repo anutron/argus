@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/drn/argus/internal/config"
+	"github.com/drn/argus/internal/events"
 	"github.com/drn/argus/internal/model"
 )
 
@@ -120,6 +121,11 @@ func (r *Runner) Start(task *model.Task, cfg config.Config, rows, cols uint16, r
 	r.mu.Lock()
 	r.sessions[task.ID] = sess
 	r.mu.Unlock()
+
+	events.Emit(model.EventTypeSessionStarted, task.ID, map[string]any{
+		"pid":    sess.PID(),
+		"resume": resume,
+	})
 
 	// Watch for process exit. The onFinish callback is fired while the
 	// session is still in the map so consumers (e.g., daemon exit info
