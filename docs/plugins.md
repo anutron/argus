@@ -257,12 +257,30 @@ Content-Type: application/json
 
 {
   "tool": "my-plugin_hello",
-  "input": { "name": "world" },
-  "context": { "task_id": "", "session_id": "" }
+  "input": { "name": "world" }
 }
 ```
 
-`context.task_id` and `context.session_id` are stable wire fields but argus does not populate them today — the MCP protocol surface has no per-call identifier wired through. The fields are reserved so a future PR can populate them without breaking existing callbacks.
+Plugins follow argus's MCP convention — callers identify themselves via tool inputs (typically a `cwd` parameter, matching `task_complete` and other built-ins). Argus does not auto-inject caller identity into the proxy payload.
+
+The pattern: declare `cwd` in your tool's `input_schema`, instruct the agent (via the tool's `description`) to pass `$PWD`, then resolve the calling task on the plugin side from the cwd:
+
+```json
+{
+  "name": "my-plugin_hello",
+  "description": "Say hello. Always pass the current working directory as `cwd` (use $PWD).",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "cwd":  { "type": "string", "description": "Pass $PWD" },
+      "name": { "type": "string" }
+    },
+    "required": ["cwd"]
+  },
+  "callback_url": "http://127.0.0.1:9991/mcp/hello",
+  "auth_header": "Bearer ..."
+}
+```
 
 The plugin must respond with the MCP-native tool result shape:
 
@@ -552,13 +570,22 @@ http.post(
 )
 
 # 2c. Register one MCP tool. The prefix MUST match the scope.
+# The description tells the agent to pass $PWD as cwd; the plugin uses cwd
+# to resolve which task is calling.
 http.post(
     f"{ARGUS}/mcp/tools",
     headers=headers(),
     json={
         "name":         "hello_say",
-        "description":  "Say hello",
-        "input_schema": { "type": "object", "properties": { "name": { "type": "string" } } },
+        "description":  "Say hello. Always pass the current working directory as `cwd` (use $PWD).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cwd":  { "type": "string", "description": "Pass $PWD" },
+                "name": { "type": "string" },
+            },
+            "required": ["cwd"],
+        },
         "callback_url": "http://127.0.0.1:9991/mcp/say",
         "auth_header":  "Bearer plugin-internal-secret",
     },
@@ -570,10 +597,11 @@ def on_settings_save(body):
     return ok()
 
 def on_mcp_say(body):
-    # body is {"tool":..., "input":{"name":"world"}, "context":{...}}
+    # body is {"tool": "...", "input": {"cwd": "...", "name": "world"}}
+    task = resolve_task_by_cwd(body["input"]["cwd"])  # plugin-side lookup
     name = body["input"].get("name", "world")
     return {
-        "content": [{ "type": "text", "text": f"hello, {name}" }],
+        "content": [{ "type": "text", "text": f"hello, {name} (from task {task})" }],
         "isError": False,
     }
 ```
@@ -593,8 +621,6 @@ The substrate was specified up front in `PLAN.md` and implemented across seven i
 - **`PUT /api/tasks/:id/meta` is master-only and takes an explicit `namespace` in the body.** The plan called for namespaces to be auto-derived from the auth scope and for plugin-scoped writes to be accepted. Reads are already scope-friendly (any authenticated token); writes are deferred to a follow-up PR. Until then, plugins that need to write metadata either ask the user to run the write under master credentials or route through a small server-side helper.
 
 - **Settings section type `stream` is reserved and rejected at registration.** PR 7 of the substrate ships `form` only. The plan describes a WebSocket-backed stream variant; that wiring follows the streampane widget integration in a later PR. The doc keeps the `stream` shape so plugin authors can preview the contract, but `type: "stream"` will fail validation today.
-
-- **MCP callback `context.task_id` and `context.session_id` are always empty.** The plan's contract reference includes them as populated identifiers. The fields are reserved on the wire; the MCP protocol surface in argus today has no per-call identifier to thread through. Plugins should not depend on the values being present in v1.
 
 - **MCP tool registration responds `201 Created` even on the heartbeat upsert path.** The plan implied `200 OK` on idempotent re-registration. The API currently returns `201` for both first-create and refresh; the registry distinguishes the two internally but the HTTP layer does not. Clients should treat both as success.
 

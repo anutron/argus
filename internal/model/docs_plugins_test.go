@@ -16,11 +16,17 @@ import (
 // matching docs update is a contract bug. This test fails the build when the
 // surface area documented in docs/plugins.md falls behind code.
 //
+// The expected-value table is intentionally string-literal rather than a
+// reference to the (eventual) EventType* constants in event.go. PR 8 ships
+// before PR 2's event constants land upstream, so importing them would make
+// this branch's CI dependent on PR 2. String literals keep the test
+// standalone while still failing the build if any future rename changes
+// either the constant value OR the doc — both must move together; the test
+// pinning either side tells the renamer "go update the other".
+//
 // We deliberately scan for substring presence rather than parsing the markdown
 // — the doc is human-prose with code fences and tables, and a fragile parser
-// would create more breakage than it prevents. Each required token below is a
-// stable identifier (event type string, endpoint path, header name) that the
-// doc must mention verbatim.
+// would create more breakage than it prevents.
 func TestDocsPlugins_ExistsAndCoversContract(t *testing.T) {
 	_, thisFile, _, _ := runtime.Caller(0)
 	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
@@ -31,21 +37,23 @@ func TestDocsPlugins_ExistsAndCoversContract(t *testing.T) {
 	doc := string(data)
 
 	t.Run("every event type is documented", func(t *testing.T) {
+		// Mirrors the EventType* constants in PR 2's internal/model/event.go.
+		// If a value changes there, update this list in lockstep.
 		for _, ev := range []string{
-			EventTypeTaskCreated,
-			EventTypeTaskStatusChanged,
-			EventTypeTaskCompleted,
-			EventTypeTaskArchived,
-			EventTypeTaskRenamed,
-			EventTypeTaskForked,
-			EventTypeMessageSent,
-			EventTypeMessageAcked,
-			EventTypeLinkCreated,
-			EventTypeLinkRemoved,
-			EventTypeSessionStarted,
-			EventTypeSessionExited,
-			EventTypeSessionIdle,
-			EventTypeResync,
+			"task.created",
+			"task.status_changed",
+			"task.completed",
+			"task.archived",
+			"task.renamed",
+			"task.forked",
+			"message.sent",
+			"message.acked",
+			"link.created",
+			"link.removed",
+			"session.started",
+			"session.exited",
+			"session.idle",
+			"resync",
 		} {
 			if !strings.Contains(doc, ev) {
 				t.Errorf("docs/plugins.md missing event type %q", ev)
