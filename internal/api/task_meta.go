@@ -4,10 +4,32 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/drn/argus/internal/db"
 )
+
+// scopeFromAuth returns the plugin scope name when the request was tagged
+// `X-Argus-Auth: scope:<name>` (non-empty `<name>`). The bool is true exactly
+// when a scope tag is present and the suffix is non-empty. Master and device
+// tags return ("", false) — callers branch on the bool, not on emptiness.
+//
+// PR 1 of the substrate plan introduces the middleware-side tagging; this
+// helper is the downstream consumer that PR 3 ships ahead of PR 1 so a
+// `scope:<name>` token can write `task_meta` without waiting on PR 1 to
+// merge first.
+func scopeFromAuth(r *http.Request) (string, bool) {
+	tag := r.Header.Get("X-Argus-Auth")
+	if !strings.HasPrefix(tag, "scope:") {
+		return "", false
+	}
+	name := strings.TrimPrefix(tag, "scope:")
+	if name == "" {
+		return "", false
+	}
+	return name, true
+}
 
 // taskMetaMaxBodyBytes caps a single PUT /api/tasks/{id}/meta request body.
 // The PR 3 plan deliberately leaves task_meta storage unbounded (the table is
@@ -64,11 +86,15 @@ func (s *Server) handleGetMeta(w http.ResponseWriter, r *http.Request) {
 }
 
 // metaPutReq is the union shape accepted by PUT /api/tasks/{id}/meta. Exactly
-// one of (Key+Value) or Entries must be set. Namespace is always required.
+// one of (Key+Value) or Entries must be set.
 //
-// When PR 1 (scope-tagged tokens) lands, the namespace will be auto-derived
-// from the auth scope and rejected if it doesn't match. For now writes are
-// master-only and the body's namespace is taken as-is.
+// Namespace handling depends on the auth tier of the request:
+//   - master tokens: Namespace is taken from the body as-is. Required.
+//   - scope:<name> tokens: Namespace is auto-derived from the auth tag and
+//     forced to <name>. If the body sets a namespace that disagrees, the
+//     handler rejects with 403 (defense in depth — prevents one plugin from
+//     writing into another plugin's namespace).
+//   - device tokens: rejected at the auth gate; never reach this struct.
 type metaPutReq struct {
 	Namespace string            `json:"namespace"`
 	Key       string            `json:"key"`
@@ -77,11 +103,16 @@ type metaPutReq struct {
 }
 
 // handlePutMeta upserts one row or a batch of rows under the path-bound
-// task's metadata. requireMaster — sidecar writes mutate cross-plugin state
-// and the device-token tier is read-only by default. See metaPutReq for the
-// accepted body shapes.
+// task's metadata. Master tokens write any namespace explicitly; scope tokens
+// write into their auth-derived namespace only. Device tokens are rejected.
+// See metaPutReq for the accepted body shapes and namespace policy.
 func (s *Server) handlePutMeta(w http.ResponseWriter, r *http.Request) {
-	if requireMaster(w, r) {
+	// Gate: accept master OR scope:<name>. Anything else (device, no auth
+	// tag) gets the same 403 requireMaster would have returned.
+	scope, hasScope := scopeFromAuth(r)
+	isMaster := r.Header.Get("X-Argus-Auth") == "master"
+	if !isMaster && !hasScope {
+		http.Error(w, `{"error":"master or scope token required"}`, http.StatusForbidden)
 		return
 	}
 	id := r.PathValue("id")
@@ -99,6 +130,18 @@ func (s *Server) handlePutMeta(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON: " + err.Error()})
 		return
+	}
+
+	// Namespace resolution. Scope tokens force-override (and reject explicit
+	// mismatch); master tokens require an explicit namespace.
+	if hasScope {
+		if req.Namespace != "" && req.Namespace != scope {
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error": "scope token cannot write outside its namespace",
+			})
+			return
+		}
+		req.Namespace = scope
 	}
 	if req.Namespace == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "namespace is required"})

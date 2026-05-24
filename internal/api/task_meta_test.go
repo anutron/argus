@@ -149,6 +149,115 @@ func TestAPI_PutMeta_RequiresMaster(t *testing.T) {
 	testutil.Equal(t, w.Code, http.StatusForbidden)
 }
 
+// scopeReq stamps X-Argus-Auth: scope:<name> to simulate a request that
+// the auth middleware would have tagged when authenticated by a plugin-scoped
+// token. Mirrors masterReq/deviceReq from messages_test.go.
+//
+// PR 1 of the substrate plan ships the actual middleware-side tagging. Until
+// it lands, the handler-side enforcement is exercised directly with a
+// hand-stamped header — same pattern as masterReq.
+func scopeReq(method, url, body, scope string) *http.Request {
+	req := authedReq(method, url, body)
+	req.Header.Set("X-Argus-Auth", "scope:"+scope)
+	return req
+}
+
+func TestAPI_PutMeta_Scope_OmittedNamespace_AutoDerives(t *testing.T) {
+	srv, d := testServer(t)
+	task := &model.Task{Name: "t"}
+	testutil.NoError(t, d.Add(task))
+
+	mux := srv.routes()
+	// Body has no namespace field — handler must auto-derive from the
+	// scope tag.
+	body := `{"key":"role","value":"coordinator"}`
+	req := scopeReq("PUT", "/api/tasks/"+task.ID+"/meta", body, "ludwig")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	testutil.Equal(t, w.Code, http.StatusOK)
+
+	entries, err := d.ListMeta(task.ID, "ludwig")
+	testutil.NoError(t, err)
+	testutil.Equal(t, len(entries), 1)
+	testutil.Equal(t, entries[0].Namespace, "ludwig")
+	testutil.Equal(t, entries[0].Key, "role")
+	testutil.Equal(t, entries[0].Value, "coordinator")
+}
+
+func TestAPI_PutMeta_Scope_MatchingNamespace_OK(t *testing.T) {
+	srv, d := testServer(t)
+	task := &model.Task{Name: "t"}
+	testutil.NoError(t, d.Add(task))
+
+	mux := srv.routes()
+	body := `{"namespace":"ludwig","key":"role","value":"worker"}`
+	req := scopeReq("PUT", "/api/tasks/"+task.ID+"/meta", body, "ludwig")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	testutil.Equal(t, w.Code, http.StatusOK)
+
+	entries, err := d.ListMeta(task.ID, "ludwig")
+	testutil.NoError(t, err)
+	testutil.Equal(t, len(entries), 1)
+	testutil.Equal(t, entries[0].Value, "worker")
+}
+
+func TestAPI_PutMeta_Scope_CrossNamespace_Forbidden(t *testing.T) {
+	srv, d := testServer(t)
+	task := &model.Task{Name: "t"}
+	testutil.NoError(t, d.Add(task))
+
+	mux := srv.routes()
+	// A scope:ludwig token tries to write into namespace=other.
+	body := `{"namespace":"other","key":"role","value":"worker"}`
+	req := scopeReq("PUT", "/api/tasks/"+task.ID+"/meta", body, "ludwig")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	testutil.Equal(t, w.Code, http.StatusForbidden)
+
+	// And no row was written to either namespace.
+	entries, err := d.ListMeta(task.ID, "")
+	testutil.NoError(t, err)
+	testutil.Equal(t, len(entries), 0)
+}
+
+// TestAPI_PutMeta_Scope_EmptySuffix_Rejected covers the scopeFromAuth
+// empty-suffix branch — a malformed `X-Argus-Auth: scope:` header must NOT
+// be treated as a valid scope token (would otherwise allow a write into the
+// empty-string namespace).
+func TestAPI_PutMeta_Scope_EmptySuffix_Rejected(t *testing.T) {
+	srv, d := testServer(t)
+	task := &model.Task{Name: "t"}
+	testutil.NoError(t, d.Add(task))
+
+	mux := srv.routes()
+	req := scopeReq("PUT", "/api/tasks/"+task.ID+"/meta",
+		`{"namespace":"x","key":"k","value":"v"}`, "")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	testutil.Equal(t, w.Code, http.StatusForbidden)
+}
+
+func TestAPI_PutMeta_Master_ExplicitNamespace_Unchanged(t *testing.T) {
+	srv, d := testServer(t)
+	task := &model.Task{Name: "t"}
+	testutil.NoError(t, d.Add(task))
+
+	mux := srv.routes()
+	// Master tier — body's explicit namespace is taken as-is, even one
+	// that "looks like" a scope it doesn't own.
+	body := `{"namespace":"ludwig","key":"role","value":"coordinator"}`
+	req := masterReq("PUT", "/api/tasks/"+task.ID+"/meta", body)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	testutil.Equal(t, w.Code, http.StatusOK)
+
+	entries, err := d.ListMeta(task.ID, "ludwig")
+	testutil.NoError(t, err)
+	testutil.Equal(t, len(entries), 1)
+	testutil.Equal(t, entries[0].Value, "coordinator")
+}
+
 func TestAPI_PutMeta_TaskNotFound(t *testing.T) {
 	srv, _ := testServer(t)
 	mux := srv.routes()
