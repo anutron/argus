@@ -150,6 +150,13 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("DELETE /api/plugins/settings/sections/{scope}/{title}", s.handleUnregisterPluginSection)
 	mux.HandleFunc("POST /api/plugins/settings/sections/{scope}/{title}/submit", s.handleSubmitPluginSectionValues)
 
+	// Plugin-registered top-level views (PR 9). POST/GET/DELETE are master-only
+	// today; see internal/api/plugin_views.go for the post-PR-1 swap TODO
+	// that broadens auth to "master OR scope" once scope-tokens land.
+	mux.HandleFunc("POST /api/plugins/views", s.handleCreatePluginView)
+	mux.HandleFunc("GET /api/plugins/views", s.handleListPluginViews)
+	mux.HandleFunc("DELETE /api/plugins/views/{id}", s.handleDeletePluginView)
+
 	return mux
 }
 
