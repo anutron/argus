@@ -58,6 +58,18 @@ func TestParseSection_DefaultTypeIsForm(t *testing.T) {
 	testutil.Equal(t, got.Type, TypeForm)
 }
 
+func TestParseSection_StreamMinimal(t *testing.T) {
+	// Stream sections have title + type + callback_url, no fields.
+	raw := []byte(`{"title":"Live orchestrators","type":"stream","callback_url":"ws://127.0.0.1:9991/live"}`)
+	got, err := ParseSection("ludwig", raw)
+	testutil.NoError(t, err)
+	testutil.Equal(t, got.Scope, "ludwig")
+	testutil.Equal(t, got.Title, "Live orchestrators")
+	testutil.Equal(t, got.Type, TypeStream)
+	testutil.Equal(t, got.CallbackURL, "ws://127.0.0.1:9991/live")
+	testutil.Nil(t, got.Spec)
+}
+
 func TestParseSection_Rejects(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -78,10 +90,10 @@ func TestParseSection_Rejects(t *testing.T) {
 			wantErr: ErrInvalidTitle,
 		},
 		{
-			name:    "stream type rejected",
+			name:    "stream type with fields rejected",
 			scope:   "s",
-			raw:     `{"title":"x","type":"stream","callback_url":"ws://x"}`,
-			wantErr: ErrInvalidType,
+			raw:     `{"title":"x","type":"stream","callback_url":"ws://x","fields":[{"key":"k","label":"l","type":"bool"}]}`,
+			wantErr: ErrStreamHasFields,
 		},
 		{
 			name:    "unknown type rejected",

@@ -68,15 +68,16 @@ A revoked token loses all of the above; argus cascades the revocation by droppin
 | ------------------------------------------------------- | ---------- | ----------------------------- | -------------------------------------- |
 | `/api/events/stream?since=<id>`                         | GET (SSE)  | any authenticated             | Subscribe to the daemon event stream   |
 | `/api/tasks/:id/meta?namespace=<ns>`                    | GET        | any authenticated             | Read task metadata                     |
-| `/api/tasks/:id/meta`                                   | PUT        | `master` (PR 3) [^meta-write] | Write task metadata                    |
+| `/api/tasks/:id/meta`                                   | PUT        | `master` or `scope:<name>`    | Write task metadata (scope auto-derives namespace) |
 | `/api/tasks/:id/input`                                  | POST       | any authenticated             | Inject input bytes into a task PTY     |
 | `/api/mcp/tools`                                        | POST       | `scope:<name>`                | Register an MCP tool                   |
 | `/api/mcp/tools/:name`                                  | DELETE     | owning scope or `master`      | Unregister an MCP tool                 |
 | `/api/plugins/settings/sections`                        | GET        | any authenticated             | List registered plugin settings sections |
 | `/api/plugins/settings/sections`                        | POST       | `scope:<name>`                | Register a settings section            |
 | `/api/plugins/settings/sections/:scope/:title`          | DELETE     | owning scope or `master`      | Unregister a settings section          |
-
-[^meta-write]: Today `PUT /api/tasks/:id/meta` is master-only and takes `namespace` from the request body. The substrate plan intends scope-scoped writes (auto-namespace from the auth tag) as a follow-up; until that lands, plugins write metadata by proxying through a small server-side helper that holds the master token, or wait for the auto-namespacing PR. The contract for `GET` is already plugin-callable.
+| `/api/plugins/views`                                    | POST       | `master` or `scope:<name>`    | Register a top-level plugin view       |
+| `/api/plugins/views`                                    | GET        | `master` or `scope:<name>`    | List plugin views (scope-filtered)     |
+| `/api/plugins/views/:id`                                | DELETE     | owning scope or `master`      | Unregister a plugin view               |
 
 All endpoints return JSON. Errors are `{"error": "..."}` with the appropriate HTTP status. Bodies are capped (1 MiB for metadata, 256 KiB for MCP tool registration and section registration, 64 KiB for input).
 
@@ -534,9 +535,7 @@ The substrate was specified up front in `PLAN.md` and implemented across seven i
 
 - **`X-Argus-Plugin-Version` is observed, not enforced.** The plan says "Argus rejects requests with unsupported versions." The middleware does not check the header today. The recommendation to send `X-Argus-Plugin-Version: 1` stands — when enforcement lands as part of a major bump, that line keeps every existing plugin working.
 
-- **`PUT /api/tasks/:id/meta` is master-only and takes an explicit `namespace` in the body.** The plan called for namespaces to be auto-derived from the auth scope and for plugin-scoped writes to be accepted. Reads are already scope-friendly (any authenticated token); writes are deferred to a follow-up PR. Until then, plugins that need to write metadata either ask the user to run the write under master credentials or route through a small server-side helper.
-
-- **Settings section type `stream` is reserved and rejected at registration.** PR 7 of the substrate ships `form` only. The plan describes a WebSocket-backed stream variant; that wiring follows the streampane widget integration in a later PR. The doc keeps the `stream` shape so plugin authors can preview the contract, but `type: "stream"` will fail validation today.
+- **Settings section type `stream` accepts registration but the TUI rail rendering for stream sections is not yet wired.** Plugins can register `type: "stream"` and the section round-trips through the daemon and the `plugin_settings` table, but the TUI does not yet open the WebSocket and pipe bytes into a streampane when the user focuses the rail entry. That wiring is the follow-up; the registration side is live so plugin authors can sequence their setup behind it.
 
 - **MCP tool registration responds `201 Created` even on the heartbeat upsert path.** The plan implied `200 OK` on idempotent re-registration. The API currently returns `201` for both first-create and refresh; the registry distinguishes the two internally but the HTTP layer does not. Clients should treat both as success.
 

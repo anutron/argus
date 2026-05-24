@@ -7,9 +7,10 @@
 //
 //   - `form` — a typed spec the TUI renders as inline rows. On user save, the
 //     `{key: value}` map is POSTed to the plugin's `callback_url`.
-//   - `stream` — reserved for a future PR. The substrate plan allows PR 7 to
-//     soft-defer the stream type, and we do; validation here rejects it so
-//     plugins fail loudly instead of registering an unrenderable section.
+//   - `stream` — a WebSocket-backed live block. When the section is focused,
+//     argus opens a WebSocket to `callback_url`; the plugin pushes ANSI bytes
+//     and the TUI renders them via the streampane widget. Stream sections
+//     have no fields — `callback_url` is the only required attribute.
 //
 // Field rendering rules live in `internal/tui/settings.go`. The package is
 // transport-agnostic: it parses, validates, and stores section descriptors;
@@ -81,7 +82,7 @@ type FormSpec struct {
 
 // Section is the persisted shape of a registered plugin settings section.
 // One row in `plugin_settings`. `Spec` is the typed FormSpec when `Type` is
-// `form`; for `stream` (currently rejected) it would carry a stream config.
+// `form`; stream sections leave `Spec` nil and only carry `CallbackURL`.
 type Section struct {
 	// Scope is the plugin scope from the auth token. The TUI groups every
 	// section by scope when rendering the "Plugins" header.
@@ -91,13 +92,14 @@ type Section struct {
 	// register at most one section per the substrate plan, so per-scope
 	// uniqueness is also effectively per-plugin uniqueness today.
 	Title string
-	// Type discriminates form vs stream. Only form is accepted in v1.
+	// Type discriminates form vs stream.
 	Type SectionType
-	// Spec is the parsed form-section schema. Nil for non-form sections (which
-	// today means nothing — stream is rejected at the validator boundary).
+	// Spec is the parsed form-section schema. Nil for stream sections — those
+	// have no fields and stream ANSI bytes directly from the callback URL.
 	Spec *FormSpec
-	// CallbackURL is where argus POSTs `{key: value}` on user save. Required
-	// for form sections so the form's outputs can reach the plugin.
+	// CallbackURL is where argus interacts with the plugin. For form sections,
+	// argus POSTs `{key: value}` on user save. For stream sections, argus
+	// opens a WebSocket and pipes received bytes into the rail's streampane.
 	CallbackURL string
 }
 
@@ -105,8 +107,9 @@ type Section struct {
 var (
 	ErrInvalidScope        = errors.New("settings: scope must be non-empty")
 	ErrInvalidTitle        = errors.New("settings: title must be non-empty")
-	ErrInvalidType         = errors.New("settings: type must be form (stream is not yet supported)")
-	ErrMissingCallbackURL  = errors.New("settings: callback_url is required for form sections")
+	ErrInvalidType         = errors.New("settings: type must be form or stream")
+	ErrMissingCallbackURL  = errors.New("settings: callback_url is required")
+	ErrStreamHasFields     = errors.New("settings: stream sections must not declare fields")
 	ErrEmptyForm           = errors.New("settings: form must declare at least one field")
 	ErrFieldMissingKey     = errors.New("settings: field key must be non-empty")
 	ErrFieldMissingLabel   = errors.New("settings: field label must be non-empty")
@@ -151,11 +154,24 @@ func ParseSection(scope string, raw []byte) (Section, error) {
 	if r.Type == "" {
 		r.Type = TypeForm
 	}
-	if r.Type != TypeForm {
+	if r.Type != TypeForm && r.Type != TypeStream {
 		return Section{}, ErrInvalidType
 	}
 	if r.CallbackURL == "" {
 		return Section{}, ErrMissingCallbackURL
+	}
+	if r.Type == TypeStream {
+		// Stream sections carry no schema — fields/spec on the wire are a
+		// shape mismatch; reject loudly rather than silently dropping.
+		if len(r.Spec) > 0 || len(r.Fields) > 0 {
+			return Section{}, ErrStreamHasFields
+		}
+		return Section{
+			Scope:       scope,
+			Title:       r.Title,
+			Type:        r.Type,
+			CallbackURL: r.CallbackURL,
+		}, nil
 	}
 	spec, err := parseFormSpec(r.Spec, r.Fields)
 	if err != nil {

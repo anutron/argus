@@ -20,9 +20,9 @@ type pluginViewJSON struct {
 	CreatedAt   string `json:"created_at,omitempty"`
 }
 
-// pluginViewCreateReq is the POST body. The scope column is reserved for the
-// post-PR-1 scope-token swap; today scope is always "" because requireMaster
-// is the gate. See the TODO on each handler.
+// pluginViewCreateReq is the POST body. The row's scope is derived from the
+// auth header (master → "", scope:<name> → "<name>") rather than the body,
+// so a plugin cannot register into another plugin's namespace.
 type pluginViewCreateReq struct {
 	Title       string `json:"title"`
 	Hotkey      string `json:"hotkey"`
@@ -42,11 +42,14 @@ func toPluginViewJSON(v *views.View) pluginViewJSON {
 
 // handleCreatePluginView registers a new plugin-owned top-level view.
 //
-// TODO(post-PR-1): swap requireMaster for "master OR scope". The scope column
-// on plugin_views is reserved for that follow-up; today every registration
-// comes from the master token and lands with scope="".
+// Master tokens register into the empty scope (""); scope:<name> tokens
+// register under their own scope. Device tokens are rejected. The row's
+// scope is forced from the auth header — the body has no scope field.
 func (s *Server) handleCreatePluginView(w http.ResponseWriter, r *http.Request) {
-	if requireMaster(w, r) {
+	scope, hasScope := scopeFromAuth(r)
+	isMaster := r.Header.Get("X-Argus-Auth") == "master"
+	if !isMaster && !hasScope {
+		http.Error(w, `{"error":"master or scope token required"}`, http.StatusForbidden)
 		return
 	}
 	var req pluginViewCreateReq
@@ -56,7 +59,7 @@ func (s *Server) handleCreatePluginView(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	reg := views.New(s.db)
-	v, err := reg.Register("", req.Title, req.Hotkey, req.CallbackURL)
+	v, err := reg.Register(scope, req.Title, req.Hotkey, req.CallbackURL)
 	if err != nil {
 		switch {
 		case errors.Is(err, views.ErrTitleRequired),
@@ -72,18 +75,23 @@ func (s *Server) handleCreatePluginView(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusCreated, toPluginViewJSON(v))
 }
 
-// handleListPluginViews returns every registered view ordered by insertion.
-//
-// TODO(post-PR-1): swap requireMaster for "master OR scope" and filter by the
-// caller's scope. Today the master token sees every row.
+// handleListPluginViews returns registered views ordered by insertion.
+// Master tokens see every row; scope:<name> tokens see only rows whose
+// scope matches their auth tag. Device tokens are rejected.
 func (s *Server) handleListPluginViews(w http.ResponseWriter, r *http.Request) {
-	if requireMaster(w, r) {
+	scope, hasScope := scopeFromAuth(r)
+	isMaster := r.Header.Get("X-Argus-Auth") == "master"
+	if !isMaster && !hasScope {
+		http.Error(w, `{"error":"master or scope token required"}`, http.StatusForbidden)
 		return
 	}
 	reg := views.New(s.db)
 	all := reg.List()
 	out := make([]pluginViewJSON, 0, len(all))
 	for _, v := range all {
+		if hasScope && v.Scope != scope {
+			continue
+		}
 		out = append(out, toPluginViewJSON(v))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"views": out})
@@ -93,14 +101,17 @@ func (s *Server) handleListPluginViews(w http.ResponseWriter, r *http.Request) {
 //
 // The spec sketch called for DELETE /api/plugins/views/{scope}/{title}, but
 // Go's net/http.ServeMux canonicalises `//` segments and 307-redirects, which
-// makes the spec-shape unusable while every row has scope="". Using {id}
-// matches the existing /api/tokens/{id} precedent and works today + after
-// PR 1's scope-token swap lands.
+// makes the spec-shape unusable when scope is "". Using {id} matches the
+// existing /api/tokens/{id} precedent.
 //
-// TODO(post-PR-1): swap requireMaster for "master OR scope" and reject delete
-// requests whose caller's scope doesn't match the row's scope.
+// Master tokens can delete any row. scope:<name> tokens can only delete rows
+// whose scope matches theirs — a cross-scope delete returns 403, never 404,
+// so a plugin cannot probe for the existence of another plugin's views.
 func (s *Server) handleDeletePluginView(w http.ResponseWriter, r *http.Request) {
-	if requireMaster(w, r) {
+	scope, hasScope := scopeFromAuth(r)
+	isMaster := r.Header.Get("X-Argus-Auth") == "master"
+	if !isMaster && !hasScope {
+		http.Error(w, `{"error":"master or scope token required"}`, http.StatusForbidden)
 		return
 	}
 	idStr := r.PathValue("id")
@@ -127,6 +138,10 @@ func (s *Server) handleDeletePluginView(w http.ResponseWriter, r *http.Request) 
 	}
 	if match == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "view not found"})
+		return
+	}
+	if hasScope && match.Scope != scope {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "view belongs to a different scope"})
 		return
 	}
 	reg := views.New(s.db)
