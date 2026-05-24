@@ -18,6 +18,7 @@ import (
 	"github.com/drn/argus/internal/spinner"
 	pluginsettings "github.com/drn/argus/internal/tui/settings"
 	"github.com/drn/argus/internal/tui/store"
+	"github.com/drn/argus/internal/tui/streampane"
 	"github.com/drn/argus/internal/tui/theme"
 	"github.com/drn/argus/internal/tui/widget"
 	"github.com/drn/argus/internal/uxlog"
@@ -255,6 +256,26 @@ type SettingsView struct {
 	// detail panel — "Saved", an error message, or empty.
 	pluginSubmitStatus map[pluginKey]string
 
+	// Stream-section mounts. Cached per (scope, title); the streampane stays
+	// alive across focus toggles so previously-received bytes are visible on
+	// re-entry. OnStreamFocus / OnStreamBlur signal the app to open / close
+	// the WebSocket connector — the settings view itself does not own the
+	// connector, only the streampane and its byte channels.
+	streamMounts map[pluginKey]*streamSectionMount
+	// streamActive identifies which stream section currently holds focus
+	// (zero value when none). Used to fire OnStreamBlur on transitions.
+	streamActive pluginKey
+
+	// OnStreamFocus fires when a stream section gains focus. The app dials
+	// callbackURL and pumps received bytes into bytesIn, while forwarding
+	// keystrokes read from keysOut to the plugin. Safe to leave nil — the
+	// streampane will simply render no live content.
+	OnStreamFocus func(scope, title, callbackURL string, bytesIn chan<- []byte, keysOut <-chan []byte)
+	// OnStreamBlur fires when a stream section loses focus (category change,
+	// focus moved to rail, or section unregistered). The app closes the
+	// connector. Safe to leave nil.
+	OnStreamBlur func(scope, title string)
+
 	// Callbacks.
 	OnRestartDaemon          func()
 	OnUpdateArgus            func()                        // triggered by the "Update Argus" row
@@ -280,6 +301,18 @@ type SettingsView struct {
 	// Persistence handle for toggling values. Both local *db.DB and remote
 	// *apistore.Store satisfy this interface.
 	database store.Store
+}
+
+// streamSectionMount is one streampane + its byte/key channels, cached on
+// the settings view per (scope, title). bytesIn is the channel the app's
+// connector pushes ANSI bytes into; keysOut carries keystrokes the streampane
+// reads from focused-pane input. The streampane consumes bytesIn until the
+// mount is torn down — kept alive across focus toggles so re-entering the
+// section preserves previously-received content without a re-dial round trip.
+type streamSectionMount struct {
+	bytesIn chan []byte
+	keysOut chan []byte
+	pane    *streampane.StreamPane
 }
 
 type projectEntry struct {
@@ -311,6 +344,7 @@ func NewSettingsView(database store.Store) *SettingsView {
 		focus:              focusPane,
 		pluginValues:       make(map[pluginKey]map[string]any),
 		pluginSubmitStatus: make(map[pluginKey]string),
+		streamMounts:       make(map[pluginKey]*streamSectionMount),
 	}
 }
 
@@ -437,9 +471,6 @@ func (sv *SettingsView) Refresh() {
 // doesn't leak its draft values forever, and the Refresh-resync after an
 // unregister surfaces an empty form if the plugin re-registers later.
 func (sv *SettingsView) prunePluginValues() {
-	if len(sv.pluginValues) == 0 {
-		return
-	}
 	live := make(map[pluginKey]bool, len(sv.pluginSections))
 	for _, sec := range sv.pluginSections {
 		live[pluginKey{scope: sec.Scope, title: sec.Title}] = true
@@ -452,6 +483,24 @@ func (sv *SettingsView) prunePluginValues() {
 	for k := range sv.pluginSubmitStatus {
 		if !live[k] {
 			delete(sv.pluginSubmitStatus, k)
+		}
+	}
+	// Stream mounts whose section was unregistered: close the streampane and
+	// fire OnStreamBlur if it was the active focused stream. Closing the
+	// streampane stops its consumer goroutine; the channels are not closed
+	// here because the app's connector may still hold the send side (it
+	// will see the closed source via its own Done channel on shutdown).
+	for k, m := range sv.streamMounts {
+		if live[k] {
+			continue
+		}
+		m.pane.Close()
+		delete(sv.streamMounts, k)
+		if sv.streamActive == k {
+			if sv.OnStreamBlur != nil {
+				sv.OnStreamBlur(k.scope, k.title)
+			}
+			sv.streamActive = pluginKey{}
 		}
 	}
 }
@@ -596,6 +645,57 @@ func (sv *SettingsView) activePluginSection() *pluginsettings.Section {
 		}
 	}
 	return nil
+}
+
+// currentStreamKey returns the pluginKey identifying the focused stream
+// section, or the zero pluginKey when no stream section currently holds
+// focus (either the active category isn't catPlugin, the active section was
+// unregistered, or the section is a form rather than a stream).
+func (sv *SettingsView) currentStreamKey() pluginKey {
+	sec := sv.activePluginSection()
+	if sec == nil || sec.Type != pluginsettings.TypeStream {
+		return pluginKey{}
+	}
+	return pluginKey{scope: sec.Scope, title: sec.Title}
+}
+
+// ensureStreamMount lazily creates a streampane + byte/key channels for the
+// given (scope, title) and caches it on sv.streamMounts. Subsequent calls
+// return the cached mount so re-entry preserves received bytes.
+func (sv *SettingsView) ensureStreamMount(key pluginKey, title string) *streamSectionMount {
+	if m, ok := sv.streamMounts[key]; ok {
+		return m
+	}
+	bytesIn := make(chan []byte, 64)
+	keysOut := make(chan []byte, 64)
+	pane := streampane.New(bytesIn)
+	pane.SetTitle(title)
+	pane.SetInputBack(keysOut)
+	m := &streamSectionMount{bytesIn: bytesIn, keysOut: keysOut, pane: pane}
+	sv.streamMounts[key] = m
+	return m
+}
+
+// notifyStreamTransition compares before/after focus and fires OnStreamBlur
+// / OnStreamFocus when the focused stream section identity changes. Capture
+// `before` via currentStreamKey() before any mutation that could change the
+// active section.
+func (sv *SettingsView) notifyStreamTransition(before pluginKey) {
+	after := sv.currentStreamKey()
+	if before == after {
+		return
+	}
+	if before != (pluginKey{}) && sv.OnStreamBlur != nil {
+		sv.OnStreamBlur(before.scope, before.title)
+	}
+	if after != (pluginKey{}) {
+		sec := sv.activePluginSection()
+		if sec != nil && sv.OnStreamFocus != nil {
+			mount := sv.ensureStreamMount(after, sec.Title)
+			sv.OnStreamFocus(after.scope, after.title, sec.CallbackURL, mount.bytesIn, mount.keysOut)
+		}
+	}
+	sv.streamActive = after
 }
 
 // pluginValueFor returns the user's current draft value for (key, title).
@@ -751,11 +851,18 @@ func (sv *SettingsView) rebuildRows() {
 		sv.rows = append(sv.rows, settingsRow{kind: srLogs, label: "Daemon Log", key: "daemon"})
 
 	case catPlugin:
-		// One row per registered form field, plus a Save row that POSTs the
-		// current draft values back to the daemon (which proxies to the
-		// plugin's callback URL).
+		// Form sections: one row per field plus a Save row that POSTs the
+		// current draft values back to the daemon. Stream sections render via
+		// a streampane in renderPane and add no rows here — the right pane
+		// devotes its full height to the streampane.
 		sec := sv.activePluginSection()
-		if sec == nil || sec.Spec == nil {
+		if sec == nil {
+			break
+		}
+		if sec.Type == pluginsettings.TypeStream {
+			break
+		}
+		if sec.Spec == nil {
 			break
 		}
 		for i := range sec.Spec.Fields {
@@ -1075,6 +1182,7 @@ func (sv *SettingsView) setActiveFromRail(e railEntry) {
 		if sv.category == catPlugin && sv.activePlugin == e.key {
 			return
 		}
+		beforeStream := sv.currentStreamKey()
 		sv.activePlugin = e.key
 		// Force a category change notification even when the old category
 		// was already catPlugin (different plugin section, same enum).
@@ -1083,6 +1191,7 @@ func (sv *SettingsView) setActiveFromRail(e railEntry) {
 		sv.cursor = 0
 		sv.scrollOff = 0
 		sv.rebuildRows()
+		sv.notifyStreamTransition(beforeStream)
 		if oldCat != catPlugin {
 			sv.notifyBranchChange()
 		}
@@ -1145,6 +1254,7 @@ func (sv *SettingsView) setCategory(c settingsCategory) {
 	if sv.category == c {
 		return
 	}
+	beforeStream := sv.currentStreamKey()
 	sv.category = c
 	sv.cursor = 0
 	sv.scrollOff = 0
@@ -1155,6 +1265,7 @@ func (sv *SettingsView) setCategory(c settingsCategory) {
 		sv.activePlugin = pluginKey{}
 	}
 	sv.rebuildRows()
+	sv.notifyStreamTransition(beforeStream)
 	sv.notifyBranchChange()
 }
 
@@ -1667,6 +1778,19 @@ func (sv *SettingsView) renderPane(screen tcell.Screen, x, y, w, h int) {
 		return
 	}
 	widget.FillArea(screen, ix, iy, iw, ih, ' ', tcell.StyleDefault)
+
+	// Stream sections get the full inner rect rendered as a streampane —
+	// items list, separator, and detail rows are all skipped because the
+	// pane is live ANSI content rather than discrete rows.
+	if sv.category == catPlugin {
+		if sec := sv.activePluginSection(); sec != nil && sec.Type == pluginsettings.TypeStream {
+			if mount, ok := sv.streamMounts[pluginKey{scope: sec.Scope, title: sec.Title}]; ok {
+				mount.pane.SetRect(ix, iy, iw, ih)
+				mount.pane.Draw(screen)
+			}
+			return
+		}
+	}
 
 	// Title row.
 	widget.DrawText(screen, ix, iy, iw, sv.category.Label(), theme.StyleTitle)

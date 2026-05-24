@@ -256,6 +256,20 @@ type App struct {
 	pluginHotkeys     map[tcell.Key]*pluginViewMount
 	activePlugin      *pluginViewMount
 	pluginConnFactory pluginConnectorFactory
+
+	// Stream-section connectors. Keyed by (scope, title). Created on
+	// SettingsView.OnStreamFocus, closed on OnStreamBlur. Reuses the same
+	// connector factory as plugin views so smoke tests can stub.
+	streamConns   map[pluginStreamKey]pluginConnector
+	streamConnsMu sync.Mutex
+}
+
+// pluginStreamKey identifies an open stream-section connector. Matches the
+// SettingsView's pluginKey shape but lives in package tui so it doesn't
+// re-export internal/tui's pluginKey.
+type pluginStreamKey struct {
+	scope string
+	title string
 }
 
 // New creates the tui application shell.
@@ -311,6 +325,8 @@ func New(database store.Store, runner agent.SessionProvider, daemonConnected boo
 	app.settings.OnDeleteSchedule = func(id string) { app.deleteSchedule(id) }
 	app.settings.OnRunSchedule = func(id string) { app.runScheduleNow(id) }
 	app.settings.OnBranchChange = func() { app.forceRedraw("settings branch changed") }
+	app.settings.OnStreamFocus = app.openStreamSection
+	app.settings.OnStreamBlur = app.closeStreamSection
 	app.settings.SetPluginSubmit(app.submitPluginSection)
 	app.settingsPage = NewSettingsPage(app.settings)
 

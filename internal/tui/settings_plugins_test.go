@@ -37,6 +37,22 @@ func seedPluginSection(t *testing.T, d *db.DB, scope, title string) {
 	testutil.NoError(t, err)
 }
 
+// seedStreamSection persists a stream-type plugin section. Uses the package
+// boundary that matches what the daemon's POST handler builds at runtime.
+func seedStreamSection(t *testing.T, d *db.DB, scope, title, callbackURL string) {
+	t.Helper()
+	sec := pluginsettings.Section{
+		Scope:       scope,
+		Title:       title,
+		Type:        pluginsettings.TypeStream,
+		CallbackURL: callbackURL,
+	}
+	row, err := db.FromSection(sec)
+	testutil.NoError(t, err)
+	_, err = d.UpsertPluginSection(row)
+	testutil.NoError(t, err)
+}
+
 func TestSettingsView_PluginsHeaderHiddenByDefault(t *testing.T) {
 	sv := testSettingsView(t)
 	entries := sv.railEntries()
@@ -567,4 +583,121 @@ func selectFirstPluginSection(t *testing.T) *SettingsView {
 		t.Fatal("failed to select plugin section")
 	}
 	return sv
+}
+
+func TestSettingsView_StreamSection_RebuildRowsHasNoRows(t *testing.T) {
+	d, _ := db.OpenInMemory()
+	t.Cleanup(func() { d.Close() }) //nolint:errcheck
+	seedStreamSection(t, d, "ludwig", "Orchestrators", "ws://127.0.0.1:9991/live")
+	sv := NewSettingsView(d)
+	sv.Refresh()
+
+	for _, e := range sv.railEntries() {
+		if e.kind == railPlugin {
+			sv.setActiveFromRail(e)
+			break
+		}
+	}
+	testutil.Equal(t, sv.category, catPlugin)
+	// Stream sections render via streampane, not row-by-row, so the rows
+	// list must be empty even though the active section exists.
+	testutil.Equal(t, len(sv.rows), 0)
+}
+
+func TestSettingsView_StreamSection_FiresFocusAndBlur(t *testing.T) {
+	d, _ := db.OpenInMemory()
+	t.Cleanup(func() { d.Close() }) //nolint:errcheck
+	seedStreamSection(t, d, "ludwig", "Orchestrators", "ws://x")
+	sv := NewSettingsView(d)
+	sv.Refresh()
+
+	var focusedScope, focusedTitle, focusedURL string
+	var blurredScope, blurredTitle string
+	sv.OnStreamFocus = func(scope, title, url string, _ chan<- []byte, _ <-chan []byte) {
+		focusedScope = scope
+		focusedTitle = title
+		focusedURL = url
+	}
+	sv.OnStreamBlur = func(scope, title string) {
+		blurredScope = scope
+		blurredTitle = title
+	}
+
+	// Enter the stream section.
+	for _, e := range sv.railEntries() {
+		if e.kind == railPlugin {
+			sv.setActiveFromRail(e)
+			break
+		}
+	}
+	testutil.Equal(t, focusedScope, "ludwig")
+	testutil.Equal(t, focusedTitle, "Orchestrators")
+	testutil.Equal(t, focusedURL, "ws://x")
+
+	// Switching away fires blur.
+	sv.setCategory(catSystem)
+	testutil.Equal(t, blurredScope, "ludwig")
+	testutil.Equal(t, blurredTitle, "Orchestrators")
+}
+
+func TestSettingsView_StreamSection_PreservesMountAcrossFocusToggle(t *testing.T) {
+	d, _ := db.OpenInMemory()
+	t.Cleanup(func() { d.Close() }) //nolint:errcheck
+	seedStreamSection(t, d, "ludwig", "Live", "ws://x")
+	sv := NewSettingsView(d)
+	sv.Refresh()
+
+	var focusCount int
+	sv.OnStreamFocus = func(_, _, _ string, _ chan<- []byte, _ <-chan []byte) {
+		focusCount++
+	}
+
+	enter := func() {
+		for _, e := range sv.railEntries() {
+			if e.kind == railPlugin {
+				sv.setActiveFromRail(e)
+				break
+			}
+		}
+	}
+	enter()
+	mount1, ok := sv.streamMounts[pluginKey{scope: "ludwig", title: "Live"}]
+	testutil.Equal(t, ok, true)
+	sv.setCategory(catSystem)
+	enter()
+	mount2, ok := sv.streamMounts[pluginKey{scope: "ludwig", title: "Live"}]
+	testutil.Equal(t, ok, true)
+	if mount1 != mount2 {
+		t.Fatal("streampane mount should survive focus toggle")
+	}
+	testutil.Equal(t, focusCount, 2)
+}
+
+func TestSettingsView_StreamSection_UnregisterFiresBlur(t *testing.T) {
+	d, _ := db.OpenInMemory()
+	t.Cleanup(func() { d.Close() }) //nolint:errcheck
+	seedStreamSection(t, d, "ludwig", "Live", "ws://x")
+	sv := NewSettingsView(d)
+	sv.Refresh()
+
+	var blurredScope string
+	sv.OnStreamBlur = func(scope, _ string) { blurredScope = scope }
+	sv.OnStreamFocus = func(_, _, _ string, _ chan<- []byte, _ <-chan []byte) {}
+
+	for _, e := range sv.railEntries() {
+		if e.kind == railPlugin {
+			sv.setActiveFromRail(e)
+			break
+		}
+	}
+
+	// Plugin unregisters in the daemon — DB row removed.
+	_, err := d.DeletePluginSection("ludwig", "Live")
+	testutil.NoError(t, err)
+	sv.Refresh()
+
+	testutil.Equal(t, blurredScope, "ludwig")
+	if _, ok := sv.streamMounts[pluginKey{scope: "ludwig", title: "Live"}]; ok {
+		t.Fatal("stream mount should be cleaned up after unregister")
+	}
 }

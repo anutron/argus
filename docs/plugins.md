@@ -535,7 +535,7 @@ The substrate was specified up front in `PLAN.md` and implemented across seven i
 
 - **`X-Argus-Plugin-Version` is observed, not enforced.** The plan says "Argus rejects requests with unsupported versions." The middleware does not check the header today. The recommendation to send `X-Argus-Plugin-Version: 1` stands — when enforcement lands as part of a major bump, that line keeps every existing plugin working.
 
-- **Settings section type `stream` accepts registration but the TUI rail rendering for stream sections is not yet wired.** Plugins can register `type: "stream"` and the section round-trips through the daemon and the `plugin_settings` table, but the TUI does not yet open the WebSocket and pipe bytes into a streampane when the user focuses the rail entry. That wiring is the follow-up; the registration side is live so plugin authors can sequence their setup behind it.
+- **Settings section type `stream` ships end-to-end.** Plugins can register `type: "stream"` and the TUI opens a WebSocket to `callback_url` when the user focuses the rail entry, piping received ANSI bytes into a streampane filling the right pane. The connector closes on blur (category change or section unregister); the streampane survives focus toggles so re-entering the section preserves received content. Stream sections must not declare `fields` — registration rejects the combination.
 
 - **MCP tool registration responds `201 Created` even on the heartbeat upsert path.** The plan implied `200 OK` on idempotent re-registration. The API currently returns `201` for both first-create and refresh; the registry distinguishes the two internally but the HTTP layer does not. Clients should treat both as success.
 
