@@ -234,5 +234,24 @@ func (d *DB) createTables() error {
 	d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_msg_in_reply_to ON task_messages(in_reply_to)`)               //nolint:errcheck
 	d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_msg_from_created ON task_messages(from_task_id, created_at)`) //nolint:errcheck
 
+	// Plugin-registered top-level views. Each row is one full-screen UI surface
+	// owned by a plugin: the TUI opens a WebSocket to callback_url when the
+	// hotkey fires, streams ANSI bytes from the plugin into a streampane, and
+	// forwards keystrokes back. scope is reserved for the post-PR-1 scope-token
+	// gating swap; today every row is registered under the master token.
+	if _, err := d.conn.Exec(`
+		CREATE TABLE IF NOT EXISTS plugin_views (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			scope        TEXT NOT NULL DEFAULT '',
+			title        TEXT NOT NULL,
+			hotkey       TEXT NOT NULL DEFAULT '',
+			callback_url TEXT NOT NULL,
+			created_at   TEXT NOT NULL,
+			UNIQUE(scope, title)
+		)
+	`); err != nil {
+		return fmt.Errorf("creating plugin_views table: %w", err)
+	}
+
 	return nil
 }
