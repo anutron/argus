@@ -1,3 +1,8 @@
+## Streampane Widget
+
+- **StreamPane drops keystrokes when the input-back channel is full.** The widget's `send()` does a non-blocking `select` — matching the PTY writer backpressure pattern elsewhere in argus. Tests that pre-fill `back` and assert no drop will hang; assert "no panic / no second send" instead.
+- **StreamPane `Touched()` increments only on non-empty chunks.** Empty chunks are a no-op so callers can poll the counter for damage without spurious redraws when the source feeds heartbeat-style zero-byte signals.
+
 ## Database Patterns
 
 - **New columns use `ALTER TABLE ... ADD COLUMN ... DEFAULT ''` after `CREATE TABLE IF NOT EXISTS`.** Error for duplicate column silently ignored.
