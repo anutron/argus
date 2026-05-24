@@ -87,6 +87,15 @@ func requireMaster(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
+// authOrigin returns the originating principal of an authenticated request:
+// "master", "device", or "scope:<plugin>". Empty string when no header was set
+// — defensive; routes mounted behind authMiddleware always have it populated.
+// Audit log sites use the return value to stamp a `from` tag on mutating
+// events so input bytes (and other plugin-callable writes) are attributable.
+func authOrigin(r *http.Request) string {
+	return r.Header.Get("X-Argus-Auth")
+}
+
 // hashToken returns the SHA-256 hex digest of a plaintext token, used for
 // constant-time lookup against the api_tokens table.
 func hashToken(plain string) string {

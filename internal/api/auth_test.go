@@ -319,6 +319,35 @@ func TestAuthMiddleware_PluginScopeToken(t *testing.T) {
 	})
 }
 
+// TestAuthOrigin pins the contract of authOrigin: it returns the X-Argus-Auth
+// header value populated by authMiddleware. Audit log call sites read this to
+// stamp the originating principal (master, device, or scope:<plugin>) on
+// mutating events. An empty return must mean "unauthenticated" — defensive,
+// because routes mounted behind authMiddleware should always have the header
+// set, but the helper still needs to behave on raw requests built in tests.
+func TestAuthOrigin(t *testing.T) {
+	cases := []struct {
+		name   string
+		header string
+		want   string
+	}{
+		{name: "master", header: "master", want: "master"},
+		{name: "device", header: "device", want: "device"},
+		{name: "plugin scope", header: "scope:ludwig", want: "scope:ludwig"},
+		{name: "scope with dash", header: "scope:my-plugin", want: "scope:my-plugin"},
+		{name: "no header", header: "", want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/api/x", nil)
+			if tc.header != "" {
+				req.Header.Set("X-Argus-Auth", tc.header)
+			}
+			testutil.Equal(t, authOrigin(req), tc.want)
+		})
+	}
+}
+
 func TestVAPIDOriginFromRequest(t *testing.T) {
 	cases := []struct {
 		name       string
