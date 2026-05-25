@@ -69,6 +69,16 @@ type smoke struct {
 	mu          sync.Mutex
 	taskID      string // empty until phase 5 succeeds
 	backendName string // empty until phase 5 succeeds
+
+	// Phase results collected during run() for the end-of-run summary.
+	results []phaseResult
+}
+
+type phaseResult struct {
+	num    int
+	name   string
+	status string // "PASS" | "FAIL"
+	detail string // error message on FAIL
 }
 
 func main() {
@@ -86,13 +96,18 @@ func main() {
 		fmt.Fprintf(os.Stderr, "setup: %v\n", err)
 		os.Exit(2)
 	}
-	defer s.cleanup()
 
+	// os.Exit skips deferred functions, so cleanup MUST run before the call.
+	// Order: run -> print summary -> cleanup -> exit. printSummary first so
+	// the user sees results even if cleanup is slow.
+	exit := 0
 	if err := s.run(); err != nil {
 		fmt.Fprintf(os.Stderr, "FAIL: %v\n", err)
-		os.Exit(1)
+		exit = 1
 	}
-	fmt.Println("OK")
+	s.printSummary()
+	s.cleanup()
+	os.Exit(exit)
 }
 
 func newSmoke(baseURL, tokenFile, masterTokenFile, project, scope string, verbose, keep bool) (*smoke, error) {
@@ -133,35 +148,65 @@ func readTokenFile(path string) (string, error) {
 	return tok, nil
 }
 
+// phases lists the substrate verification phases in execution order. The
+// ordering is not the numeric ordering — later-numbered phases run earlier
+// when they're cheaper or build infrastructure for later ones (Phase 5 must
+// happen before Phase 4 because the meta tests need a task ID).
+func (s *smoke) phases() []struct {
+	num  int
+	name string
+	fn   func() error
+} {
+	return []struct {
+		num  int
+		name string
+		fn   func() error
+	}{
+		{1, "auth check", s.phase1AuthCheck},
+		{3, "event stream", s.phase3EventStream},
+		{5, "throwaway task", s.phase5ThrowawayTask},
+		{4, "task_meta", s.phase4TaskMeta},
+		{7, "plugin views", s.phase7PluginViews},
+		{6, "MCP tool registration", s.phase6MCPToolRegistration},
+		{10, "event resync", s.phase10EventResync},
+		{9, "input injection", s.phase9InputInjection},
+		{8, "stream section", s.phase8StreamSection},
+	}
+}
+
+// run executes every phase in order, stopping at the first failure (phases
+// have dependencies — Phase 4's metadata writes need Phase 5's task ID). Per-
+// phase results are recorded in s.results for printSummary to display at exit.
 func (s *smoke) run() error {
-	if err := s.phase1AuthCheck(); err != nil {
-		return fmt.Errorf("phase 1 (auth check): %w", err)
-	}
-	if err := s.phase3EventStream(); err != nil {
-		return fmt.Errorf("phase 3 (event stream): %w", err)
-	}
-	if err := s.phase5ThrowawayTask(); err != nil {
-		return fmt.Errorf("phase 5 (throwaway task): %w", err)
-	}
-	if err := s.phase4TaskMeta(); err != nil {
-		return fmt.Errorf("phase 4 (task_meta): %w", err)
-	}
-	if err := s.phase7PluginViews(); err != nil {
-		return fmt.Errorf("phase 7 (plugin views): %w", err)
-	}
-	if err := s.phase6MCPToolRegistration(); err != nil {
-		return fmt.Errorf("phase 6 (MCP tool registration): %w", err)
-	}
-	if err := s.phase10EventResync(); err != nil {
-		return fmt.Errorf("phase 10 (event resync): %w", err)
-	}
-	if err := s.phase9InputInjection(); err != nil {
-		return fmt.Errorf("phase 9 (input injection): %w", err)
-	}
-	if err := s.phase8StreamSection(); err != nil {
-		return fmt.Errorf("phase 8 (stream section): %w", err)
+	for _, p := range s.phases() {
+		err := p.fn()
+		res := phaseResult{num: p.num, name: p.name}
+		if err != nil {
+			res.status = "FAIL"
+			res.detail = err.Error()
+			s.results = append(s.results, res)
+			return fmt.Errorf("phase %d (%s): %w", p.num, p.name, err)
+		}
+		res.status = "PASS"
+		s.results = append(s.results, res)
 	}
 	return nil
+}
+
+// printSummary writes a one-line-per-phase table to stdout. Phases listed in
+// execution order (which is not numeric order — see phases()). PASS / FAIL
+// only; the harness fails fast on first error, so at most one FAIL row.
+func (s *smoke) printSummary() {
+	fmt.Println()
+	fmt.Println("Phase results:")
+	fmt.Println("  #   PHASE                            STATUS")
+	fmt.Println("  --  -------------------------------  ------")
+	for _, r := range s.results {
+		fmt.Printf("  %-2d  %-31s  %s\n", r.num, r.name, r.status)
+		if r.detail != "" {
+			fmt.Printf("      %s\n", truncate(r.detail, 200))
+		}
+	}
 }
 
 // cleanup tears down resources allocated during the run. Safe to call
