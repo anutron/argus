@@ -148,6 +148,9 @@ func (s *smoke) run() error {
 	if err := s.phase7PluginViews(); err != nil {
 		return fmt.Errorf("phase 7 (plugin views): %w", err)
 	}
+	if err := s.phase6MCPToolRegistration(); err != nil {
+		return fmt.Errorf("phase 6 (MCP tool registration): %w", err)
+	}
 	return nil
 }
 
@@ -282,6 +285,94 @@ func (s *smoke) phase4TaskMeta() error {
 	}
 	s.logf("cross-namespace PUT correctly rejected with 403")
 	return nil
+}
+
+// phase6MCPToolRegistration registers an MCP tool against the live registry,
+// verifies the daemon force-prefixes by scope (rejects names that don't
+// start with "<scope>_"), and exercises the un-register path. No invocation
+// from an MCP client — that would require an MCP stdio client, which is
+// out of scope for v1. The registry's proxy logic is exercised in unit
+// tests inside internal/mcp.
+func (s *smoke) phase6MCPToolRegistration() error {
+	plugin := newFakePlugin()
+	defer plugin.Stop()
+
+	toolName := s.scope + "_hello"
+	ok, err := s.registerMCPTool(toolName, plugin)
+	if err != nil {
+		return fmt.Errorf("register MCP tool: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("daemon did not return 201 on registration")
+	}
+	defer s.unregisterMCPToolTolerant(toolName)
+	s.logf("registered MCP tool %q (callback=%s)", toolName, plugin.URL())
+
+	// (2) Wrong-prefix registration must be rejected. The substrate enforces
+	// name = <scope>_<rest>; smuggling a tool under a different prefix would
+	// let one plugin hijack another's namespace.
+	hostileName := "not" + s.scope + "_hello"
+	body := mcpRegBody(hostileName, plugin)
+	resp, err := s.scopedRequest(http.MethodPost, "/api/mcp/tools", body)
+	if err != nil {
+		return fmt.Errorf("POST hostile tool: %w", err)
+	}
+	if err := expectStatus(resp, http.StatusBadRequest, "POST hostile-prefix tool"); err != nil {
+		return err
+	}
+	s.logf("wrong-prefix MCP tool registration correctly rejected with 400")
+
+	// (3) Unregister our own tool — must succeed.
+	resp, err = s.scopedRequest(http.MethodDelete, "/api/mcp/tools/"+toolName, "")
+	if err != nil {
+		return fmt.Errorf("DELETE own tool: %w", err)
+	}
+	if err := expectStatus(resp, http.StatusOK, "DELETE own MCP tool"); err != nil {
+		return err
+	}
+	s.logf("unregistered MCP tool %q", toolName)
+
+	// (4) Re-DELETE is idempotent: registry returns nil on missing-tool, the
+	// handler returns 200. Pinning this so a future refactor that flips it
+	// to 404 has to consciously update the harness — DELETE idempotency is
+	// the standard HTTP convention.
+	resp, err = s.scopedRequest(http.MethodDelete, "/api/mcp/tools/"+toolName, "")
+	if err != nil {
+		return fmt.Errorf("re-DELETE: %w", err)
+	}
+	if err := expectStatus(resp, http.StatusOK, "re-DELETE of missing MCP tool"); err != nil {
+		return err
+	}
+	s.logf("re-DELETE of missing tool returned 200 (idempotent, as expected)")
+	return nil
+}
+
+func mcpRegBody(name string, plugin *fakePlugin) string {
+	return fmt.Sprintf(`{"name":%q,"description":"smoke test tool","input_schema":{"type":"object","properties":{}},"callback_url":%q,"auth_header":%q}`,
+		name, plugin.URL()+"/mcp/"+name, plugin.AuthHeader())
+}
+
+func (s *smoke) registerMCPTool(name string, plugin *fakePlugin) (bool, error) {
+	body := mcpRegBody(name, plugin)
+	resp, err := s.scopedRequest(http.MethodPost, "/api/mcp/tools", body)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		out, _ := io.ReadAll(resp.Body)
+		return false, fmt.Errorf("status %d: %s", resp.StatusCode, truncate(string(out), 200))
+	}
+	return true, nil
+}
+
+func (s *smoke) unregisterMCPToolTolerant(name string) {
+	resp, err := s.scopedRequest(http.MethodDelete, "/api/mcp/tools/"+name, "")
+	if err != nil {
+		s.logf("cleanup: unregister MCP tool %q: %v", name, err)
+		return
+	}
+	_ = resp.Body.Close()
 }
 
 // phase7PluginViews exercises the plugin-views CRUD surface end-to-end:
