@@ -86,7 +86,7 @@ func (b *AttentionBar) Draw(screen tcell.Screen) {
 		return
 	}
 
-	style := theme.StyleInReview
+	nameStyle := theme.StyleInReview
 	rows := len(b.entries)
 	overflow := 0
 	if rows > AttentionMaxRows {
@@ -95,8 +95,13 @@ func (b *AttentionBar) Draw(screen tcell.Screen) {
 	}
 	row := inner.Y
 	for i := 0; i < rows && row < inner.Y+inner.H; i++ {
-		line := string(theme.IconNeedsInput) + " " + b.entries[i].TaskName
-		DrawText(screen, inner.X, row, inner.W, truncateAttention(line, inner.W), style)
+		// Render the '?' icon in the needs-input (orange) style so it
+		// matches the task-list badge, and the name in the in-review
+		// (blue) panel style so the row reads as part of the panel.
+		screen.SetContent(inner.X, row, theme.IconNeedsInput, nil, theme.StyleNeedsInput)
+		if inner.W > 2 {
+			DrawText(screen, inner.X+2, row, inner.W-2, truncateAttention(b.entries[i].TaskName, inner.W-2), nameStyle)
+		}
 		row++
 	}
 	if overflow > 0 && row < inner.Y+inner.H {
