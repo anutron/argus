@@ -44,6 +44,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -143,6 +144,9 @@ func (s *smoke) run() error {
 	}
 	if err := s.phase4TaskMeta(); err != nil {
 		return fmt.Errorf("phase 4 (task_meta): %w", err)
+	}
+	if err := s.phase7PluginViews(); err != nil {
+		return fmt.Errorf("phase 7 (plugin views): %w", err)
 	}
 	return nil
 }
@@ -278,6 +282,198 @@ func (s *smoke) phase4TaskMeta() error {
 	}
 	s.logf("cross-namespace PUT correctly rejected with 403")
 	return nil
+}
+
+// phase7PluginViews exercises the plugin-views CRUD surface end-to-end:
+// register-as-scope, list-from-scope (filtered), list-from-master (all),
+// delete-as-master, register-master-view, cross-scope delete must 403,
+// list-from-scope post-cleanup is empty. Each step is one assertion on the
+// real /api/plugins/views handlers.
+func (s *smoke) phase7PluginViews() error {
+	suffix := time.Now().UnixNano()
+	smokeTitle := fmt.Sprintf("smoke-view-%d", suffix)
+	masterTitle := fmt.Sprintf("master-view-%d", suffix)
+
+	// (1) Register a view under the scope token.
+	smokeID, err := s.registerScopeView(smokeTitle)
+	if err != nil {
+		return fmt.Errorf("register smoke view: %w", err)
+	}
+	defer s.adminDelete("/api/plugins/views/"+i64s(smokeID), "smoke view cleanup")
+	s.logf("registered scope view id=%d title=%q", smokeID, smokeTitle)
+
+	// (2) Scope-token GET returns only our row.
+	scoped, err := s.listPluginViews(s.scopeToken)
+	if err != nil {
+		return err
+	}
+	for _, v := range scoped {
+		if v.Scope != s.scope {
+			return fmt.Errorf("scope GET leaked foreign-scope row: scope=%q title=%q", v.Scope, v.Title)
+		}
+	}
+	if !containsView(scoped, smokeID) {
+		return fmt.Errorf("scope GET did not include our just-registered view id=%d", smokeID)
+	}
+	s.logf("scope GET returned %d rows (all scope=%s)", len(scoped), s.scope)
+
+	// (3) Master GET sees our row too (and possibly others; we only
+	// assert ours is present).
+	allViews, err := s.listPluginViews(s.masterToken)
+	if err != nil {
+		return err
+	}
+	if !containsView(allViews, smokeID) {
+		return fmt.Errorf("master GET did not include our view id=%d", smokeID)
+	}
+	s.logf("master GET returned %d rows (ours included)", len(allViews))
+
+	// (4) Register a master-scope view (scope="") so we can verify the
+	// cross-scope delete guard.
+	masterID, err := s.registerMasterView(masterTitle)
+	if err != nil {
+		return fmt.Errorf("register master view: %w", err)
+	}
+	defer s.adminDelete("/api/plugins/views/"+i64s(masterID), "master view cleanup")
+	s.logf("registered master view id=%d title=%q", masterID, masterTitle)
+
+	// (5) Scope token attempting to delete the master view must 403.
+	resp, err := s.scopedRequest(http.MethodDelete, "/api/plugins/views/"+i64s(masterID), "")
+	if err != nil {
+		return fmt.Errorf("scoped DELETE on master view: %w", err)
+	}
+	if err := expectStatus(resp, http.StatusForbidden, "scoped DELETE of master view"); err != nil {
+		return err
+	}
+	s.logf("cross-scope DELETE correctly rejected with 403")
+
+	// (6) Scope token can delete its own view.
+	resp, err = s.scopedRequest(http.MethodDelete, "/api/plugins/views/"+i64s(smokeID), "")
+	if err != nil {
+		return fmt.Errorf("scoped DELETE on own view: %w", err)
+	}
+	if err := expectStatus(resp, http.StatusOK, "scoped DELETE of own view"); err != nil {
+		return err
+	}
+	s.logf("scope DELETE of own view succeeded")
+
+	// (7) Confirm scope GET no longer sees the row.
+	after, err := s.listPluginViews(s.scopeToken)
+	if err != nil {
+		return err
+	}
+	if containsView(after, smokeID) {
+		return fmt.Errorf("smoke view id=%d still present after DELETE", smokeID)
+	}
+	return nil
+}
+
+func (s *smoke) registerScopeView(title string) (int64, error) {
+	body := fmt.Sprintf(`{"title":%q,"callback_url":"http://127.0.0.1:0/unused"}`, title)
+	resp, err := s.scopedRequest(http.MethodPost, "/api/plugins/views", body)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		out, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("POST scope view: status %d: %s", resp.StatusCode, truncate(string(out), 200))
+	}
+	var v struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		return 0, err
+	}
+	return v.ID, nil
+}
+
+func (s *smoke) registerMasterView(title string) (int64, error) {
+	body := fmt.Sprintf(`{"title":%q,"callback_url":"http://127.0.0.1:0/unused"}`, title)
+	resp, err := s.adminPOST("/api/plugins/views", body)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		out, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("POST master view: status %d: %s", resp.StatusCode, truncate(string(out), 200))
+	}
+	var v struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&v); err != nil {
+		return 0, err
+	}
+	return v.ID, nil
+}
+
+type viewRow struct {
+	ID    int64  `json:"id"`
+	Scope string `json:"scope"`
+	Title string `json:"title"`
+}
+
+func (s *smoke) listPluginViews(token string) ([]viewRow, error) {
+	req, err := http.NewRequest(http.MethodGet, s.baseURL+"/api/plugins/views", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		out, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GET /api/plugins/views: status %d: %s", resp.StatusCode, truncate(string(out), 200))
+	}
+	var decoded struct {
+		Views []viewRow `json:"views"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, err
+	}
+	return decoded.Views, nil
+}
+
+func containsView(rows []viewRow, id int64) bool {
+	for _, v := range rows {
+		if v.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// adminDelete is a defer-friendly cleanup that tolerates 404 (resource
+// already gone is success during teardown) and logs other failures via the
+// verbose channel. Used for best-effort cleanup of resources whose creation
+// can't be undone with a defer in the registering caller's stack frame
+// (deferred functions can't return errors usefully).
+func (s *smoke) adminDelete(path, label string) {
+	req, err := http.NewRequest(http.MethodDelete, s.baseURL+path, nil)
+	if err != nil {
+		s.logf("cleanup: %s: %v", label, err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+s.masterToken)
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		s.logf("cleanup: %s: %v", label, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNotFound {
+		return
+	}
+	body, _ := io.ReadAll(resp.Body)
+	s.logf("cleanup: %s failed: status %d: %s", label, resp.StatusCode, truncate(string(body), 200))
+}
+
+func i64s(n int64) string {
+	return strconv.FormatInt(n, 10)
 }
 
 func expectStatus(resp *http.Response, want int, label string) error {
