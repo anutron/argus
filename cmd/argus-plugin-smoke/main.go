@@ -158,6 +158,9 @@ func (s *smoke) run() error {
 	if err := s.phase9InputInjection(); err != nil {
 		return fmt.Errorf("phase 9 (input injection): %w", err)
 	}
+	if err := s.phase8StreamSection(); err != nil {
+		return fmt.Errorf("phase 8 (stream section): %w", err)
+	}
 	return nil
 }
 
@@ -292,6 +295,112 @@ func (s *smoke) phase4TaskMeta() error {
 	}
 	s.logf("cross-namespace PUT correctly rejected with 403")
 	return nil
+}
+
+// phase8StreamSection exercises the settings-section registration surface
+// with type:stream. The daemon stores the (scope, title, callback_url) row
+// but doesn't proxy the WebSocket itself — the TUI connects directly to
+// the plugin's callback URL on focus. So the harness asserts the daemon
+// persists the right shape, makes it visible via the list endpoint, and
+// honors cross-scope guards on unregister. The WS path itself is exercised
+// by internal/tui/views/connector_test.go.
+func (s *smoke) phase8StreamSection() error {
+	plugin := newFakePlugin()
+	defer plugin.Stop()
+	title := fmt.Sprintf("smoke-stream-%d", time.Now().UnixNano())
+	callback := plugin.WSURL() + "/stream/" + title
+
+	regBody := fmt.Sprintf(`{"title":%q,"type":"stream","callback_url":%q}`, title, callback)
+	resp, err := s.scopedRequest(http.MethodPost, "/api/plugins/settings/sections", regBody)
+	if err != nil {
+		return fmt.Errorf("POST stream section: %w", err)
+	}
+	if err := expectStatus(resp, http.StatusCreated, "POST stream section"); err != nil {
+		return err
+	}
+	defer s.unregisterStreamSection(s.scope, title)
+	s.logf("registered stream section title=%q callback=%s", title, callback)
+
+	sections, err := s.listPluginSections()
+	if err != nil {
+		return fmt.Errorf("list sections: %w", err)
+	}
+	match := findSection(sections, s.scope, title)
+	if match == nil {
+		return fmt.Errorf("section %s/%s missing from list after register", s.scope, title)
+	}
+	if match.Type != "stream" {
+		return fmt.Errorf("section type: got %q, want \"stream\"", match.Type)
+	}
+	if match.CallbackURL != callback {
+		return fmt.Errorf("section callback: got %q, want %q", match.CallbackURL, callback)
+	}
+	s.logf("section appears in list with correct shape (type=%s)", match.Type)
+
+	// Cross-scope unregister attempt: caller scope mismatches path scope.
+	resp, err = s.scopedRequest(http.MethodDelete, "/api/plugins/settings/sections/not-"+s.scope+"/anything", "")
+	if err != nil {
+		return fmt.Errorf("cross-scope DELETE: %w", err)
+	}
+	if err := expectStatus(resp, http.StatusForbidden, "cross-scope DELETE section"); err != nil {
+		return err
+	}
+	s.logf("cross-scope DELETE correctly rejected with 403")
+
+	// Own-scope unregister succeeds.
+	resp, err = s.scopedRequest(http.MethodDelete, "/api/plugins/settings/sections/"+s.scope+"/"+title, "")
+	if err != nil {
+		return fmt.Errorf("DELETE own section: %w", err)
+	}
+	if err := expectStatus(resp, http.StatusOK, "DELETE own section"); err != nil {
+		return err
+	}
+	s.logf("scope DELETE of own section succeeded")
+	return nil
+}
+
+func (s *smoke) listPluginSections() ([]pluginSectionRow, error) {
+	resp, err := s.scopedRequest(http.MethodGet, "/api/plugins/settings/sections", "")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GET sections: status %d: %s", resp.StatusCode, truncate(string(body), 200))
+	}
+	var decoded struct {
+		Sections []pluginSectionRow `json:"sections"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return nil, err
+	}
+	return decoded.Sections, nil
+}
+
+type pluginSectionRow struct {
+	Scope       string `json:"scope"`
+	Title       string `json:"title"`
+	Type        string `json:"type"`
+	CallbackURL string `json:"callback_url"`
+}
+
+func findSection(rows []pluginSectionRow, scope, title string) *pluginSectionRow {
+	for i, r := range rows {
+		if r.Scope == scope && r.Title == title {
+			return &rows[i]
+		}
+	}
+	return nil
+}
+
+func (s *smoke) unregisterStreamSection(scope, title string) {
+	resp, err := s.scopedRequest(http.MethodDelete, "/api/plugins/settings/sections/"+scope+"/"+title, "")
+	if err != nil {
+		s.logf("cleanup: unregister section %s/%s: %v", scope, title, err)
+		return
+	}
+	_ = resp.Body.Close()
 }
 
 // phase9InputInjection posts a marker line to the throwaway `cat` session's
