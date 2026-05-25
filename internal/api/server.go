@@ -46,11 +46,6 @@ type Server struct {
 	// events.SetSink to the same broker that serves /api/events/stream.
 	eventBus *eventBus
 
-	// eventBus broadcasts model.Events to attached SSE subscribers. Server
-	// implements events.Sink (see Emit) so the daemon can wire the global
-	// events.SetSink to the same broker that serves /api/events/stream.
-	eventBus *eventBus
-
 	// stopCh is closed by Shutdown to signal background goroutines (idle
 	// watcher, push fan-out housekeeping) to terminate. Range over <-stopCh
 	// in select-loops to honour shutdown.
