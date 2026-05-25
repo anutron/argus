@@ -155,6 +155,9 @@ func (s *smoke) run() error {
 	if err := s.phase10EventResync(); err != nil {
 		return fmt.Errorf("phase 10 (event resync): %w", err)
 	}
+	if err := s.phase9InputInjection(); err != nil {
+		return fmt.Errorf("phase 9 (input injection): %w", err)
+	}
 	return nil
 }
 
@@ -289,6 +292,81 @@ func (s *smoke) phase4TaskMeta() error {
 	}
 	s.logf("cross-namespace PUT correctly rejected with 403")
 	return nil
+}
+
+// phase9InputInjection posts a marker line to the throwaway `cat` session's
+// PTY and verifies the daemon delivered it. cat is a deterministic echo
+// loop — what goes in comes out. The marker should appear in /output (and
+// then appear AGAIN because terminal echo is on for the line-mode PTY, so
+// we just look for "contains").
+func (s *smoke) phase9InputInjection() error {
+	if s.taskID == "" {
+		return fmt.Errorf("no target task; Phase 5 must run first")
+	}
+	marker := fmt.Sprintf("PLUGIN-SMOKE-INPUT-%d", time.Now().UnixNano())
+	input := marker + "\n"
+
+	if err := s.postInput(s.taskID, input); err != nil {
+		return fmt.Errorf("POST input: %w", err)
+	}
+	s.logf("posted %d bytes of input to task %s", len(input), s.taskID)
+
+	// Bash needs a moment to execute. Poll up to 2 seconds for the marker
+	// to surface in /output.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		out, err := s.fetchTaskOutput(s.taskID)
+		if err != nil {
+			return fmt.Errorf("fetch output: %w", err)
+		}
+		if strings.Contains(out, marker) {
+			s.logf("input marker %q observed in task output", marker)
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("input marker %q did not appear in task output within 2s", marker)
+}
+
+func (s *smoke) postInput(taskID, body string) error {
+	req, err := http.NewRequest(http.MethodPost, s.baseURL+"/api/tasks/"+taskID+"/input", strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+s.scopeToken)
+	req.Header.Set("Content-Type", "text/plain")
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		out, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("POST /input: status %d: %s", resp.StatusCode, truncate(string(out), 200))
+	}
+	return nil
+}
+
+func (s *smoke) fetchTaskOutput(taskID string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, s.baseURL+"/api/tasks/"+taskID+"/output?clean=1", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+s.scopeToken)
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		out, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("GET /output: status %d: %s", resp.StatusCode, truncate(string(out), 200))
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
 }
 
 // phase10EventResync opens an SSE connection with since=1 and looks for a
@@ -615,17 +693,17 @@ func expectStatus(resp *http.Response, want int, label string) error {
 	return fmt.Errorf("%s: status %d (want %d): %s", label, resp.StatusCode, want, truncate(string(body), 200))
 }
 
-// phase5ThrowawayTask creates a transient bash-backed backend ("bash-smoke")
+// phase5ThrowawayTask creates a transient `cat`-backed backend ("smoke-cat")
 // and a task on the configured project. Both are torn down in cleanup().
-// The bash session itself is idle waiting for stdin, which is exactly what
-// Phase 9 (input injection) needs.
+// The cat session is a deterministic echo loop — reads stdin, writes to
+// stdout, exits on EOF. That keeps the PTY alive long enough for Phase 9
+// (input injection) to round-trip a marker through it.
 //
 // If the backend already exists (e.g., from a prior --keep run), the harness
 // reuses it but does NOT claim ownership for cleanup — it cannot tell
-// whether the existing backend was someone else's bash backend or a leftover
-// from us.
+// whether the existing row was someone else's or a leftover from us.
 func (s *smoke) phase5ThrowawayTask() error {
-	const backendName = "bash-smoke"
+	const backendName = "smoke-cat"
 	owned, err := s.ensureBashBackend(backendName)
 	if err != nil {
 		return fmt.Errorf("ensure backend %q: %w", backendName, err)
@@ -634,7 +712,7 @@ func (s *smoke) phase5ThrowawayTask() error {
 		s.mu.Lock()
 		s.backendName = backendName
 		s.mu.Unlock()
-		s.logf("registered backend %q (bash)", backendName)
+		s.logf("registered backend %q (cat)", backendName)
 	} else {
 		s.logf("reusing pre-existing backend %q (cleanup skipped)", backendName)
 	}
@@ -654,8 +732,19 @@ func (s *smoke) phase5ThrowawayTask() error {
 // ensureBashBackend POSTs the backend definition. Returns owned=true when we
 // just created it (cleanup later), owned=false when it already existed
 // (cleanup skipped). Treats any 2xx as success.
+//
+// The command is `sh -c cat`, not just `cat`. Argus's BuildCmd
+// unconditionally appends `--session-id <UUID>` to every non-Codex/non-Pi
+// backend invocation — that's Claude's CLI flag — which makes any other
+// backend (cat, sleep, custom scripts) error out on the unexpected args.
+// Wrapping with `sh -c` absorbs the trailing args into $0/$1 where they're
+// discarded, so the inner `cat` runs cleanly.
+//
+// Surfaced substrate gap: per-backend session-id support should be opt-in
+// (the default should be off), or backends should declare what arg shape
+// they accept. Documenting via this comment + the harness workaround.
 func (s *smoke) ensureBashBackend(name string) (bool, error) {
-	body := fmt.Sprintf(`{"name":%q,"command":"bash"}`, name)
+	body := fmt.Sprintf(`{"name":%q,"command":"sh -c cat"}`, name)
 	resp, err := s.adminPOST("/api/backends", body)
 	if err != nil {
 		return false, err

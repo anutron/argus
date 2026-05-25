@@ -64,12 +64,12 @@ func TestAdminDELETE_StatusMismatchSurfacesBody(t *testing.T) {
 func TestEnsureBashBackend_CreatedOwnsCleanup(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		testutil.Contains(t, string(body), `"command":"bash"`)
+		testutil.Contains(t, string(body), `"command":"sh -c cat"`)
 		w.WriteHeader(http.StatusCreated)
 	}))
 	t.Cleanup(srv.Close)
 	s := newSmokeForTest(srv)
-	owned, err := s.ensureBashBackend("bash-smoke")
+	owned, err := s.ensureBashBackend("smoke-cat")
 	testutil.NoError(t, err)
 	if !owned {
 		t.Fatal("expected owned=true on 201")
