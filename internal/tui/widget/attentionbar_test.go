@@ -108,8 +108,8 @@ func TestAttentionBar_DrawShowsTaskNames(t *testing.T) {
 		t.Errorf("expected border top-left corner in output, got:\n%s", got)
 	}
 	// Icon rune should be present.
-	if !strings.ContainsRune(got, theme.IconMoonStars) {
-		t.Errorf("expected IconMoonStars in output, got:\n%s", got)
+	if !strings.ContainsRune(got, theme.IconNeedsInput) {
+		t.Errorf("expected IconNeedsInput in output, got:\n%s", got)
 	}
 }
 

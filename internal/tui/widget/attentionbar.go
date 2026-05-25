@@ -8,8 +8,9 @@ import (
 	"github.com/rivo/tview"
 )
 
-// AttentionMaxRows caps how tall the bar will grow when many tasks are idle.
-// Past this, additional entries are summarised on the last line as "+N more".
+// AttentionMaxRows caps how tall the bar will grow when many tasks are
+// blocked on a user prompt. Past this, additional entries are summarised on
+// the last line as "+N more".
 const AttentionMaxRows = 5
 
 // AttentionEntry is a single row in the attention bar.
@@ -17,9 +18,9 @@ type AttentionEntry struct {
 	TaskName string
 }
 
-// AttentionBar is a bordered box that lists tasks needing user attention.
+// AttentionBar is a bordered box that lists tasks blocked on a user prompt.
 // It sits above the agent view's git status panel and grows vertically with
-// the number of idle+unvisited tasks. When the entry list is empty the bar
+// the number of needs-input tasks. When the entry list is empty the bar
 // reports zero desired height so its parent flex item can be collapsed.
 type AttentionBar struct {
 	*tview.Box
@@ -80,7 +81,7 @@ func (b *AttentionBar) Draw(screen tcell.Screen) {
 		return
 	}
 
-	inner := DrawBorderedPanel(screen, x, y, width, height, " Idle ", theme.StyleInReview)
+	inner := DrawBorderedPanel(screen, x, y, width, height, " Needs input ", theme.StyleInReview)
 	if inner.W <= 0 || inner.H <= 0 {
 		return
 	}
@@ -94,7 +95,7 @@ func (b *AttentionBar) Draw(screen tcell.Screen) {
 	}
 	row := inner.Y
 	for i := 0; i < rows && row < inner.Y+inner.H; i++ {
-		line := string(theme.IconMoonStars) + " " + b.entries[i].TaskName
+		line := string(theme.IconNeedsInput) + " " + b.entries[i].TaskName
 		DrawText(screen, inner.X, row, inner.W, truncateAttention(line, inner.W), style)
 		row++
 	}
