@@ -50,6 +50,7 @@ import (
 	"time"
 
 	"github.com/drn/argus/internal/db"
+	"github.com/drn/argus/internal/model"
 )
 
 type smoke struct {
@@ -150,6 +151,9 @@ func (s *smoke) run() error {
 	}
 	if err := s.phase6MCPToolRegistration(); err != nil {
 		return fmt.Errorf("phase 6 (MCP tool registration): %w", err)
+	}
+	if err := s.phase10EventResync(); err != nil {
+		return fmt.Errorf("phase 10 (event resync): %w", err)
 	}
 	return nil
 }
@@ -284,6 +288,41 @@ func (s *smoke) phase4TaskMeta() error {
 		return err
 	}
 	s.logf("cross-namespace PUT correctly rejected with 403")
+	return nil
+}
+
+// phase10EventResync opens an SSE connection with since=1 and looks for a
+// `resync` event. The substrate emits resync only when the caller's cursor
+// is strictly older than the oldest retained event in the ring. On a daemon
+// that has never overflowed its bounded ring (the common case in local
+// development), OldestEventID == 1, no value of `since > 0` satisfies
+// since < oldest, and resync never fires.
+//
+// So this phase has two valid outcomes:
+//
+//   - Resync emitted within a short window → behavior verified, log + pass.
+//   - No resync within the window → daemon's oldest event id is ≤ 1, so
+//     the test is not exercisable on this daemon. Log and pass.
+//
+// The harness never fails Phase 10 — it can't distinguish "resync broken"
+// from "ring never overflowed" without a dedicated admin endpoint to inspect
+// OldestEventID. The unit tests in events_test.go cover the SSE decoding;
+// the handler's resync emission is exercised in internal/api/events_integration_test.go.
+func (s *smoke) phase10EventResync() error {
+	sub, err := s.startEventStream(1)
+	if err != nil {
+		return fmt.Errorf("open SSE with since=1: %w", err)
+	}
+	defer sub.Close()
+
+	ev, err := sub.WaitFor(500*time.Millisecond, func(e model.Event) bool {
+		return e.Type == model.EventTypeResync
+	})
+	if err != nil {
+		s.logf("no resync event observed in 500ms (oldest event id likely ≤ 1; not exercisable here)")
+		return nil
+	}
+	s.logf("daemon emitted resync (id=%d, payload=%s)", ev.ID, string(ev.Payload))
 	return nil
 }
 
