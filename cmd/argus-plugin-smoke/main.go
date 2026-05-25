@@ -101,6 +101,9 @@ func (s *smoke) run() error {
 	if err := s.phase1AuthCheck(); err != nil {
 		return fmt.Errorf("phase 1 (auth check): %w", err)
 	}
+	if err := s.phase3EventStream(); err != nil {
+		return fmt.Errorf("phase 3 (event stream): %w", err)
+	}
 	return nil
 }
 
@@ -112,6 +115,19 @@ func (s *smoke) phase1AuthCheck() error {
 		return fmt.Errorf("scope-token auth against GET /api/plugins/views: %w", err)
 	}
 	s.logf("scope=%s token authenticates against /api/plugins/views", s.scope)
+	return nil
+}
+
+// phase3EventStream opens the SSE channel against the live daemon, confirms
+// the handshake succeeds, and closes cleanly. No event assertions yet — later
+// phases drive the daemon and then call sub.WaitFor on the resulting events.
+func (s *smoke) phase3EventStream() error {
+	sub, err := s.startEventStream(0)
+	if err != nil {
+		return fmt.Errorf("open SSE: %w", err)
+	}
+	defer sub.Close()
+	s.logf("SSE handshake OK; ready to consume events")
 	return nil
 }
 
