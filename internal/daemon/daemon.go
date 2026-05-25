@@ -65,6 +65,7 @@ type Daemon struct {
 	sockPath  string               // set by Serve, used by cleanup
 	pidPath   string               // set by Serve, used by cleanup
 	mcpPort   int                  // actual MCP HTTP port in use (set after listen)
+	apiPort   int                  // actual REST API HTTP port in use (set after listen)
 	mcpServer *mcp.Server          // set when KB is enabled, shut down in cleanup
 	kbIndexer *kb.Indexer          // set when KB is enabled, stopped in cleanup
 	apiServer *api.Server          // set when API is enabled, shut down in cleanup
@@ -490,6 +491,9 @@ func (d *Daemon) Serve(sockPath string) error {
 			if err != nil {
 				slog.Error("api server error", "err", err)
 			} else {
+				d.mu.Lock()
+				d.apiPort = apiPort
+				d.mu.Unlock()
 				slog.Info("api server listening", "port", apiPort)
 			}
 		}
