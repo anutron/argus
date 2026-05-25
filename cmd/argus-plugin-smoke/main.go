@@ -141,6 +141,9 @@ func (s *smoke) run() error {
 	if err := s.phase5ThrowawayTask(); err != nil {
 		return fmt.Errorf("phase 5 (throwaway task): %w", err)
 	}
+	if err := s.phase4TaskMeta(); err != nil {
+		return fmt.Errorf("phase 4 (task_meta): %w", err)
+	}
 	return nil
 }
 
@@ -202,6 +205,88 @@ func (s *smoke) phase3EventStream() error {
 	defer sub.Close()
 	s.logf("SSE handshake OK; ready to consume events")
 	return nil
+}
+
+// phase4TaskMeta exercises /api/tasks/{id}/meta with the scope token:
+//  1. PUT a key/value (no namespace in the body) and confirm the daemon
+//     stamps it with the scope namespace.
+//  2. GET back and verify the row round-trips.
+//  3. PUT into a different namespace and confirm the daemon rejects with
+//     403 — the scope guard is the only thing standing between two plugins
+//     stomping each other's metadata.
+func (s *smoke) phase4TaskMeta() error {
+	if s.taskID == "" {
+		return fmt.Errorf("no target task; Phase 5 must run first")
+	}
+	key := "phase4-key"
+	value := fmt.Sprintf("phase4-value-%d", time.Now().UnixNano())
+
+	// (1) Write via scope token (no namespace; daemon auto-derives).
+	writeBody := fmt.Sprintf(`{"key":%q,"value":%q}`, key, value)
+	resp, err := s.scopedRequest(http.MethodPut, "/api/tasks/"+s.taskID+"/meta", writeBody)
+	if err != nil {
+		return fmt.Errorf("PUT meta: %w", err)
+	}
+	if err := expectStatus(resp, http.StatusOK, "PUT /meta"); err != nil {
+		return err
+	}
+	s.logf("PUT meta key=%q wrote into auto-derived namespace", key)
+
+	// (2) Read back; verify the entry matches.
+	resp, err = s.scopedRequest(http.MethodGet, "/api/tasks/"+s.taskID+"/meta?namespace="+s.scope, "")
+	if err != nil {
+		return fmt.Errorf("GET meta: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("GET meta: status %d: %s", resp.StatusCode, truncate(string(body), 200))
+	}
+	var decoded struct {
+		Entries []struct {
+			Namespace string `json:"namespace"`
+			Key       string `json:"key"`
+			Value     string `json:"value"`
+		} `json:"entries"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return fmt.Errorf("decode meta response: %w", err)
+	}
+	found := false
+	for _, e := range decoded.Entries {
+		if e.Namespace == s.scope && e.Key == key {
+			if e.Value != value {
+				return fmt.Errorf("meta round-trip: namespace=%s key=%s want %q got %q", e.Namespace, e.Key, value, e.Value)
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("meta round-trip: wrote %s.%s but GET did not return it (entries=%d)", s.scope, key, len(decoded.Entries))
+	}
+	s.logf("GET meta returned %d entries; round-trip OK for %s.%s", len(decoded.Entries), s.scope, key)
+
+	// (3) Cross-namespace write must be rejected.
+	hostileBody := fmt.Sprintf(`{"namespace":%q,"key":%q,"value":"x"}`, "not-"+s.scope, key)
+	resp, err = s.scopedRequest(http.MethodPut, "/api/tasks/"+s.taskID+"/meta", hostileBody)
+	if err != nil {
+		return fmt.Errorf("PUT cross-ns: %w", err)
+	}
+	if err := expectStatus(resp, http.StatusForbidden, "PUT /meta with foreign namespace"); err != nil {
+		return err
+	}
+	s.logf("cross-namespace PUT correctly rejected with 403")
+	return nil
+}
+
+func expectStatus(resp *http.Response, want int, label string) error {
+	defer resp.Body.Close()
+	if resp.StatusCode == want {
+		return nil
+	}
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("%s: status %d (want %d): %s", label, resp.StatusCode, want, truncate(string(body), 200))
 }
 
 // phase5ThrowawayTask creates a transient bash-backed backend ("bash-smoke")
@@ -314,6 +399,24 @@ func (s *smoke) adminPOST(path, body string) (*http.Response, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+s.masterToken)
 	req.Header.Set("Content-Type", "application/json")
+	return s.httpClient.Do(req)
+}
+
+// scopedRequest builds a request with the scope token attached. body may be
+// empty. Caller owns the returned response body.
+func (s *smoke) scopedRequest(method, path, body string) (*http.Response, error) {
+	var rdr io.Reader
+	if body != "" {
+		rdr = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, s.baseURL+path, rdr)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+s.scopeToken)
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	return s.httpClient.Do(req)
 }
 
