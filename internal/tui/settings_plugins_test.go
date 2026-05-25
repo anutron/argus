@@ -9,7 +9,6 @@ import (
 
 	"github.com/drn/argus/internal/db"
 	"github.com/drn/argus/internal/testutil"
-	"github.com/drn/argus/internal/tui/layout"
 	pluginsettings "github.com/drn/argus/internal/tui/settings"
 )
 
@@ -38,41 +37,20 @@ func seedPluginSection(t *testing.T, d *db.DB, scope, title string) {
 	testutil.NoError(t, err)
 }
 
-func TestSettingsView_HidesLayoutsWhenOnlyDefault(t *testing.T) {
-	sv := testSettingsView(t)
-	// Seed only the default layout — should not appear in the rail.
-	sv.SetLayouts(nil)
-	entries := sv.railEntries()
-	for _, e := range entries {
-		if e.cat == catLayouts {
-			t.Fatal("Layouts entry should be hidden when only default layout registered")
-		}
+// seedStreamSection persists a stream-type plugin section. Uses the package
+// boundary that matches what the daemon's POST handler builds at runtime.
+func seedStreamSection(t *testing.T, d *db.DB, scope, title, callbackURL string) {
+	t.Helper()
+	sec := pluginsettings.Section{
+		Scope:       scope,
+		Title:       title,
+		Type:        pluginsettings.TypeStream,
+		CallbackURL: callbackURL,
 	}
-}
-
-func TestSettingsView_ShowsLayoutsWhenUserLayoutsPresent(t *testing.T) {
-	sv := testSettingsView(t)
-	sv.SetLayouts([]layout.Layout{
-		{Name: layout.DefaultLayoutName, Title: "Default"},
-		{Name: "split-horizontal", Title: "Horizontal", Root: layout.Node{Type: layout.NodeSplit, Direction: layout.DirHorizontal, Children: []layout.Node{{Type: layout.NodeTerminal}, {Type: layout.NodeTerminal}}}},
-	})
-	entries := sv.railEntries()
-	found := false
-	for _, e := range entries {
-		if e.cat == catLayouts {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("Layouts entry should appear when user layout is registered")
-	}
-
-	// Switching to catLayouts produces one row per user layout.
-	sv.setCategory(catLayouts)
-	if len(sv.rows) != 1 {
-		t.Fatalf("expected 1 layout row, got %d", len(sv.rows))
-	}
-	testutil.Equal(t, sv.rows[0].key, "split-horizontal")
+	row, err := db.FromSection(sec)
+	testutil.NoError(t, err)
+	_, err = d.UpsertPluginSection(row)
+	testutil.NoError(t, err)
 }
 
 func TestSettingsView_PluginsHeaderHiddenByDefault(t *testing.T) {
@@ -372,33 +350,6 @@ func TestSettingsView_PasteIntoPluginField(t *testing.T) {
 	}
 }
 
-func TestSettings_RenderLayoutDetail(t *testing.T) {
-	sv := testSettingsView(t)
-	sv.SetLayouts([]layout.Layout{
-		{Name: layout.DefaultLayoutName, Title: "Default"},
-		{
-			Name:  "split-horizontal",
-			Title: "Horizontal",
-			Root: layout.Node{
-				Type:      layout.NodeSplit,
-				Direction: layout.DirHorizontal,
-				Children:  []layout.Node{{Type: layout.NodeTerminal}, {Type: layout.NodeTerminal}},
-			},
-		},
-		{Name: "leaf-only", Root: layout.Node{Type: layout.NodeTerminal}},
-	})
-	sv.setCategory(catLayouts)
-	// Render every layout row to exercise both the split and leaf branches.
-	for i := range sv.rows {
-		sv.cursor = i
-		sv.SetRect(0, 0, 100, 30)
-		sv.Draw(drawSim(t))
-	}
-	// Bogus key path (defensive guard inside the renderer).
-	bogus := &settingsRow{kind: srLayout, key: "missing"}
-	sv.renderLayoutDetail(drawSim(t), 0, 0, 50, 10, bogus)
-}
-
 func TestSettings_RenderPluginFieldDetail(t *testing.T) {
 	sv := selectFirstPluginSection(t)
 	// Walk through every field row to exercise the type-specific branches.
@@ -632,4 +583,121 @@ func selectFirstPluginSection(t *testing.T) *SettingsView {
 		t.Fatal("failed to select plugin section")
 	}
 	return sv
+}
+
+func TestSettingsView_StreamSection_RebuildRowsHasNoRows(t *testing.T) {
+	d, _ := db.OpenInMemory()
+	t.Cleanup(func() { d.Close() }) //nolint:errcheck
+	seedStreamSection(t, d, "ludwig", "Orchestrators", "ws://127.0.0.1:9991/live")
+	sv := NewSettingsView(d)
+	sv.Refresh()
+
+	for _, e := range sv.railEntries() {
+		if e.kind == railPlugin {
+			sv.setActiveFromRail(e)
+			break
+		}
+	}
+	testutil.Equal(t, sv.category, catPlugin)
+	// Stream sections render via streampane, not row-by-row, so the rows
+	// list must be empty even though the active section exists.
+	testutil.Equal(t, len(sv.rows), 0)
+}
+
+func TestSettingsView_StreamSection_FiresFocusAndBlur(t *testing.T) {
+	d, _ := db.OpenInMemory()
+	t.Cleanup(func() { d.Close() }) //nolint:errcheck
+	seedStreamSection(t, d, "ludwig", "Orchestrators", "ws://x")
+	sv := NewSettingsView(d)
+	sv.Refresh()
+
+	var focusedScope, focusedTitle, focusedURL string
+	var blurredScope, blurredTitle string
+	sv.OnStreamFocus = func(scope, title, url string, _ chan<- []byte, _ <-chan []byte) {
+		focusedScope = scope
+		focusedTitle = title
+		focusedURL = url
+	}
+	sv.OnStreamBlur = func(scope, title string) {
+		blurredScope = scope
+		blurredTitle = title
+	}
+
+	// Enter the stream section.
+	for _, e := range sv.railEntries() {
+		if e.kind == railPlugin {
+			sv.setActiveFromRail(e)
+			break
+		}
+	}
+	testutil.Equal(t, focusedScope, "ludwig")
+	testutil.Equal(t, focusedTitle, "Orchestrators")
+	testutil.Equal(t, focusedURL, "ws://x")
+
+	// Switching away fires blur.
+	sv.setCategory(catSystem)
+	testutil.Equal(t, blurredScope, "ludwig")
+	testutil.Equal(t, blurredTitle, "Orchestrators")
+}
+
+func TestSettingsView_StreamSection_PreservesMountAcrossFocusToggle(t *testing.T) {
+	d, _ := db.OpenInMemory()
+	t.Cleanup(func() { d.Close() }) //nolint:errcheck
+	seedStreamSection(t, d, "ludwig", "Live", "ws://x")
+	sv := NewSettingsView(d)
+	sv.Refresh()
+
+	var focusCount int
+	sv.OnStreamFocus = func(_, _, _ string, _ chan<- []byte, _ <-chan []byte) {
+		focusCount++
+	}
+
+	enter := func() {
+		for _, e := range sv.railEntries() {
+			if e.kind == railPlugin {
+				sv.setActiveFromRail(e)
+				break
+			}
+		}
+	}
+	enter()
+	mount1, ok := sv.streamMounts[pluginKey{scope: "ludwig", title: "Live"}]
+	testutil.Equal(t, ok, true)
+	sv.setCategory(catSystem)
+	enter()
+	mount2, ok := sv.streamMounts[pluginKey{scope: "ludwig", title: "Live"}]
+	testutil.Equal(t, ok, true)
+	if mount1 != mount2 {
+		t.Fatal("streampane mount should survive focus toggle")
+	}
+	testutil.Equal(t, focusCount, 2)
+}
+
+func TestSettingsView_StreamSection_UnregisterFiresBlur(t *testing.T) {
+	d, _ := db.OpenInMemory()
+	t.Cleanup(func() { d.Close() }) //nolint:errcheck
+	seedStreamSection(t, d, "ludwig", "Live", "ws://x")
+	sv := NewSettingsView(d)
+	sv.Refresh()
+
+	var blurredScope string
+	sv.OnStreamBlur = func(scope, _ string) { blurredScope = scope }
+	sv.OnStreamFocus = func(_, _, _ string, _ chan<- []byte, _ <-chan []byte) {}
+
+	for _, e := range sv.railEntries() {
+		if e.kind == railPlugin {
+			sv.setActiveFromRail(e)
+			break
+		}
+	}
+
+	// Plugin unregisters in the daemon — DB row removed.
+	_, err := d.DeletePluginSection("ludwig", "Live")
+	testutil.NoError(t, err)
+	sv.Refresh()
+
+	testutil.Equal(t, blurredScope, "ludwig")
+	if _, ok := sv.streamMounts[pluginKey{scope: "ludwig", title: "Live"}]; ok {
+		t.Fatal("stream mount should be cleaned up after unregister")
+	}
 }

@@ -64,8 +64,7 @@ func TestSettingsView_RailNavigation(t *testing.T) {
 func TestSettingsView_RailNavigationBottomBound(t *testing.T) {
 	sv := testSettingsView(t)
 	sv.setFocus(focusRail)
-	// Park on the last category. catLayouts hides on empty layouts, so the
-	// last visible built-in is catLogs by default.
+	// Park on the last category — catLogs is the last visible built-in.
 	sv.setCategory(catLogs)
 
 	// Down at the bottom must return false (allows tab nav to propagate).
@@ -150,15 +149,11 @@ func TestSettingsView_HandleClickOutside(t *testing.T) {
 }
 
 func TestSettingsView_Categories(t *testing.T) {
-	// All non-hidden built-ins must be addressable. Visiting each must
-	// populate at least one row (auto-start row is platform-gated, but every
-	// other category seeds at least one row). catLayouts hides on empty so
-	// it's skipped here unless the test seeds layouts.
+	// All built-ins must be addressable. Visiting each must populate at least
+	// one row (auto-start row is platform-gated, but every other category
+	// seeds at least one row).
 	sv := testSettingsView(t)
 	for _, c := range builtinCategories {
-		if c == catLayouts {
-			continue
-		}
 		sv.setCategory(c)
 		// Sandbox / KB / API toggles always have ≥1 row. Projects/Schedules
 		// fall back to a placeholder row when empty. Backends has seeded

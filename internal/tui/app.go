@@ -33,7 +33,6 @@ import (
 	"github.com/drn/argus/internal/scheduler"
 	"github.com/drn/argus/internal/tui/dagview"
 	"github.com/drn/argus/internal/tui/gitpanel"
-	"github.com/drn/argus/internal/tui/layout"
 	"github.com/drn/argus/internal/tui/modal"
 	"github.com/drn/argus/internal/tui/store"
 	"github.com/drn/argus/internal/tui/taskview"
@@ -156,11 +155,6 @@ type App struct {
 	agentPage *tview.Flex
 	pages     *tview.Pages
 
-	// layouts holds named layout descriptors. The built-in `tasks-default`
-	// is registered at boot; user layouts loaded from ~/.argus/layouts/
-	// are held but not yet rendered (PR 7 wires them through Settings).
-	layouts *layout.Registry
-
 	// State
 	mode               viewMode
 	agentFocus         agentFocus
@@ -265,6 +259,20 @@ type App struct {
 	pluginHotkeys     map[tcell.Key]*pluginViewMount
 	activePlugin      *pluginViewMount
 	pluginConnFactory pluginConnectorFactory
+
+	// Stream-section connectors. Keyed by (scope, title). Created on
+	// SettingsView.OnStreamFocus, closed on OnStreamBlur. Reuses the same
+	// connector factory as plugin views so smoke tests can stub.
+	streamConns   map[pluginStreamKey]pluginConnector
+	streamConnsMu sync.Mutex
+}
+
+// pluginStreamKey identifies an open stream-section connector. Matches the
+// SettingsView's pluginKey shape but lives in package tui so it doesn't
+// re-export internal/tui's pluginKey.
+type pluginStreamKey struct {
+	scope string
+	title string
 }
 
 // New creates the tui application shell.
@@ -291,7 +299,6 @@ func New(database store.Store, runner agent.SessionProvider, daemonConnected boo
 		lastAttachCols:         make(map[string]uint16),
 		wtRoot:                 filepath.Join(db.DataDir(), "worktrees"),
 		clipboardWriter:        pbcopyWriter,
-		layouts:                layout.WithDefaults(layout.NewRegistry()),
 	}
 	if dc, ok := runner.(*dclient.Client); ok {
 		app.daemonClient = dc
@@ -321,7 +328,8 @@ func New(database store.Store, runner agent.SessionProvider, daemonConnected boo
 	app.settings.OnDeleteSchedule = func(id string) { app.deleteSchedule(id) }
 	app.settings.OnRunSchedule = func(id string) { app.runScheduleNow(id) }
 	app.settings.OnBranchChange = func() { app.forceRedraw("settings branch changed") }
-	app.settings.SetLayouts(app.layouts.List())
+	app.settings.OnStreamFocus = app.openStreamSection
+	app.settings.OnStreamBlur = app.closeStreamSection
 	app.settings.SetPluginSubmit(app.submitPluginSection)
 	app.settingsPage = NewSettingsPage(app.settings)
 
@@ -517,32 +525,6 @@ func (a *App) afterDraw(screen tcell.Screen) {
 // TUI's. Must be called before Run() — the flag is consumed there.
 func (a *App) SetDaemonStale(stale bool) {
 	a.daemonStale = stale
-}
-
-// Layouts exposes the layout registry for callers that need to inspect or
-// register layouts (PR 7 wires this into Settings).
-func (a *App) Layouts() *layout.Registry {
-	return a.layouts
-}
-
-// LoadLayoutsDir scans dir for *.json layout files and registers each valid
-// one. Missing dirs are no-ops. Parse / register errors are logged via
-// uxlog and ignored so a single malformed user layout cannot prevent boot.
-//
-// Wired by cmd/argus/main.go at startup against ~/.argus/layouts/. The
-// settings view is refreshed at the end so the Layouts rail entry's
-// hide-on-empty state reflects the post-load registry.
-func (a *App) LoadLayoutsDir(dir string) {
-	res := a.layouts.LoadDir(dir)
-	if res.Loaded > 0 {
-		uxlog.Log("[tui] loaded %d layout(s) from %s", res.Loaded, dir)
-	}
-	for _, err := range res.Errors {
-		uxlog.Log("[tui] layout load error: %v", err)
-	}
-	if a.settings != nil {
-		a.settings.SetLayouts(a.layouts.List())
-	}
 }
 
 // submitPluginSection is the production submit hook wired into the

@@ -7,7 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/drn/argus/internal/db"
@@ -96,17 +95,24 @@ func TestAPI_RegisterPluginSection_BadBody(t *testing.T) {
 	testutil.Equal(t, w.Code, http.StatusBadRequest)
 }
 
-func TestAPI_RegisterPluginSection_RejectsStreamType(t *testing.T) {
+func TestAPI_RegisterPluginSection_AcceptsStreamType(t *testing.T) {
 	srv, _ := testServer(t)
 	mux := srv.routes()
 
 	w := httptest.NewRecorder()
-	body := `{"title":"x","type":"stream","callback_url":"ws://x"}`
+	body := `{"title":"Live orchestrators","type":"stream","callback_url":"ws://127.0.0.1:9991/live"}`
+	mux.ServeHTTP(w, pluginReq("POST", "/api/plugins/settings/sections", "ludwig", body))
+	testutil.Equal(t, w.Code, http.StatusCreated)
+}
+
+func TestAPI_RegisterPluginSection_RejectsStreamWithFields(t *testing.T) {
+	srv, _ := testServer(t)
+	mux := srv.routes()
+
+	w := httptest.NewRecorder()
+	body := `{"title":"x","type":"stream","callback_url":"ws://x","fields":[{"key":"k","label":"l","type":"bool"}]}`
 	mux.ServeHTTP(w, pluginReq("POST", "/api/plugins/settings/sections", "test-plugin", body))
 	testutil.Equal(t, w.Code, http.StatusBadRequest)
-	if !strings.Contains(w.Body.String(), "stream") {
-		t.Fatalf("expected error mentioning stream, got %s", w.Body.String())
-	}
 }
 
 func TestAPI_ListPluginSections(t *testing.T) {

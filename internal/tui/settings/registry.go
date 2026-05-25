@@ -37,23 +37,12 @@ func NewRegistry() *Registry {
 // Register validates and stores s. Replaces any prior section with the same
 // (scope, title). Returns the validation error directly so callers can map
 // to HTTP 400 / RPC error codes. Validation runs at the parser boundary
-// (ParseSection) for HTTP-sourced sections; Register repeats the cheap
-// checks defensively so direct callers can't slip past.
+// (ParseSection) for HTTP-sourced sections; Register repeats the same checks
+// defensively so direct callers can't slip past — the underlying logic lives
+// in validateSection so the two paths can't drift.
 func (r *Registry) Register(s Section) error {
-	if s.Scope == "" {
-		return ErrInvalidScope
-	}
-	if s.Title == "" {
-		return ErrInvalidTitle
-	}
-	if s.Type != TypeForm {
-		return ErrInvalidType
-	}
-	if s.CallbackURL == "" {
-		return ErrMissingCallbackURL
-	}
-	if s.Spec == nil || len(s.Spec.Fields) == 0 {
-		return ErrEmptyForm
+	if err := validateSection(s); err != nil {
+		return err
 	}
 	r.mu.Lock()
 	r.sections[registryKey{scope: s.Scope, title: s.Title}] = s
@@ -161,11 +150,17 @@ func validateSection(s Section) error {
 	if s.Title == "" {
 		return ErrInvalidTitle
 	}
-	if s.Type != TypeForm {
+	if s.Type != TypeForm && s.Type != TypeStream {
 		return ErrInvalidType
 	}
 	if s.CallbackURL == "" {
 		return ErrMissingCallbackURL
+	}
+	if s.Type == TypeStream {
+		if s.Spec != nil && len(s.Spec.Fields) > 0 {
+			return ErrStreamHasFields
+		}
+		return nil
 	}
 	if s.Spec == nil || len(s.Spec.Fields) == 0 {
 		return ErrEmptyForm

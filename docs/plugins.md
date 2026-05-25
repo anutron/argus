@@ -59,7 +59,6 @@ A `scope:<name>` token can:
 - Write task metadata in namespace `<name>`. Reads are open to all authenticated tokens; cross-namespace writes are rejected.
 - Inject input into any task via `POST /api/tasks/:id/input`. The audit log stamps `origin=scope:<name>` on the write.
 - Register exactly one settings section. Re-registering with the same title replaces the prior entry.
-- Drop a layout JSON into `~/.argus/layouts/` on the host (no HTTP surface — argus rescans on boot).
 
 A revoked token loses all of the above; argus cascades the revocation by dropping every MCP tool and settings section owned by the scope.
 
@@ -69,15 +68,16 @@ A revoked token loses all of the above; argus cascades the revocation by droppin
 | ------------------------------------------------------- | ---------- | ----------------------------- | -------------------------------------- |
 | `/api/events/stream?since=<id>`                         | GET (SSE)  | any authenticated             | Subscribe to the daemon event stream   |
 | `/api/tasks/:id/meta?namespace=<ns>`                    | GET        | any authenticated             | Read task metadata                     |
-| `/api/tasks/:id/meta`                                   | PUT        | `master` (PR 3) [^meta-write] | Write task metadata                    |
+| `/api/tasks/:id/meta`                                   | PUT        | `master` or `scope:<name>`    | Write task metadata (scope auto-derives namespace) |
 | `/api/tasks/:id/input`                                  | POST       | any authenticated             | Inject input bytes into a task PTY     |
 | `/api/mcp/tools`                                        | POST       | `scope:<name>`                | Register an MCP tool                   |
 | `/api/mcp/tools/:name`                                  | DELETE     | owning scope or `master`      | Unregister an MCP tool                 |
 | `/api/plugins/settings/sections`                        | GET        | any authenticated             | List registered plugin settings sections |
 | `/api/plugins/settings/sections`                        | POST       | `scope:<name>`                | Register a settings section            |
 | `/api/plugins/settings/sections/:scope/:title`          | DELETE     | owning scope or `master`      | Unregister a settings section          |
-
-[^meta-write]: Today `PUT /api/tasks/:id/meta` is master-only and takes `namespace` from the request body. The substrate plan intends scope-scoped writes (auto-namespace from the auth tag) as a follow-up; until that lands, plugins write metadata by proxying through a small server-side helper that holds the master token, or wait for the auto-namespacing PR. The contract for `GET` is already plugin-callable.
+| `/api/plugins/views`                                    | POST       | `master` or `scope:<name>`    | Register a top-level plugin view       |
+| `/api/plugins/views`                                    | GET        | `master` or `scope:<name>`    | List plugin views (scope-filtered)     |
+| `/api/plugins/views/:id`                                | DELETE     | owning scope or `master`      | Unregister a plugin view               |
 
 All endpoints return JSON. Errors are `{"error": "..."}` with the appropriate HTTP status. Bodies are capped (1 MiB for metadata, 256 KiB for MCP tool registration and section registration, 64 KiB for input).
 
@@ -370,7 +370,7 @@ When stream lands, the registered shape will be:
 }
 ```
 
-Argus will open a WebSocket; the plugin pushes ANSI bytes and argus pushes back focused-pane keystrokes through the streampane widget shared with the layout system.
+Argus will open a WebSocket; the plugin pushes ANSI bytes and argus pushes back focused-pane keystrokes through the streampane widget.
 
 ### List
 
@@ -417,88 +417,7 @@ A plugin can unregister only its own section. The master token can drop any sect
 
 ### Ordering and hide-on-empty
 
-Built-in settings sections render first in their canonical order, followed by the `Layouts` section (when at least one non-default layout is registered) and then a blank-line separator and a `Plugins` header before alphabetically-sorted plugin sections. When no plugin sections exist, both the `Plugins` header and the preceding separator disappear; ditto for `Layouts` when only the default layout is loaded.
-
-## Layouts
-
-Argus scans `~/.argus/layouts/*.json` at boot and registers each parsed layout alongside the built-in `tasks-default`. Plugins do not have an HTTP-side registration channel for layouts — drop the file on the host filesystem and restart the daemon.
-
-### Layout JSON schema v1
-
-```json
-{
-  "name": "<unique-name>",
-  "title": "Human-readable title",
-  "root": {
-    "type": "split",
-    "direction": "horizontal",
-    "sizes": [1, 1],
-    "children": [
-      { "type": "terminal", "bind": "task:current", "cycle": false },
-      { "type": "terminal", "cycle": true }
-    ]
-  },
-  "hotkeys": {
-    "tab": "cycle right",
-    "ctrl-1": "focus first",
-    "ctrl-2": "focus second"
-  }
-}
-```
-
-Required:
-
-- `name` — unique registry key. The user picks layouts by name from Settings → Layouts.
-- `root` — the top of the tree.
-
-Node types:
-
-| Type            | Description                                            |
-| --------------- | ------------------------------------------------------ |
-| `split`         | Internal node. Has `direction`, `sizes`, `children`.   |
-| `terminal`      | Leaf: a PTY-backed agent terminal.                     |
-| `task-list`     | Leaf: the task list panel.                             |
-| `git`           | Leaf: git status / diff for the active task worktree.  |
-| `file`          | Leaf: file explorer for the active task worktree.      |
-| `streampane`    | Leaf: ANSI stream rendered from a callback or file.    |
-| `task-preview`  | Leaf: argus-internal preview panel (default layout only). |
-| `task-detail`   | Leaf: argus-internal detail panel (default layout only).  |
-
-Split nodes require:
-
-- `direction`: `horizontal` or `vertical`.
-- `sizes`: an array of positive integers, one per child. Sizes are ratios — `[1, 1]` is 50/50, `[2, 1]` is two-thirds/one-third.
-- `children`: at least two nodes. Sizes length must equal children length.
-
-Leaf attributes:
-
-- `terminal.bind` — pin the panel to a specific source. Accepted forms:
-  - `task:<id>` — pin to a literal task id
-  - `task:current` — pin to whatever the user has focused
-  - `meta:<key>=<value>` — pin to tasks matching a metadata predicate (e.g. `meta:my-plugin.role=coordinator`)
-- `terminal.cycle` — when true, the panel cycles through matching tasks rather than pinning to one.
-- `streampane.source` — accepted forms:
-  - `callback:<url>` — argus opens a WebSocket to the URL
-  - `file:<path>` — argus tails the file (e.g. `file:~/.argus/ux.log`)
-
-Hotkeys are free-form strings; the layout renderer interprets them. The contract reserves `tab`, `ctrl-1`..`ctrl-9`, and `esc`. Use lower-case keys.
-
-Out of scope for v1:
-
-- Borders / titles per panel.
-- Conditional rendering ("show this panel only if X").
-- User-resizable splits at runtime.
-
-### Examples
-
-`docs/examples/layouts/` ships four reference layouts that round-trip through the parser as part of `internal/tui/layout/examples_test.go`:
-
-- `split-horizontal.json` — terminal | terminal, left pinned via `bind`, right cycles.
-- `split-vertical.json` — terminal / terminal stacked, both cycle.
-- `logs.json` — terminal + streampane tailing `~/.argus/ux.log`.
-- `reshuffle.json` — terminal centered between file and git rails.
-
-Copy any of them into `~/.argus/layouts/` to test.
+Built-in settings sections render first in their canonical order, followed by a blank-line separator and a `Plugins` header before alphabetically-sorted plugin sections. When no plugin sections exist, both the `Plugins` header and the preceding separator disappear.
 
 ## Versioning
 
@@ -515,14 +434,12 @@ Additive changes through v1:
 - New event types (clients ignore unknown `event:` lines).
 - New endpoints under `/api/`.
 - New optional fields on existing JSON bodies.
-- New layout node types (older argus rejects unknown leaf types at parse, so layouts using newer types simply fail to load on older builds — not a breaking compat issue for the protocol).
 
 Breaking changes (require major bump):
 
 - Renaming or removing an event type.
 - Changing the field name or type within an event payload.
 - Removing or renaming an endpoint.
-- Removing or renaming a layout node type.
 - Changing the prefix-enforcement rule on MCP tool names.
 
 ## A hello-world plugin
@@ -618,9 +535,7 @@ The substrate was specified up front in `PLAN.md` and implemented across seven i
 
 - **`X-Argus-Plugin-Version` is observed, not enforced.** The plan says "Argus rejects requests with unsupported versions." The middleware does not check the header today. The recommendation to send `X-Argus-Plugin-Version: 1` stands — when enforcement lands as part of a major bump, that line keeps every existing plugin working.
 
-- **`PUT /api/tasks/:id/meta` is master-only and takes an explicit `namespace` in the body.** The plan called for namespaces to be auto-derived from the auth scope and for plugin-scoped writes to be accepted. Reads are already scope-friendly (any authenticated token); writes are deferred to a follow-up PR. Until then, plugins that need to write metadata either ask the user to run the write under master credentials or route through a small server-side helper.
-
-- **Settings section type `stream` is reserved and rejected at registration.** PR 7 of the substrate ships `form` only. The plan describes a WebSocket-backed stream variant; that wiring follows the streampane widget integration in a later PR. The doc keeps the `stream` shape so plugin authors can preview the contract, but `type: "stream"` will fail validation today.
+- **Settings section type `stream` ships end-to-end.** Plugins can register `type: "stream"` and the TUI opens a WebSocket to `callback_url` when the user focuses the rail entry, piping received ANSI bytes into a streampane filling the right pane. The connector closes on blur (category change or section unregister); the streampane survives focus toggles so re-entering the section preserves received content. Stream sections must not declare `fields` — registration rejects the combination.
 
 - **MCP tool registration responds `201 Created` even on the heartbeat upsert path.** The plan implied `200 OK` on idempotent re-registration. The API currently returns `201` for both first-create and refresh; the registry distinguishes the two internally but the HTTP layer does not. Clients should treat both as success.
 
@@ -628,7 +543,7 @@ The substrate was specified up front in `PLAN.md` and implemented across seven i
 
 - **No `argus plugin` CLI subcommand.** Open question 5 in the plan. Plugins manage themselves; `argus token mint --scope` is the only CLI surface argus offers a plugin author. Listing registered tools and sections is HTTP-only (`GET /api/plugins/settings/sections`; no `/api/mcp/tools` GET endpoint today — query the database directly via `argus daemon` introspection if you need it during development).
 
-- **No `default-layout` config knob.** Open question 10 in the plan. Boot is hardcoded to `tasks-default`; switching layouts goes through Settings → Layouts at runtime.
+- **No JSON layouts.** The plan called for user-supplied JSON layouts under `~/.argus/layouts/` to recompose argus's built-in widgets. That story was superseded by plugin views (PR 9), which let a plugin register its own top-level page and render it via WebSocket. The `~/.argus/layouts/` directory is no longer scanned at boot.
 
 If a divergence above bothers you for a specific plugin, file an argus issue — the contract is additive within v1, so a new opt-in field is usually the right shape.
 
@@ -640,7 +555,5 @@ If a divergence above bothers you for a specific plugin, file an argus issue —
 - `internal/api/mcp_tools.go` — registration / unregistration handlers.
 - `internal/api/plugin_settings.go` — section registration and save proxy.
 - `internal/mcp/registry.go` — the persistent registry the MCP server consults alongside built-ins, plus the proxy logic.
-- `internal/tui/layout/parser.go` — layout JSON schema validator.
 - `internal/tui/settings/form.go` — settings section parser and validator.
 - `internal/model/event.go` — canonical event type strings (renames here are breaking changes).
-- `docs/examples/layouts/*.json` — reference layouts that double as executable schema tests.

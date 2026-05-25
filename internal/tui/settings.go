@@ -16,9 +16,9 @@ import (
 	"github.com/drn/argus/internal/launchagent"
 	"github.com/drn/argus/internal/model"
 	"github.com/drn/argus/internal/spinner"
-	"github.com/drn/argus/internal/tui/layout"
 	pluginsettings "github.com/drn/argus/internal/tui/settings"
 	"github.com/drn/argus/internal/tui/store"
+	"github.com/drn/argus/internal/tui/streampane"
 	"github.com/drn/argus/internal/tui/theme"
 	"github.com/drn/argus/internal/tui/widget"
 	"github.com/drn/argus/internal/uxlog"
@@ -48,7 +48,6 @@ const (
 	srSourcePath
 	srSchedule
 	srAutoStart
-	srLayout
 	srPluginField
 	srPluginSubmit
 )
@@ -72,11 +71,6 @@ const (
 	catRemoteAPI
 	catAppearance
 	catLogs
-	// catLayouts is the built-in "Layouts" section. The rail entry hides
-	// when only the default layout (`tasks-default`) is registered — i.e.
-	// when the user has no user-supplied layouts in ~/.argus/layouts/ —
-	// per the substrate plan's "hide on empty" requirement.
-	catLayouts
 	// catPlugin is a sentinel: the rail can hold any number of plugin
 	// sections, each addressed by [pluginKey{scope, title}] rather than by
 	// a fixed enum value. See [SettingsView.pluginKeyForCategory] for the
@@ -105,8 +99,6 @@ func (c settingsCategory) Label() string {
 		return "Appearance"
 	case catLogs:
 		return "Logs"
-	case catLayouts:
-		return "Layouts"
 	case catPlugin:
 		// Plugin sections render their own title (the registered Section's
 		// Title); the catPlugin sentinel itself has no rail-rendered label.
@@ -116,13 +108,10 @@ func (c settingsCategory) Label() string {
 }
 
 // builtinCategories is the fixed top portion of the rail. Plugins, when
-// present, render after a "Plugins" header below this list. catLayouts is
-// included here because it's a built-in even though it hides on empty —
-// hide-on-empty is enforced in [SettingsView.railEntries] rather than by
-// removing the enum entry.
+// present, render after a "Plugins" header below this list.
 var builtinCategories = []settingsCategory{
 	catSystem, catSandbox, catProjects, catBackends, catSchedules,
-	catKnowledgeBase, catRemoteAPI, catAppearance, catLogs, catLayouts,
+	catKnowledgeBase, catRemoteAPI, catAppearance, catLogs,
 }
 
 // settingsFocus is which sub-panel currently owns input within the settings view.
@@ -245,11 +234,6 @@ type SettingsView struct {
 	updateStatus    string // last-result status line shown in detail panel
 	updateOutput    string // last go-install output (for detail panel)
 
-	// Layouts. Sourced from [App.layouts]; cached snapshot avoids racing the
-	// layout registry's RWMutex on every Draw. SetLayouts is the App's
-	// injection point.
-	layouts []layout.Layout
-
 	// Plugin settings sections. Mirrors the daemon's `plugin_settings` table
 	// via store.Store.PluginSections (the same path local and remote modes
 	// share). pluginValues holds the user-entered draft per (scope, title,
@@ -271,6 +255,26 @@ type SettingsView struct {
 	// pluginSubmitStatus is the last status line rendered in the Submit
 	// detail panel — "Saved", an error message, or empty.
 	pluginSubmitStatus map[pluginKey]string
+
+	// Stream-section mounts. Cached per (scope, title); the streampane stays
+	// alive across focus toggles so previously-received bytes are visible on
+	// re-entry. OnStreamFocus / OnStreamBlur signal the app to open / close
+	// the WebSocket connector — the settings view itself does not own the
+	// connector, only the streampane and its byte channels.
+	streamMounts map[pluginKey]*streamSectionMount
+	// streamActive identifies which stream section currently holds focus
+	// (zero value when none). Used to fire OnStreamBlur on transitions.
+	streamActive pluginKey
+
+	// OnStreamFocus fires when a stream section gains focus. The app dials
+	// callbackURL and pumps received bytes into bytesIn, while forwarding
+	// keystrokes read from keysOut to the plugin. Safe to leave nil — the
+	// streampane will simply render no live content.
+	OnStreamFocus func(scope, title, callbackURL string, bytesIn chan<- []byte, keysOut <-chan []byte)
+	// OnStreamBlur fires when a stream section loses focus (category change,
+	// focus moved to rail, or section unregistered). The app closes the
+	// connector. Safe to leave nil.
+	OnStreamBlur func(scope, title string)
 
 	// Callbacks.
 	OnRestartDaemon          func()
@@ -297,6 +301,18 @@ type SettingsView struct {
 	// Persistence handle for toggling values. Both local *db.DB and remote
 	// *apistore.Store satisfy this interface.
 	database store.Store
+}
+
+// streamSectionMount is one streampane + its byte/key channels, cached on
+// the settings view per (scope, title). bytesIn is the channel the app's
+// connector pushes ANSI bytes into; keysOut carries keystrokes the streampane
+// reads from focused-pane input. The streampane consumes bytesIn until the
+// mount is torn down — kept alive across focus toggles so re-entering the
+// section preserves previously-received content without a re-dial round trip.
+type streamSectionMount struct {
+	bytesIn chan []byte
+	keysOut chan []byte
+	pane    *streampane.StreamPane
 }
 
 type projectEntry struct {
@@ -328,15 +344,8 @@ func NewSettingsView(database store.Store) *SettingsView {
 		focus:              focusPane,
 		pluginValues:       make(map[pluginKey]map[string]any),
 		pluginSubmitStatus: make(map[pluginKey]string),
+		streamMounts:       make(map[pluginKey]*streamSectionMount),
 	}
-}
-
-// SetLayouts updates the cached list of registered layouts. The app calls
-// this on the tick goroutine — after a [LoadLayoutsDir] call or any boot
-// rehydrate — so the Layouts rail entry's hide-on-empty condition
-// reflects the live registry. Passing nil clears the cache.
-func (sv *SettingsView) SetLayouts(layouts []layout.Layout) {
-	sv.layouts = layouts
 }
 
 // SetPluginSubmit wires the hook that posts plugin-section values back to
@@ -462,9 +471,6 @@ func (sv *SettingsView) Refresh() {
 // doesn't leak its draft values forever, and the Refresh-resync after an
 // unregister surfaces an empty form if the plugin re-registers later.
 func (sv *SettingsView) prunePluginValues() {
-	if len(sv.pluginValues) == 0 {
-		return
-	}
 	live := make(map[pluginKey]bool, len(sv.pluginSections))
 	for _, sec := range sv.pluginSections {
 		live[pluginKey{scope: sec.Scope, title: sec.Title}] = true
@@ -477,6 +483,24 @@ func (sv *SettingsView) prunePluginValues() {
 	for k := range sv.pluginSubmitStatus {
 		if !live[k] {
 			delete(sv.pluginSubmitStatus, k)
+		}
+	}
+	// Stream mounts whose section was unregistered: close the streampane and
+	// fire OnStreamBlur if it was the active focused stream. Closing the
+	// streampane stops its consumer goroutine; the channels are not closed
+	// here because the app's connector may still hold the send side (it
+	// will see the closed source via its own Done channel on shutdown).
+	for k, m := range sv.streamMounts {
+		if live[k] {
+			continue
+		}
+		m.pane.Close()
+		delete(sv.streamMounts, k)
+		if sv.streamActive == k {
+			if sv.OnStreamBlur != nil {
+				sv.OnStreamBlur(k.scope, k.title)
+			}
+			sv.streamActive = pluginKey{}
 		}
 	}
 }
@@ -522,8 +546,8 @@ const (
 )
 
 // railEntry is one row in the rail's dynamic list. Built using
-// [SettingsView.railEntries] every frame so plugin register/unregister and
-// layout hide-on-empty take effect without state plumbing.
+// [SettingsView.railEntries] every frame so plugin register/unregister
+// takes effect without state plumbing.
 type railEntry struct {
 	kind railEntryKind
 	cat  settingsCategory // populated for railBuiltin and railPlugin
@@ -549,11 +573,9 @@ func (e railEntry) selectable() bool {
 // plan's "Section ordering" rule:
 //
 //  1. Built-in categories, in their fixed order.
-//  2. The Layouts entry is filtered out when no non-default layout is
-//     registered (hide-on-empty).
-//  3. Blank separator + "Plugins" header, both hidden when no plugin
+//  2. Blank separator + "Plugins" header, both hidden when no plugin
 //     sections are registered.
-//  4. Plugin sections sorted alphabetically by title (ties broken by scope).
+//  3. Plugin sections sorted alphabetically by title (ties broken by scope).
 //
 // This is the single source of truth for both rail rendering and cursor
 // navigation — keep render/handle code consuming this slice rather than
@@ -561,11 +583,6 @@ func (e railEntry) selectable() bool {
 func (sv *SettingsView) railEntries() []railEntry {
 	out := make([]railEntry, 0, len(builtinCategories)+len(sv.pluginSections)+2)
 	for _, c := range builtinCategories {
-		// Hide Layouts when the user has no non-default layouts. The plan
-		// requires hide-on-empty for this section explicitly.
-		if c == catLayouts && !sv.hasUserLayouts() {
-			continue
-		}
 		out = append(out, railEntry{kind: railBuiltin, cat: c, label: c.Label()})
 	}
 	if len(sv.pluginSections) > 0 {
@@ -594,19 +611,6 @@ func (sv *SettingsView) railEntries() []railEntry {
 	return out
 }
 
-// hasUserLayouts reports whether the layout registry contains any layouts
-// beyond the built-in default. The plan ties the Layouts rail entry's
-// visibility to this — when the user hasn't dropped any *.json into
-// ~/.argus/layouts/, the section disappears entirely.
-func (sv *SettingsView) hasUserLayouts() bool {
-	for _, l := range sv.layouts {
-		if l.Name != layout.DefaultLayoutName {
-			return true
-		}
-	}
-	return false
-}
-
 // activeRailIdx returns the index of the rail entry matching the current
 // category (and active plugin, when category == catPlugin). Returns -1 when
 // no rail entry corresponds — possible after a plugin unregisters mid-
@@ -627,20 +631,6 @@ func (sv *SettingsView) activeRailIdx(entries []railEntry) int {
 	return -1
 }
 
-// userLayouts returns just the non-default layouts. Stable order
-// (alphabetical by Name) so the Layouts rows render deterministically.
-func (sv *SettingsView) userLayouts() []layout.Layout {
-	out := make([]layout.Layout, 0, len(sv.layouts))
-	for _, l := range sv.layouts {
-		if l.Name == layout.DefaultLayoutName {
-			continue
-		}
-		out = append(out, l)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
-}
-
 // activePluginSection returns the plugin section the cursor is currently
 // on (nil when category is not catPlugin or the section has been
 // unregistered). Used by rendering and key handling.
@@ -655,6 +645,57 @@ func (sv *SettingsView) activePluginSection() *pluginsettings.Section {
 		}
 	}
 	return nil
+}
+
+// currentStreamKey returns the pluginKey identifying the focused stream
+// section, or the zero pluginKey when no stream section currently holds
+// focus (either the active category isn't catPlugin, the active section was
+// unregistered, or the section is a form rather than a stream).
+func (sv *SettingsView) currentStreamKey() pluginKey {
+	sec := sv.activePluginSection()
+	if sec == nil || sec.Type != pluginsettings.TypeStream {
+		return pluginKey{}
+	}
+	return pluginKey{scope: sec.Scope, title: sec.Title}
+}
+
+// ensureStreamMount lazily creates a streampane + byte/key channels for the
+// given (scope, title) and caches it on sv.streamMounts. Subsequent calls
+// return the cached mount so re-entry preserves received bytes.
+func (sv *SettingsView) ensureStreamMount(key pluginKey, title string) *streamSectionMount {
+	if m, ok := sv.streamMounts[key]; ok {
+		return m
+	}
+	bytesIn := make(chan []byte, 64)
+	keysOut := make(chan []byte, 64)
+	pane := streampane.New(bytesIn)
+	pane.SetTitle(title)
+	pane.SetInputBack(keysOut)
+	m := &streamSectionMount{bytesIn: bytesIn, keysOut: keysOut, pane: pane}
+	sv.streamMounts[key] = m
+	return m
+}
+
+// notifyStreamTransition compares before/after focus and fires OnStreamBlur
+// / OnStreamFocus when the focused stream section identity changes. Capture
+// `before` via currentStreamKey() before any mutation that could change the
+// active section.
+func (sv *SettingsView) notifyStreamTransition(before pluginKey) {
+	after := sv.currentStreamKey()
+	if before == after {
+		return
+	}
+	if before != (pluginKey{}) && sv.OnStreamBlur != nil {
+		sv.OnStreamBlur(before.scope, before.title)
+	}
+	if after != (pluginKey{}) {
+		sec := sv.activePluginSection()
+		if sec != nil && sv.OnStreamFocus != nil {
+			mount := sv.ensureStreamMount(after, sec.Title)
+			sv.OnStreamFocus(after.scope, after.title, sec.CallbackURL, mount.bytesIn, mount.keysOut)
+		}
+	}
+	sv.streamActive = after
 }
 
 // pluginValueFor returns the user's current draft value for (key, title).
@@ -809,24 +850,19 @@ func (sv *SettingsView) rebuildRows() {
 		sv.rows = append(sv.rows, settingsRow{kind: srLogs, label: "UX Log", key: "ux"})
 		sv.rows = append(sv.rows, settingsRow{kind: srLogs, label: "Daemon Log", key: "daemon"})
 
-	case catLayouts:
-		// The rail entry hides when the user has no non-default layouts, so
-		// reaching this arm always means at least one user layout exists.
-		// Listing the user layouts as rows lets the cursor walk through them
-		// to inspect each layout's title and JSON shape; activation (binding
-		// a hotkey / making one the boot default) is intentionally out of
-		// scope for PR 7 — the Layouts row in the rail is read-only here so
-		// PR 7's settings refactor stays bounded.
-		for _, l := range sv.userLayouts() {
-			sv.rows = append(sv.rows, settingsRow{kind: srLayout, label: l.Name, key: l.Name})
-		}
-
 	case catPlugin:
-		// One row per registered form field, plus a Save row that POSTs the
-		// current draft values back to the daemon (which proxies to the
-		// plugin's callback URL).
+		// Form sections: one row per field plus a Save row that POSTs the
+		// current draft values back to the daemon. Stream sections render via
+		// a streampane in renderPane and add no rows here — the right pane
+		// devotes its full height to the streampane.
 		sec := sv.activePluginSection()
-		if sec == nil || sec.Spec == nil {
+		if sec == nil {
+			break
+		}
+		if sec.Type == pluginsettings.TypeStream {
+			break
+		}
+		if sec.Spec == nil {
 			break
 		}
 		for i := range sec.Spec.Fields {
@@ -1146,6 +1182,7 @@ func (sv *SettingsView) setActiveFromRail(e railEntry) {
 		if sv.category == catPlugin && sv.activePlugin == e.key {
 			return
 		}
+		beforeStream := sv.currentStreamKey()
 		sv.activePlugin = e.key
 		// Force a category change notification even when the old category
 		// was already catPlugin (different plugin section, same enum).
@@ -1154,6 +1191,7 @@ func (sv *SettingsView) setActiveFromRail(e railEntry) {
 		sv.cursor = 0
 		sv.scrollOff = 0
 		sv.rebuildRows()
+		sv.notifyStreamTransition(beforeStream)
 		if oldCat != catPlugin {
 			sv.notifyBranchChange()
 		}
@@ -1216,6 +1254,7 @@ func (sv *SettingsView) setCategory(c settingsCategory) {
 	if sv.category == c {
 		return
 	}
+	beforeStream := sv.currentStreamKey()
 	sv.category = c
 	sv.cursor = 0
 	sv.scrollOff = 0
@@ -1226,6 +1265,7 @@ func (sv *SettingsView) setCategory(c settingsCategory) {
 		sv.activePlugin = pluginKey{}
 	}
 	sv.rebuildRows()
+	sv.notifyStreamTransition(beforeStream)
 	sv.notifyBranchChange()
 }
 
@@ -1739,6 +1779,19 @@ func (sv *SettingsView) renderPane(screen tcell.Screen, x, y, w, h int) {
 	}
 	widget.FillArea(screen, ix, iy, iw, ih, ' ', tcell.StyleDefault)
 
+	// Stream sections get the full inner rect rendered as a streampane —
+	// items list, separator, and detail rows are all skipped because the
+	// pane is live ANSI content rather than discrete rows.
+	if sv.category == catPlugin {
+		if sec := sv.activePluginSection(); sec != nil && sec.Type == pluginsettings.TypeStream {
+			if mount, ok := sv.streamMounts[pluginKey{scope: sec.Scope, title: sec.Title}]; ok {
+				mount.pane.SetRect(ix, iy, iw, ih)
+				mount.pane.Draw(screen)
+			}
+			return
+		}
+	}
+
 	// Title row.
 	widget.DrawText(screen, ix, iy, iw, sv.category.Label(), theme.StyleTitle)
 	row0 := 2 // title + blank line
@@ -1855,8 +1908,6 @@ func (sv *SettingsView) renderRowDetail(screen tcell.Screen, x, y, w, h int, row
 		sv.renderScheduleDetail(screen, x, y, w, h)
 	case srAutoStart:
 		sv.renderAutoStartDetail(screen, x, y, w, h)
-	case srLayout:
-		sv.renderLayoutDetail(screen, x, y, w, h, row)
 	case srPluginField:
 		sv.renderPluginFieldDetail(screen, x, y, w, h, row)
 	case srPluginSubmit:

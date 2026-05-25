@@ -1470,54 +1470,6 @@ func TestPTYSizeFromPaneRect(t *testing.T) {
 	}
 }
 
-func TestApp_LayoutsRegistryHasDefault(t *testing.T) {
-	d := testDB(t)
-	runner := agent.NewRunner(nil)
-	app := New(d, runner, false)
-
-	reg := app.Layouts()
-	if reg == nil {
-		t.Fatal("expected non-nil layout registry")
-	}
-	got, ok := reg.Get("tasks-default")
-	if !ok {
-		t.Fatal("tasks-default not registered")
-	}
-	testutil.Equal(t, got.Name, "tasks-default")
-}
-
-func TestApp_LoadLayoutsDirRegistersJSONFiles(t *testing.T) {
-	d := testDB(t)
-	runner := agent.NewRunner(nil)
-	app := New(d, runner, false)
-
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "x.json"),
-		[]byte(`{"name":"mylayout","title":"M","root":{"type":"terminal"}}`),
-		0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	app.LoadLayoutsDir(dir)
-	_, ok := app.Layouts().Get("mylayout")
-	testutil.True(t, ok)
-}
-
-func TestApp_LoadLayoutsDirLogsErrorsButDoesNotPanic(t *testing.T) {
-	d := testDB(t)
-	runner := agent.NewRunner(nil)
-	app := New(d, runner, false)
-
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "bad.json"), []byte("{not json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// Must not panic and must not register anything.
-	app.LoadLayoutsDir(dir)
-	_, ok := app.Layouts().Get("nope")
-	testutil.False(t, ok)
-}
-
 func TestPTYSizeForRect(t *testing.T) {
 	cases := []struct {
 		name               string

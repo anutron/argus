@@ -175,6 +175,96 @@ func TestPluginViews_DeleteRejectsNonMaster(t *testing.T) {
 	testutil.Equal(t, w.Code, http.StatusForbidden)
 }
 
-func itoa(n int64) string {
-	return strconv.FormatInt(n, 10)
+// Scope-token tests follow. The handler accepts master OR scope:<name>;
+// scope tokens may only see and mutate rows whose scope matches their tag.
+
+func TestPluginViews_PostScopeTokenStoresOwnScope(t *testing.T) {
+	srv, d := testServer(t)
+	mux := srv.routes()
+
+	req := scopeReq("POST", "/api/plugins/views",
+		`{"title":"Coord","hotkey":"ctrl+c","callback_url":"ws://127.0.0.1:9/view"}`,
+		"ludwig")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	testutil.Equal(t, w.Code, http.StatusCreated)
+
+	var got pluginViewJSON
+	testutil.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	testutil.Equal(t, got.Scope, "ludwig")
+	testutil.Equal(t, got.Title, "Coord")
+
+	all, _ := d.PluginViews()
+	testutil.Equal(t, len(all), 1)
+	testutil.Equal(t, all[0].Scope, "ludwig")
+}
+
+func TestPluginViews_GetScopeTokenFiltersToOwnScope(t *testing.T) {
+	srv, d := testServer(t)
+	mux := srv.routes()
+
+	r := views.New(d)
+	_, _ = r.Register("ludwig", "Ludwig view", "", "ws://l")
+	_, _ = r.Register("plannotator", "Plannotator view", "", "ws://p")
+	_, _ = r.Register("", "Master view", "", "ws://m") // master-owned
+
+	// Scope token sees only its own row.
+	req := scopeReq("GET", "/api/plugins/views", "", "ludwig")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	testutil.Equal(t, w.Code, http.StatusOK)
+
+	var resp struct {
+		Views []pluginViewJSON `json:"views"`
+	}
+	testutil.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	testutil.Equal(t, len(resp.Views), 1)
+	testutil.Equal(t, resp.Views[0].Scope, "ludwig")
+
+	// Master still sees all three.
+	mreq := masterReq("GET", "/api/plugins/views", "")
+	mw := httptest.NewRecorder()
+	mux.ServeHTTP(mw, mreq)
+	testutil.Equal(t, mw.Code, http.StatusOK)
+	var mresp struct {
+		Views []pluginViewJSON `json:"views"`
+	}
+	testutil.NoError(t, json.Unmarshal(mw.Body.Bytes(), &mresp))
+	testutil.Equal(t, len(mresp.Views), 3)
+}
+
+func TestPluginViews_DeleteScopeTokenAllowsOwnRow(t *testing.T) {
+	srv, d := testServer(t)
+	mux := srv.routes()
+
+	r := views.New(d)
+	v, err := r.Register("ludwig", "Doomed", "", "ws://d")
+	testutil.NoError(t, err)
+
+	req := scopeReq("DELETE", "/api/plugins/views/"+strconv.FormatInt(v.ID, 10), "", "ludwig")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	testutil.Equal(t, w.Code, http.StatusOK)
+
+	all, _ := d.PluginViews()
+	testutil.Equal(t, len(all), 0)
+}
+
+func TestPluginViews_DeleteScopeTokenForbiddenOnCrossScope(t *testing.T) {
+	srv, d := testServer(t)
+	mux := srv.routes()
+
+	r := views.New(d)
+	v, err := r.Register("plannotator", "Theirs", "", "ws://t")
+	testutil.NoError(t, err)
+
+	// "ludwig" token tries to delete a "plannotator" row.
+	req := scopeReq("DELETE", "/api/plugins/views/"+strconv.FormatInt(v.ID, 10), "", "ludwig")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	testutil.Equal(t, w.Code, http.StatusForbidden)
+
+	// Row still exists.
+	all, _ := d.PluginViews()
+	testutil.Equal(t, len(all), 1)
 }

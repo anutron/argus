@@ -61,7 +61,7 @@ func TestRegistry_RegisterRejectsInvalid(t *testing.T) {
 		t.Fatalf("expected ErrInvalidTitle, got %v", err)
 	}
 	// Wrong type.
-	err = r.Register(Section{Scope: "s", Title: "t", Type: TypeStream, CallbackURL: "ws://x"})
+	err = r.Register(Section{Scope: "s", Title: "t", Type: "wat", CallbackURL: "http://x"})
 	if !errors.Is(err, ErrInvalidType) {
 		t.Fatalf("expected ErrInvalidType, got %v", err)
 	}
@@ -81,6 +81,25 @@ func TestRegistry_RegisterRejectsInvalid(t *testing.T) {
 		t.Fatalf("expected ErrEmptyForm, got %v", err)
 	}
 	testutil.Equal(t, r.Len(), 0)
+}
+
+func TestRegistry_RegisterAcceptsStream(t *testing.T) {
+	r := NewRegistry()
+	err := r.Register(Section{Scope: "ludwig", Title: "Live", Type: TypeStream, CallbackURL: "ws://x"})
+	testutil.NoError(t, err)
+	testutil.Equal(t, r.Len(), 1)
+	got, ok := r.Get("ludwig", "Live")
+	testutil.Equal(t, ok, true)
+	testutil.Equal(t, got.Type, TypeStream)
+
+	// Stream + fields rejected.
+	err = r.Register(Section{
+		Scope: "ludwig", Title: "Bad", Type: TypeStream, CallbackURL: "ws://x",
+		Spec: &FormSpec{Fields: []FormField{{Key: "k", Label: "l", Type: FieldBool}}},
+	})
+	if !errors.Is(err, ErrStreamHasFields) {
+		t.Fatalf("expected ErrStreamHasFields, got %v", err)
+	}
 }
 
 func TestRegistry_GetAndUnregister(t *testing.T) {
