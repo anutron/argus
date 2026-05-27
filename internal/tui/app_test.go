@@ -900,6 +900,84 @@ func TestCloseConfirmDelete(t *testing.T) {
 	}
 }
 
+func TestOpenHelp(t *testing.T) {
+	d := testDB(t)
+	app := New(d, agent.NewRunner(nil), false)
+
+	app.openHelp()
+
+	if app.mode != modeHelp {
+		t.Errorf("mode = %v, want modeHelp", app.mode)
+	}
+	if app.helpModal == nil {
+		t.Error("helpModal should not be nil")
+	}
+	// Calling again is a no-op (no second modal allocated).
+	first := app.helpModal
+	app.openHelp()
+	if app.helpModal != first {
+		t.Error("openHelp must be idempotent while modal is visible")
+	}
+}
+
+func TestCloseHelp(t *testing.T) {
+	d := testDB(t)
+	app := New(d, agent.NewRunner(nil), false)
+
+	app.openHelp()
+	app.closeHelp()
+
+	if app.mode != modeTaskList {
+		t.Errorf("mode = %v, want modeTaskList", app.mode)
+	}
+	if app.helpModal != nil {
+		t.Error("helpModal should be nil after close")
+	}
+	if app.helpPrevPage != "" {
+		t.Errorf("helpPrevPage = %q, want empty", app.helpPrevPage)
+	}
+}
+
+func TestHandleHelpKeyClosesOnEscape(t *testing.T) {
+	d := testDB(t)
+	app := New(d, agent.NewRunner(nil), false)
+
+	app.openHelp()
+	app.handleHelpKey(tcell.NewEventKey(tcell.KeyEscape, 0, tcell.ModNone))
+
+	if app.mode != modeTaskList {
+		t.Errorf("mode = %v, want modeTaskList", app.mode)
+	}
+	if app.helpModal != nil {
+		t.Error("helpModal should be nil after Esc")
+	}
+}
+
+func TestCloseHelpRestoresActiveTab(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tab  widget.Tab
+	}{
+		{"tasks", widget.TabTasks},
+		{"DAG", widget.TabDAG},
+		{"settings", widget.TabSettings},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := testDB(t)
+			app := New(d, agent.NewRunner(nil), false)
+			app.switchTab(tc.tab)
+			app.openHelp()
+			app.closeHelp()
+			if app.mode != modeTaskList {
+				t.Errorf("mode = %v, want modeTaskList", app.mode)
+			}
+			if app.header.ActiveTab() != tc.tab {
+				t.Errorf("active tab = %v, want %v after close", app.header.ActiveTab(), tc.tab)
+			}
+		})
+	}
+}
+
 func TestDeleteTask(t *testing.T) {
 	d := testDB(t)
 	runner := agent.NewRunner(nil)

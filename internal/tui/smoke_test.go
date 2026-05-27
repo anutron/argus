@@ -360,6 +360,33 @@ func TestSmoke_TabSwitching(t *testing.T) {
 	}
 }
 
+func TestSmoke_HelpModalOpensOnQuestionKey(t *testing.T) {
+	d := testDB(t)
+	app := New(d, agent.NewRunner(nil), false)
+
+	sim, stop := wireApp(t, app)
+	defer stop()
+
+	sim.InjectKey(tcell.KeyRune, '?', 0)
+	syncUI(t, app.tapp)
+
+	var open bool
+	readUI(t, app.tapp, func() { open = app.helpModal != nil && app.mode == modeHelp })
+	if !open {
+		t.Fatal("? should open the help modal")
+	}
+
+	// Esc closes it and restores the task list mode.
+	sim.InjectKey(tcell.KeyEscape, 0, 0)
+	syncUI(t, app.tapp)
+
+	var closed bool
+	readUI(t, app.tapp, func() { closed = app.helpModal == nil && app.mode == modeTaskList })
+	if !closed {
+		t.Fatal("Esc should close the help modal")
+	}
+}
+
 func TestSmoke_NewTaskFormPaste(t *testing.T) {
 	d := testDB(t)
 	runner := agent.NewRunner(nil)
