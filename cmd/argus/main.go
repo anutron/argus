@@ -51,6 +51,9 @@ func main() {
 		case "kb":
 			runKBCommand(os.Args[2:])
 			return
+		case "token":
+			runTokenCommand(os.Args[2:])
+			return
 		}
 	}
 
