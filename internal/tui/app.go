@@ -1,8 +1,12 @@
 package tui
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -61,6 +65,7 @@ const (
 	modeRestartDaemonPrompt
 	modeAppleEventsPicker
 	modeHelp
+	modePluginView
 )
 
 // agentFocus tracks which panel has focus in the agent view.
@@ -247,6 +252,29 @@ type App struct {
 	// driven, so the one CSI 2J flash per resize is the right tradeoff.
 	lastScreenW int
 	lastScreenH int
+
+	// Plugin-registered top-level views. See plugin_views.go for the
+	// mount/activate/deactivate lifecycle. pluginConnFactory is overridable
+	// so smoke tests can replace the real WebSocket dialer with an in-
+	// process stub.
+	pluginMounts      []*pluginViewMount
+	pluginHotkeys     map[tcell.Key]*pluginViewMount
+	activePlugin      *pluginViewMount
+	pluginConnFactory pluginConnectorFactory
+
+	// Stream-section connectors. Keyed by (scope, title). Created on
+	// SettingsView.OnStreamFocus, closed on OnStreamBlur. Reuses the same
+	// connector factory as plugin views so smoke tests can stub.
+	streamConns   map[pluginStreamKey]pluginConnector
+	streamConnsMu sync.Mutex
+}
+
+// pluginStreamKey identifies an open stream-section connector. Matches the
+// SettingsView's pluginKey shape but lives in package tui so it doesn't
+// re-export internal/tui's pluginKey.
+type pluginStreamKey struct {
+	scope string
+	title string
 }
 
 // New creates the tui application shell.
@@ -302,6 +330,9 @@ func New(database store.Store, runner agent.SessionProvider, daemonConnected boo
 	app.settings.OnDeleteSchedule = func(id string) { app.deleteSchedule(id) }
 	app.settings.OnRunSchedule = func(id string) { app.runScheduleNow(id) }
 	app.settings.OnBranchChange = func() { app.forceRedraw("settings branch changed") }
+	app.settings.OnStreamFocus = app.openStreamSection
+	app.settings.OnStreamBlur = app.closeStreamSection
+	app.settings.SetPluginSubmit(app.submitPluginSection)
 	app.settingsPage = NewSettingsPage(app.settings)
 
 	cfg := database.Config()
@@ -435,6 +466,7 @@ func (a *App) buildUI() {
 		AddPage("agent", a.agentPage, true, false).
 		AddPage("dag", a.dagPage, true, false).
 		AddPage("settings", a.settingsPage, true, false)
+	a.loadPluginViews()
 	// Every Pages mutation (AddPage / RemovePage / SwitchToPage / Show / Hide)
 	// is a layout change that needs a tcell Sync to wipe ghost cells under
 	// tmux/iTerm2. Wiring it once here covers every modal open/close, every
@@ -486,12 +518,64 @@ func (a *App) afterDraw(screen tcell.Screen) {
 	a.lastScreenH = h
 	uxlog.Log("[tui] afterDraw resize %dx%d — Sync", w, h)
 	screen.Sync()
+	// Forward the resize to the active plugin view (if any). Best-effort —
+	// errors land in uxlog rather than the user's terminal.
+	a.resizePluginViewIfActive()
 }
 
 // SetDaemonStale records that the connected daemon's binary differs from the
 // TUI's. Must be called before Run() — the flag is consumed there.
 func (a *App) SetDaemonStale(stale bool) {
 	a.daemonStale = stale
+}
+
+// submitPluginSection is the production submit hook wired into the
+// SettingsView at App construction. It looks up the section's callback URL
+// from the live PluginSections list and POSTs the user-entered values map
+// there.
+//
+// Two-process limitation: in --remote mode the TUI is on a host that may
+// not reach the plugin's callback URL (the plugin server is typically on
+// the same LAN as the daemon, not the user's phone). The proper fix is to
+// proxy through the daemon's /submit endpoint, which a follow-up will
+// wire once the apiclient gains a SubmitPluginSection method. Local mode
+// — the common case — works today because both the TUI and the plugin
+// share localhost.
+func (a *App) submitPluginSection(scope, title string, values map[string]any) error {
+	sections, err := a.db.PluginSections()
+	if err != nil {
+		return err
+	}
+	var callbackURL string
+	for _, sec := range sections {
+		if sec.Scope == scope && sec.Title == title {
+			callbackURL = sec.CallbackURL
+			break
+		}
+	}
+	if callbackURL == "" {
+		return fmt.Errorf("plugin section %s/%s not found", scope, title)
+	}
+	body, err := json.Marshal(values)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, callbackURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("plugin returned %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // openRestartDaemonPrompt shows the modal asking whether to restart the
@@ -1428,6 +1512,29 @@ func (a *App) refreshTasksWithIDs(runningIDs, idleIDs []string) {
 
 // handleGlobalKey processes key events at the application level.
 func (a *App) handleGlobalKey(event *tcell.EventKey) *tcell.EventKey {
+	// Plugin-view mode — Esc exits, every other keystroke forwards to the
+	// plugin via the streampane's InputBack channel. The streampane's
+	// InputHandler does the actual forwarding; we just need to intercept
+	// Esc here before the streampane consumes it. See plugin_views.go.
+	if a.mode == modePluginView {
+		if event.Key() == tcell.KeyEscape {
+			a.deactivatePluginView()
+			return nil
+		}
+		return event
+	}
+
+	// Plugin-view hotkey activation — checked before form handlers so the
+	// hotkey works from any non-modal context. tview.Pages already routes
+	// the form modes via earlier branches below, so they get to absorb the
+	// keystroke first when active.
+	if event.Key() != tcell.KeyRune {
+		if m, ok := a.pluginHotkeys[event.Key()]; ok && a.mode == modeTaskList {
+			a.activatePluginView(m)
+			return nil
+		}
+	}
+
 	// New task form mode — delegate everything to the form
 	if a.mode == modeNewTask && a.newTaskForm != nil {
 		a.handleNewTaskKey(event)
@@ -2844,6 +2951,29 @@ func ptySizeFromPaneRect(pw, ph int) (rows, cols uint16) {
 	// so the int → uint16 conversion cannot overflow; the max() floors also
 	// guarantee positive values. Silence gosec G115 for both fields.
 	return uint16(max(ph-agentViewColOverhead, 5)), uint16(max(pw-agentViewColOverhead, 20)) //nolint:gosec // see comment
+}
+
+// Rect is the agent-pane outer rectangle on screen, taken at face value.
+// Multi-pane layouts (PR 7 and later) pass per-pane rects here rather than
+// going through computePTYSize's host-term/box-default reasoning.
+type Rect struct {
+	X, Y, W, H int
+}
+
+// PTYSizeForRect returns the PTY (rows, cols) for an agent terminal whose
+// outer rect on screen is r. The 1-cell border on each side
+// (agentViewColOverhead) is subtracted; rows and cols are clamped to the
+// minimum useful floor (5 rows / 20 cols).
+//
+// Unlike [App.computePTYSize], the input rect is trusted: there is no
+// host-term fallback and no Box-default rejection. Callers driving the new
+// layout registry already know the authoritative pane rect.
+func PTYSizeForRect(r Rect) (rows, cols uint16) {
+	if r.W <= 0 || r.H <= 0 {
+		return 0, 0
+	}
+	// Realistic cell counts cap well under uint16; max() guarantees positive.
+	return uint16(max(r.H-agentViewColOverhead, 5)), uint16(max(r.W-agentViewColOverhead, 20)) //nolint:gosec // bounded by terminal cell count
 }
 
 // startSession starts a session for an *existing* task (Enter-to-restart or
