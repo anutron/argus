@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -88,6 +89,8 @@ type App struct {
 	agentHeader  *widget.AgentHeader
 	gitPanel     *gitpanel.GitPanel // git status for agent view (left panel)
 	filePanel    *gitpanel.FilePanel
+	attentionBar *widget.AttentionBar // sits above gitPanel in agent view
+	agentLeftCol *tview.Flex          // vertical flex that owns attentionBar + gitPanel
 
 	// Tabs
 	settings     *SettingsView
@@ -164,6 +167,7 @@ type App struct {
 	// Idle-unvisited tracking (for visual InReview promotion)
 	idleUnvisited    map[string]bool // task IDs idle since user last opened their agent view
 	viewedWhileAgent map[string]bool // tasks viewed in agent view; suppresses idleUnvisited re-add
+	needsInputIDs    []string        // task IDs detected as blocked on a user prompt this tick
 
 	// Daemon health
 	daemonFailures    int
@@ -394,9 +398,20 @@ func (a *App) buildUI() {
 		AddItem(a.taskDetail, 0, 1, false)
 	a.taskPage = taskview.NewTaskPage(taskFlex, a.tasklist)
 
-	// Agent page — header + three-panel layout
+	// Agent page — header + three-panel layout. The left column stacks
+	// the attention bar (visible only when other tasks need user attention)
+	// above the git status panel; it starts at zero height and grows as
+	// updateAttentionBar resizes it.
+	a.attentionBar = widget.NewAttentionBar()
+	a.agentLeftCol = tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(a.attentionBar, 0, 0, false).
+		AddItem(a.gitPanel, 0, 1, false)
+	a.attentionBar.OnHeightChange = func() {
+		a.agentLeftCol.ResizeItem(a.attentionBar, a.attentionBar.DesiredHeight(), 0)
+		a.forceRedraw("attention bar height changed")
+	}
 	agentPanels := tview.NewFlex().SetDirection(tview.FlexColumn).
-		AddItem(a.gitPanel, 0, 1, false).
+		AddItem(a.agentLeftCol, 0, 1, false).
 		AddItem(a.agentPane, 0, 3, false).
 		AddItem(a.filePanel, 0, 1, false)
 	a.agentPage = tview.NewFlex().SetDirection(tview.FlexRow).
@@ -1109,6 +1124,147 @@ func (a *App) syncIdleUnvisited() {
 	a.tasklist.SetIdleUnvisited(ids)
 }
 
+// updateAttentionBar feeds the agent view's attention bar with the names of
+// tasks currently blocked on a user prompt (the `needsInputIDs` set computed
+// by refreshTasksWithIDs). The currently-viewed task is excluded so the bar
+// only surfaces OTHER tasks waiting on input — opening one yourself already
+// makes it obvious. Names are sorted for stable rendering.
+func (a *App) updateAttentionBar() {
+	if a.attentionBar == nil {
+		return
+	}
+	currentID := ""
+	if a.mode == modeAgent {
+		currentID = a.agentState.TaskID
+	}
+	byID := make(map[string]*model.Task, len(a.tasks))
+	for _, t := range a.tasks {
+		byID[t.ID] = t
+	}
+	entries := make([]widget.AttentionEntry, 0, len(a.needsInputIDs))
+	for _, id := range a.needsInputIDs {
+		if id == currentID {
+			continue
+		}
+		t, ok := byID[id]
+		if !ok {
+			continue
+		}
+		entries = append(entries, widget.AttentionEntry{TaskName: t.Name})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].TaskName < entries[j].TaskName })
+	a.attentionBar.SetEntries(entries)
+}
+
+// detectNeedsInput returns the subset of idleIDs whose recent PTY output
+// contains a known "agent is blocked on a user prompt" signature. Scanning is
+// gated on idleness — an agent that's still streaming bytes is not blocked
+// even if the marker text passes through the buffer transiently. Reads use
+// the on-disk session log so detection works for tasks the user has not yet
+// visited (see readSessionLogTailBytes).
+func (a *App) detectNeedsInput(idleIDs []string) []string {
+	if len(idleIDs) == 0 {
+		return nil
+	}
+	var out []string
+	for _, id := range idleIDs {
+		tail := readSessionLogTailBytes(id, detectNeedsInputTailBytes)
+		if len(tail) == 0 {
+			continue
+		}
+		if agent.DetectNeedsInput(tail) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// detectNeedsInputSticky wraps detectNeedsInput with a "carry-forward" pass:
+// any task that was previously detected as needing input gets re-checked
+// against its log tail this tick, even if it has fallen out of idleIDs.
+//
+// Why: Claude's prompt UI emits periodic animation bytes (cursor blink,
+// spinner) while waiting for the user. Each emission bumps the session's
+// lastOutput, which kicks the task out of the daemon's idle list for a tick
+// or two at a time. Without this pass the attention bar would oscillate —
+// visible only during the ~3 s windows when the task crosses back through
+// the idle threshold — which the user perceives as "the bar shows briefly
+// then disappears."
+//
+// The sticky entry self-clears when the on-disk marker is gone (the agent
+// has produced enough new bytes to push it out of the tail window — i.e.
+// the question has been answered) or when the task is no longer running.
+func (a *App) detectNeedsInputSticky(idleIDs, runningIDs, prevNeedsInput []string) []string {
+	fresh := a.detectNeedsInput(idleIDs)
+	if len(prevNeedsInput) == 0 {
+		return fresh
+	}
+	freshSet := make(map[string]bool, len(fresh))
+	for _, id := range fresh {
+		freshSet[id] = true
+	}
+	runningSet := make(map[string]bool, len(runningIDs))
+	for _, id := range runningIDs {
+		runningSet[id] = true
+	}
+	for _, id := range prevNeedsInput {
+		if freshSet[id] || !runningSet[id] {
+			continue
+		}
+		tail := readSessionLogTailBytes(id, detectNeedsInputTailBytes)
+		if len(tail) == 0 {
+			continue
+		}
+		if agent.DetectNeedsInput(tail) {
+			fresh = append(fresh, id)
+			freshSet[id] = true
+		}
+	}
+	return fresh
+}
+
+// detectNeedsInputTailBytes is how many bytes to read from the end of each
+// idle task's session log per tick. Large enough to contain Claude's full
+// selection-UI overlay after the colorized repaint inflates line widths.
+const detectNeedsInputTailBytes = 16 * 1024
+
+// readSessionLogTailBytes returns the last n raw bytes of a task's session
+// log, or nil on any error. Unlike readSessionLogTail (which strips ANSI for
+// human display), this preserves the raw stream so the caller can do its own
+// ANSI handling.
+//
+// detectNeedsInput reads here instead of through SessionHandle.RecentOutputTail
+// because in daemon-client mode the local ring buffer only fills after the
+// TUI opens a stream connection for that session, i.e. after the user has
+// visited it. The disk log captures every byte the daemon ever wrote, so the
+// detector can flag a blocked agent the user has never opened.
+func readSessionLogTailBytes(taskID string, n int) []byte {
+	f, err := os.Open(agent.SessionLogPath(taskID))
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil
+	}
+	size := info.Size()
+	offset := int64(0)
+	if size > int64(n) {
+		offset = size - int64(n)
+	}
+	if offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return nil
+		}
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
 // refreshTasks fetches running/idle session IDs (RPC) and updates the task
 // list. IMPORTANT: This blocks on RPC calls — NEVER call from the tview main
 // goroutine. Use refreshTasksAsync instead for any UI-thread call site.
@@ -1167,6 +1323,13 @@ func (a *App) refreshTasksWithIDs(runningIDs, idleIDs []string) {
 		return
 	}
 	a.tasks = tasks
+	// Snapshot the previous needs-input set before we overwrite it. The
+	// sticky pass below uses this to carry forward detections that have
+	// fallen out of idleIDs — Claude's prompt UI emits periodic animation
+	// bytes (cursor blink, spinner) that bump lastOutput without
+	// representing real progress, kicking a genuinely-blocked task out of
+	// the daemon's idle list for a tick or two at a time.
+	prevNeedsInput := a.needsInputIDs
 	a.runningIDs = runningIDs
 	a.idleIDs = idleIDs
 
@@ -1242,6 +1405,9 @@ func (a *App) refreshTasksWithIDs(runningIDs, idleIDs []string) {
 	a.tasklist.SetRunning(a.runningIDs)
 	a.tasklist.SetIdle(idleIDs)
 	a.syncIdleUnvisited()
+	a.needsInputIDs = a.detectNeedsInputSticky(idleIDs, runningIDs, prevNeedsInput)
+	a.tasklist.SetNeedsInput(a.needsInputIDs)
+	a.updateAttentionBar()
 	a.statusbar.SetTasks(a.tasks)
 	a.statusbar.SetRunning(a.runningIDs)
 
@@ -2196,6 +2362,9 @@ func (a *App) onTaskSelect(task *model.Task, autoStart bool) {
 	a.agentHeader.SetTaskName(task.Name)
 	a.agentPane.SetTaskID(task.ID)
 	a.agentPane.ResetVT()
+	// Re-filter the attention bar now that currentID is set — otherwise the
+	// just-opened task could linger in the bar until the next tick.
+	a.updateAttentionBar()
 	// Refresh the clipboard hint synchronously on entry so re-opening a
 	// task with a pending payload doesn't flash a hint-less header for up
 	// to one tick. The tick loop continues to keep this in sync.

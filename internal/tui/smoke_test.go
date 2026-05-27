@@ -1612,3 +1612,164 @@ func TestSmoke_FocusLossDoesNotTriggerSync(t *testing.T) {
 		t.Fatalf("focus loss must not fire focus-regained Sync; tail:\n%s", string(tail))
 	}
 }
+
+// TestSmoke_AttentionBarShowsOtherNeedsInputTasks verifies the agent view's
+// attention bar populates from needsInputIDs, excludes the currently-viewed
+// task, and collapses back to zero height once no other tasks are blocked.
+func TestSmoke_AttentionBarShowsOtherNeedsInputTasks(t *testing.T) {
+	d := testDB(t)
+	runner := agent.NewRunner(nil)
+	app := New(d, runner, false)
+
+	viewed := &model.Task{ID: "view-1", Name: "viewed", Status: model.StatusInProgress, Project: "p", CreatedAt: time.Now()}
+	other := &model.Task{ID: "other-1", Name: "needs-help", Status: model.StatusInProgress, Project: "p", CreatedAt: time.Now()}
+	d.Add(viewed)
+	d.Add(other)
+	app.refreshTasks()
+
+	_, stop := wireApp(t, app)
+	defer stop()
+
+	// Pretend both tasks were blocked on a prompt, then enter the viewed task.
+	readUI(t, app.tapp, func() {
+		app.needsInputIDs = []string{viewed.ID, other.ID}
+		app.updateAttentionBar()
+		app.onTaskSelect(viewed, false)
+	})
+
+	var entries []widget.AttentionEntry
+	var height int
+	readUI(t, app.tapp, func() {
+		entries = app.attentionBar.Entries()
+		height = app.attentionBar.DesiredHeight()
+	})
+	if len(entries) != 1 || entries[0].TaskName != "needs-help" {
+		t.Fatalf("attention bar should contain the OTHER task only; got %#v", entries)
+	}
+	if height != 3 { // 1 entry + 2 border rows
+		t.Fatalf("desired height = %d, want 3 for one entry", height)
+	}
+
+	// Clear the other task from needsInputIDs and refresh — bar should collapse.
+	readUI(t, app.tapp, func() {
+		app.needsInputIDs = nil
+		app.updateAttentionBar()
+	})
+
+	readUI(t, app.tapp, func() {
+		entries = app.attentionBar.Entries()
+		height = app.attentionBar.DesiredHeight()
+	})
+	if len(entries) != 0 {
+		t.Fatalf("attention bar should be empty after clearing other; got %#v", entries)
+	}
+	if height != 0 {
+		t.Fatalf("desired height after clearing = %d, want 0", height)
+	}
+}
+
+// TestRefreshTasks_NeedsInputSticky verifies that once a task is detected as
+// needing input, it remains in needsInputIDs across ticks where it temporarily
+// drops out of idleIDs. Claude's prompt UI emits periodic animation bytes
+// (cursor blink, spinner) that bump the session's lastOutput without
+// representing real progress; before the sticky pass, the attention bar
+// would flicker off in that gap and appear briefly each time the task
+// crossed back through the 3 s idle threshold.
+func TestRefreshTasks_NeedsInputSticky(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	d := testDB(t)
+	runner := agent.NewRunner(nil)
+	app := New(d, runner, false)
+
+	viewed := &model.Task{ID: "view-1", Name: "viewed", Status: model.StatusInProgress, Project: "p", CreatedAt: time.Now()}
+	other := &model.Task{ID: "other-1", Name: "needs-help", Status: model.StatusInProgress, Project: "p", CreatedAt: time.Now()}
+	if err := d.Add(viewed); err != nil {
+		t.Fatalf("db.Add viewed: %v", err)
+	}
+	if err := d.Add(other); err != nil {
+		t.Fatalf("db.Add other: %v", err)
+	}
+
+	_, stop := wireApp(t, app)
+	defer stop()
+
+	// Write a log file for the other task containing the needs-input marker.
+	// Path A ('❯ 1.' with literal space) is what survives ANSI strip in the
+	// AskUserQuestion overlay.
+	logPath := agent.SessionLogPath(other.ID)
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	withMarker := []byte("Do you want me to proceed?\n❯ 1. Yes\n  2. No\n")
+	if err := os.WriteFile(logPath, withMarker, 0o600); err != nil {
+		t.Fatalf("write log with marker: %v", err)
+	}
+
+	snapshotIDs := func() []string {
+		var out []string
+		readUI(t, app.tapp, func() {
+			out = append(out, app.needsInputIDs...)
+		})
+		return out
+	}
+
+	// Tick 1: other is idle → detected via the normal path.
+	readUI(t, app.tapp, func() {
+		app.refreshTasksWithIDs([]string{viewed.ID, other.ID}, []string{other.ID})
+	})
+	if got := snapshotIDs(); !containsString(got, other.ID) {
+		t.Fatalf("tick 1: expected %q in needsInputIDs, got %v", other.ID, got)
+	}
+
+	// Tick 2: Claude emitted an animation byte → other is no longer in
+	// idleIDs. Sticky pass must keep it because the marker is still on disk.
+	readUI(t, app.tapp, func() {
+		app.refreshTasksWithIDs([]string{viewed.ID, other.ID}, nil)
+	})
+	if got := snapshotIDs(); !containsString(got, other.ID) {
+		t.Fatalf("tick 2 (sticky): expected %q to persist in needsInputIDs even when not idle, got %v", other.ID, got)
+	}
+
+	// Tick 3: agent moved past the question (user responded elsewhere) — log
+	// no longer contains the marker. Sticky pass must drop the task.
+	if err := os.WriteFile(logPath, []byte("agent is working on something else\n"), 0o600); err != nil {
+		t.Fatalf("overwrite log: %v", err)
+	}
+	readUI(t, app.tapp, func() {
+		app.refreshTasksWithIDs([]string{viewed.ID, other.ID}, nil)
+	})
+	if got := snapshotIDs(); containsString(got, other.ID) {
+		t.Fatalf("tick 3: expected %q to drop after marker cleared, got %v", other.ID, got)
+	}
+
+	// Tick 4: task no longer running — sticky must drop it even if the
+	// marker is still in the log tail (rewrite it back to ensure that's the
+	// scenario the test is exercising).
+	if err := os.WriteFile(logPath, withMarker, 0o600); err != nil {
+		t.Fatalf("rewrite log with marker: %v", err)
+	}
+	// Re-detect via a fresh tick where it IS idle so the sticky branch has
+	// something to carry forward.
+	readUI(t, app.tapp, func() {
+		app.refreshTasksWithIDs([]string{viewed.ID, other.ID}, []string{other.ID})
+	})
+	if got := snapshotIDs(); !containsString(got, other.ID) {
+		t.Fatalf("tick 4 setup: expected %q in needsInputIDs, got %v", other.ID, got)
+	}
+	// Now exclude other from runningIDs entirely.
+	readUI(t, app.tapp, func() {
+		app.refreshTasksWithIDs([]string{viewed.ID}, nil)
+	})
+	if got := snapshotIDs(); containsString(got, other.ID) {
+		t.Fatalf("tick 4: expected %q to drop when no longer running, got %v", other.ID, got)
+	}
+}
+
+func containsString(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
