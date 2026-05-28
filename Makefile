@@ -1,7 +1,16 @@
-.PHONY: build vet test test-watch test-cover test-cover-gate test-pkg lint-pr fmt fmt-check vuln
+.PHONY: build vet test test-watch test-cover test-cover-gate test-pkg lint-pr fmt fmt-check vuln pre-pr
 
 build:
 	go build ./...
+
+# Full pre-PR gate — mirrors .github/workflows/ci.yml in order. Run this
+# (and get a clean pass) before opening or updating a PR. test-cover-gate
+# runs the race suite + coverage floor, so it subsumes `make test`.
+# Note: `vuln` is `continue-on-error` in CI (advisory only — stdlib CVEs
+# need a Go bump), but is fatal here so local runs surface them early.
+# A red `make pre-pr` whose ONLY failure is `vuln` will still pass CI.
+pre-pr: build vet fmt-check lint-pr vuln test-cover-gate
+	@echo "✓ pre-pr checks passed — safe to open/update the PR"
 
 vet:
 	go vet ./...

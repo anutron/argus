@@ -13,6 +13,7 @@ import (
 	"github.com/drn/argus/internal/config"
 	"github.com/drn/argus/internal/db"
 	"github.com/drn/argus/internal/model"
+	"github.com/drn/argus/internal/testutil"
 )
 
 // initGitRepo creates a git repo with one commit in a fresh temp dir and
@@ -486,4 +487,45 @@ func TestCreateAndStart_StartedAtSetOnSuccess(t *testing.T) {
 		t.Errorf("StartedAt %v should be >= %v", task.StartedAt, before)
 	}
 	RemoveWorktreeAndBranch(task.Worktree, task.Branch, repo)
+}
+
+// TestStartPendingBlocked_GuardClauses pins the three argument guards that
+// reject the call before any worktree/DB/session side effect runs. The db is
+// never touched on these paths, so a nil database is safe.
+func TestStartPendingBlocked_GuardClauses(t *testing.T) {
+	tests := []struct {
+		name   string
+		runner SessionProvider
+		task   *model.Task
+		want   string
+	}{
+		{
+			name:   "nil runner",
+			runner: nil,
+			task:   &model.Task{ID: "x", Status: model.StatusPending},
+			want:   "nil runner",
+		},
+		{
+			name:   "nil task",
+			runner: &fakeRunner{},
+			task:   nil,
+			want:   "nil task",
+		},
+		{
+			name:   "non-pending status",
+			runner: &fakeRunner{},
+			task:   &model.Task{ID: "x", Status: model.StatusInReview},
+			want:   "already in status",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sess, err := StartPendingBlocked(nil, tc.runner, tc.task)
+			testutil.Nil(t, sess)
+			if err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			testutil.Contains(t, err.Error(), tc.want)
+		})
+	}
 }
