@@ -130,7 +130,7 @@ func (d *DB) addLocked(t *model.Task) error {
 }
 
 func (d *DB) Update(t *model.Task) error {
-	oldStatus, hadOld, err := d.updateLocked(t)
+	oldStatus, oldArchived, hadOld, err := d.updateLocked(t)
 	if err != nil {
 		return err
 	}
@@ -146,22 +146,35 @@ func (d *DB) Update(t *model.Task) error {
 			events.Emit(model.EventTypeTaskCompleted, t.ID, nil)
 		}
 	}
+	// Archive transition: parity with SetArchived so hera and other consumers
+	// of `task.archived` see the event regardless of which write path archived
+	// the row. HTTP /api/tasks PUT and MCP task_archive both flow through
+	// Update; without this they would silently flip the bit and leave any
+	// downstream view of "live bindings" stale.
+	if hadOld && !oldArchived && t.Archived {
+		events.Emit(model.EventTypeTaskArchived, t.ID, nil)
+	}
 	return nil
 }
 
-func (d *DB) updateLocked(t *model.Task) (model.Status, bool, error) {
+func (d *DB) updateLocked(t *model.Task) (model.Status, bool, bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// Capture old status BEFORE the write so the post-unlock emission sees
-	// the transition. A row that doesn't exist yet (hadOld=false) is the
-	// "row missing" case that returns ErrTaskNotFound below; we suppress
-	// the event for that.
-	var oldStatus model.Status
-	var hadOld bool
-	var oldStatusStr string
-	if err := d.conn.QueryRow(`SELECT status FROM tasks WHERE id=?`, t.ID).Scan(&oldStatusStr); err == nil {
+	// Capture old status + archived state BEFORE the write so the post-unlock
+	// emission sees the transition. A row that doesn't exist yet (hadOld=false)
+	// is the "row missing" case that returns ErrTaskNotFound below; we
+	// suppress the event for that.
+	var (
+		oldStatus    model.Status
+		oldArchived  bool
+		hadOld       bool
+		oldStatusStr string
+		oldArchInt   int
+	)
+	if err := d.conn.QueryRow(`SELECT status, archived FROM tasks WHERE id=?`, t.ID).Scan(&oldStatusStr, &oldArchInt); err == nil {
 		oldStatus, _ = model.ParseStatus(oldStatusStr)
+		oldArchived = oldArchInt != 0
 		hadOld = true
 	}
 
@@ -182,13 +195,13 @@ func (d *DB) updateLocked(t *model.Task) (model.Status, bool, error) {
 		t.BaseBranch, encodeDependsOn(t.DependsOn), t.Result, t.PlanSlug,
 		formatTime(t.CreatedAt), formatTime(t.StartedAt), formatTime(t.EndedAt), t.ID)
 	if err != nil {
-		return oldStatus, hadOld, err
+		return oldStatus, oldArchived, hadOld, err
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		return oldStatus, hadOld, fmt.Errorf("%w: %s", ErrTaskNotFound, t.ID)
+		return oldStatus, oldArchived, hadOld, fmt.Errorf("%w: %s", ErrTaskNotFound, t.ID)
 	}
-	return oldStatus, hadOld, nil
+	return oldStatus, oldArchived, hadOld, nil
 }
 
 // Rename updates only the name column for a task.
