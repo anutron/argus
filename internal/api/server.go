@@ -72,7 +72,7 @@ type Server struct {
 	// Production sets this to defaultPluginSubmit (a real HTTP POST to the
 	// plugin's callback_url); tests override it to assert on what would
 	// have been forwarded without spinning up a fake plugin server.
-	pluginSubmitFn func(ctx context.Context, callbackURL string, body []byte) (int, []byte, error)
+	pluginSubmitFn func(ctx context.Context, callbackURL, authHeader string, body []byte) (int, []byte, error)
 }
 
 // New creates a new API server. pushMgr is optional; pass nil to disable

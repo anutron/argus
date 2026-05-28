@@ -101,6 +101,12 @@ type Section struct {
 	// argus POSTs `{key: value}` on user save. For stream sections, argus
 	// opens a WebSocket and pipes received bytes into the rail's streampane.
 	CallbackURL string
+	// AuthHeader is the verbatim Authorization-header value the daemon's
+	// callback proxy MUST set when POSTing form submissions to CallbackURL.
+	// Empty means no header. Plugins that gate their callback endpoint on a
+	// static header (e.g. hera's MCP listener requiring Authorization: <token>
+	// on /mcp/*) put that value here at registration time.
+	AuthHeader string
 }
 
 // Errors surfaced by ParseSection. HTTP handlers map ErrInvalid* to 400.
@@ -126,6 +132,7 @@ type rawSection struct {
 	Title       string          `json:"title"`
 	Type        SectionType     `json:"type"`
 	CallbackURL string          `json:"callback_url"`
+	AuthHeader  string          `json:"auth_header,omitempty"`
 	Spec        json.RawMessage `json:"spec,omitempty"`
 	// Older drafts of the plan inline fields next to spec; accept either by
 	// preferring `spec` when present. Fields at the top level is the example
@@ -171,6 +178,7 @@ func ParseSection(scope string, raw []byte) (Section, error) {
 			Title:       r.Title,
 			Type:        r.Type,
 			CallbackURL: r.CallbackURL,
+			AuthHeader:  r.AuthHeader,
 		}, nil
 	}
 	spec, err := parseFormSpec(r.Spec, r.Fields)
@@ -183,6 +191,7 @@ func ParseSection(scope string, raw []byte) (Section, error) {
 		Type:        r.Type,
 		Spec:        spec,
 		CallbackURL: r.CallbackURL,
+		AuthHeader:  r.AuthHeader,
 	}, nil
 }
 
