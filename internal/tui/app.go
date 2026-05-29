@@ -91,6 +91,7 @@ type App struct {
 	filePanel    *gitpanel.FilePanel
 	attentionBar *widget.AttentionBar // sits above gitPanel in agent view
 	agentLeftCol *tview.Flex          // vertical flex that owns attentionBar + gitPanel
+	agentPanels  *tview.Flex          // horizontal flex: left col | agent pane | file panel
 
 	// Tabs
 	settings     *SettingsView
@@ -153,6 +154,7 @@ type App struct {
 	// State
 	mode               viewMode
 	agentFocus         agentFocus
+	agentZen           bool // single-pane (zoom) mode: side panels collapsed to 0 width
 	agentState         agentview.State
 	daemonConnected    bool
 	tasks              []*model.Task
@@ -410,13 +412,13 @@ func (a *App) buildUI() {
 		a.agentLeftCol.ResizeItem(a.attentionBar, a.attentionBar.DesiredHeight(), 0)
 		a.forceRedraw("attention bar height changed")
 	}
-	agentPanels := tview.NewFlex().SetDirection(tview.FlexColumn).
+	a.agentPanels = tview.NewFlex().SetDirection(tview.FlexColumn).
 		AddItem(a.agentLeftCol, 0, 1, false).
 		AddItem(a.agentPane, 0, 3, false).
 		AddItem(a.filePanel, 0, 1, false)
 	a.agentPage = tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(a.agentHeader, 1, 0, false).
-		AddItem(agentPanels, 0, 1, true)
+		AddItem(a.agentPanels, 0, 1, true)
 
 	// DAG view — owned by the App so the tick loop can refresh node snapshots
 	// and key handlers can dispatch link/unlink/halt back into the daemon.
@@ -1673,6 +1675,44 @@ func (a *App) updateFocusIndicators() {
 	a.filePanel.SetFocused(a.agentFocus == focusFiles)
 }
 
+// clearAgentZen turns single-pane (zoom) mode off and restores the 1:3:1 agent
+// layout. Idempotent — safe to call when zen is already off (the ResizeItem
+// calls just re-assert the proportional sizing). Shared by toggleAgentZen's
+// un-zoom branch, exitAgentView, and the agent-view entry points (defensive, so
+// a session torn down without exitAgentView can't leave the next entry zoomed).
+// Main goroutine only.
+func (a *App) clearAgentZen() {
+	a.agentZen = false
+	a.agentPanels.ResizeItem(a.agentLeftCol, 0, 1)
+	a.agentPanels.ResizeItem(a.filePanel, 0, 1)
+}
+
+// toggleAgentZen flips single-pane (zoom) mode in the agent view. When on, the
+// left column (attention bar + git) and the file panel collapse to zero width
+// so the agent terminal fills the whole pane row; when off, the 1:3:1 layout is
+// restored. The terminal pane's Draw() recomputes the PTY size from its own
+// inner rect every frame, so the resize RPC (and the agent's full-width
+// repaint) fires automatically — no computePTYSize change or manual Resize.
+func (a *App) toggleAgentZen() {
+	if a.agentZen {
+		// Un-zoom keeps terminal focus: there is no prior-focus tracking, and
+		// the user is typically still working in the terminal after a zoom.
+		a.clearAgentZen()
+	} else {
+		a.agentZen = true
+		a.agentPanels.ResizeItem(a.agentLeftCol, 0, 0)
+		a.agentPanels.ResizeItem(a.filePanel, 0, 0)
+		// Force focus back to the terminal: the file panel is hidden at zero
+		// width, so leaving focus there would silently swallow keys with no
+		// visible target.
+		if a.agentFocus != focusTerminal {
+			a.agentFocus = focusTerminal
+			a.updateFocusIndicators()
+		}
+	}
+	uxlog.Log("[tui] agent zen mode toggled: %v", a.agentZen)
+}
+
 // handleAgentKey handles keys when the agent view is active.
 func (a *App) handleAgentKey(event *tcell.EventKey) *tcell.EventKey {
 	switch event.Key() {
@@ -1702,6 +1742,12 @@ func (a *App) handleAgentKey(event *tcell.EventKey) *tcell.EventKey {
 		return nil
 	case tcell.KeyCtrlP: // Open PR for the worktree's branch via gh
 		a.openPR()
+		return nil
+	case tcell.KeyCtrlZ:
+		// Toggle single-pane (zoom) view: collapse/restore side panels.
+		// Intercepted here so it never reaches the PTY — otherwise Claude
+		// Code would background the foreground task on Ctrl+Z (0x1a / SIGTSTP).
+		a.toggleAgentZen()
 		return nil
 	case tcell.KeyCtrlY:
 		// Conditional intercept: only steal ctrl+y from the PTY when an
@@ -2327,6 +2373,9 @@ func (a *App) enterPendingAgentView(task *model.Task) {
 	a.agentState.Reset(task.ID, task.Name)
 	a.mu.Unlock()
 
+	// Defensive: ensure we open un-zoomed even if a prior session was torn
+	// down without exitAgentView restoring the layout.
+	a.clearAgentZen()
 	a.agentHeader.SetTaskName(task.Name)
 	// Leave pane taskID empty — task isn't in the DB yet, no log to replay.
 	a.agentPane.SetTaskID("")
@@ -2359,6 +2408,9 @@ func (a *App) onTaskSelect(task *model.Task, autoStart bool) {
 	a.agentFocus = focusTerminal
 	a.agentState.Reset(task.ID, task.Name)
 	a.mu.Unlock()
+	// Defensive: ensure we open un-zoomed even if a prior session was torn
+	// down without exitAgentView restoring the layout.
+	a.clearAgentZen()
 	a.agentHeader.SetTaskName(task.Name)
 	a.agentPane.SetTaskID(task.ID)
 	a.agentPane.ResetVT()
@@ -3830,6 +3882,9 @@ func (a *App) exitAgentView() {
 	a.mode = modeTaskList
 	a.agentFocus = focusTerminal
 	a.mu.Unlock()
+	// Restore the 1:3:1 layout if we left while zoomed, so the next agent
+	// view opens with the side panels visible.
+	a.clearAgentZen()
 	a.agentPane.SetSession(nil)
 	a.agentPane.SetFocused(false)
 	a.agentPane.ExitDiffMode()
