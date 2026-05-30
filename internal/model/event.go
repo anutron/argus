@@ -38,6 +38,15 @@ const (
 	EventTypeSessionExited     = "session.exited"
 	EventTypeSessionIdle       = "session.idle"
 
+	// EventTypeSessionNeedsInput fires when a session transitions into or out
+	// of the "blocked waiting on the user" state (the red ? in the TUI). One
+	// event type carries both edges; the payload's needs_input bool
+	// distinguishes enter (true) from clear (false), e.g.
+	// {"needs_input":true}. Emitted by the daemon's idle/needs-input watcher
+	// (internal/api/push.go) so external consumers render the signal without
+	// re-deriving argus's detection heuristic from session logs.
+	EventTypeSessionNeedsInput = "session.needs_input"
+
 	// EventTypeResync is synthesised by the SSE handler when a client
 	// connects with a `since` cursor older than the oldest retained event.
 	// It is never persisted in the events table — clients seeing it should

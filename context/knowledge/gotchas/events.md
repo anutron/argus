@@ -23,3 +23,12 @@ The package-level sink is one atomic pointer. Tests that install a recording sin
 ## `task.completed` is emitted in addition to `task.status_changed`
 
 When `db.Update` detects a status change to `StatusComplete`, it emits BOTH events (in that order). Plugins filtering on `task.completed` get a precise hook; plugins watching `task.status_changed` see the full transition stream. This double-emit is intentional — there is no "promote status_changed to completed" downstream; the contract is "both fire."
+
+## `session.needs_input` is daemon-authoritative, idle-gated, and sticky
+
+`api.Server.detectNeedsInputTick` (called each `idleWatcherTick`) scans idle sessions with the shared `agent.DetectNeedsInput` heuristic and publishes the set onto the runner (`SetNeedsInputIDs`) so `/api/tasks`' `needs_input` field is correct with NO TUI attached. Two invariants are load-bearing and non-obvious:
+
+- **Idle-gate + sticky carry-forward, or the SSE events oscillate.** Detection only runs on idle tasks (a still-streaming agent that flashes `❯ 1.` transiently is not blocked). But Claude's prompt UI emits periodic animation bytes that briefly knock a blocked session OUT of the idle set — without the sticky pass in `computeNeedsInput` (re-check previously-flagged tasks that are still running), the flag and its `session.needs_input` events would flap every few ticks. Mirrors the TUI's `detectNeedsInputSticky`; do not drop either half.
+- **Reads the session ring (`RecentOutputTail`), not the on-disk log.** The daemon is the sole PTY reader so the ring is always populated — correct without a TUI. The TUI's `detectNeedsInput` reads the disk log instead, because in daemon-client mode its local ring only fills after the user opens a stream. Same heuristic, different byte source by process.
+
+One event type carries both edges: the payload `{"needs_input":true|false}` distinguishes enter from clear (there is no separate "cleared" type). `state.needsInputNow` is replaced wholesale each tick, so an exited session (absent from running/idle) drops out of the set and fires a clear event via the diff automatically.

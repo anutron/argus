@@ -88,10 +88,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 // missing fields as falsy, which matches the intended contract (no idle field
 // == not idle).
 type taskJSON struct {
-	ID           string `json:"id"`
-	Name         string `json:"name"`
-	Status       string `json:"status"`
-	Idle         bool   `json:"idle,omitempty"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Idle   bool   `json:"idle,omitempty"`
+	// NeedsInput is a runtime-derived flag, true only when Status ==
+	// in_progress and the daemon's watcher detected the agent is blocked
+	// waiting on the user (the red ? in the TUI). omitempty drops the field
+	// when false, matching the Idle contract (missing == not blocked).
+	NeedsInput   bool   `json:"needs_input,omitempty"`
 	Project      string `json:"project"`
 	Branch       string `json:"branch,omitempty"`
 	Backend      string `json:"backend,omitempty"`
@@ -106,7 +111,8 @@ type taskJSON struct {
 // to populate taskJSON. Group runtime flags here so the taskToJSON signature
 // doesn't grow into a positional bool chain when more flags are added.
 type taskRuntimeState struct {
-	Idle bool
+	Idle       bool
+	NeedsInput bool
 }
 
 func taskToJSON(t *model.Task, rt taskRuntimeState) taskJSON {
@@ -115,6 +121,7 @@ func taskToJSON(t *model.Task, rt taskRuntimeState) taskJSON {
 		Name:         t.Name,
 		Status:       t.Status.String(),
 		Idle:         rt.Idle,
+		NeedsInput:   rt.NeedsInput,
 		Project:      t.Project,
 		Branch:       t.Branch,
 		Backend:      t.Backend,
@@ -130,14 +137,17 @@ func taskToJSON(t *model.Task, rt taskRuntimeState) taskJSON {
 // Mirrors the TUI's drawTaskRow rule: an InProgress task is idle when it has
 // no live session (running map miss) or its session is waiting for input
 // (idle map hit). Non-InProgress tasks are never idle.
-func computeRuntimeState(t *model.Task, runningSet, idleSet map[string]bool) taskRuntimeState {
+func computeRuntimeState(t *model.Task, runningSet, idleSet, needsInputSet map[string]bool) taskRuntimeState {
 	if t.Status != model.StatusInProgress {
 		return taskRuntimeState{}
 	}
-	return taskRuntimeState{Idle: !runningSet[t.ID] || idleSet[t.ID]}
+	return taskRuntimeState{
+		Idle:       !runningSet[t.ID] || idleSet[t.ID],
+		NeedsInput: needsInputSet[t.ID],
+	}
 }
 
-func (s *Server) sessionStateMaps() (runningSet, idleSet map[string]bool) {
+func (s *Server) sessionStateMaps() (runningSet, idleSet, needsInputSet map[string]bool) {
 	running, idle := s.runner.RunningAndIdle()
 	runningSet = make(map[string]bool, len(running))
 	for _, id := range running {
@@ -147,7 +157,12 @@ func (s *Server) sessionStateMaps() (runningSet, idleSet map[string]bool) {
 	for _, id := range idle {
 		idleSet[id] = true
 	}
-	return runningSet, idleSet
+	needs := s.runner.NeedsInputIDs()
+	needsInputSet = make(map[string]bool, len(needs))
+	for _, id := range needs {
+		needsInputSet[id] = true
+	}
+	return runningSet, idleSet, needsInputSet
 }
 
 func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
@@ -164,7 +179,7 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	// "all" returns both.
 	archivedFilter := r.URL.Query().Get("archived")
 
-	runningSet, idleSet := s.sessionStateMaps()
+	runningSet, idleSet, needsInputSet := s.sessionStateMaps()
 
 	result := make([]taskJSON, 0)
 	for _, t := range tasks {
@@ -186,7 +201,7 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		if projectFilter != "" && t.Project != projectFilter {
 			continue
 		}
-		result = append(result, taskToJSON(t, computeRuntimeState(t, runningSet, idleSet)))
+		result = append(result, taskToJSON(t, computeRuntimeState(t, runningSet, idleSet, needsInputSet)))
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"tasks": result})
@@ -201,8 +216,8 @@ func (s *Server) handleGetTask(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "task not found"})
 		return
 	}
-	runningSet, idleSet := s.sessionStateMaps()
-	writeJSON(w, http.StatusOK, taskToJSON(task, computeRuntimeState(task, runningSet, idleSet)))
+	runningSet, idleSet, needsInputSet := s.sessionStateMaps()
+	writeJSON(w, http.StatusOK, taskToJSON(task, computeRuntimeState(task, runningSet, idleSet, needsInputSet)))
 }
 
 // --- Create Task ---
