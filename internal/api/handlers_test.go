@@ -207,7 +207,7 @@ func TestComputeRuntimeState(t *testing.T) {
 			if tc.idle {
 				idle["t1"] = true
 			}
-			testutil.Equal(t, computeRuntimeState(task, running, idle).Idle, tc.wantIdle)
+			testutil.Equal(t, computeRuntimeState(task, running, idle, map[string]bool{}).Idle, tc.wantIdle)
 		})
 	}
 }
