@@ -53,6 +53,41 @@ func TestPluginHelp_HelpFrameShowsOverlayWithFullDict(t *testing.T) {
 	}
 }
 
+// TestPluginHelp_HelpFrameWithNoPriorDictRendersEmptyOverlay asserts that a help
+// control frame with NO prior hotkeys dictionary still pops the overlay without
+// panicking, showing the plugin title and an empty hotkey list.
+func TestPluginHelp_HelpFrameWithNoPriorDictRendersEmptyOverlay(t *testing.T) {
+	app, fake, sim, stop := activatePluginForTestWithSim(t)
+	defer stop()
+
+	// No hotkeys frame pushed — go straight to help.
+	fake.onControl([]byte(`{"type":"help"}`))
+	syncUI(t, app.tapp)
+
+	var visible bool
+	var mode viewMode
+	var front string
+	var n int
+	readUI(t, app.tapp, func() {
+		visible = app.pluginHelpVisible
+		mode = app.mode
+		front, _ = app.pages.GetFrontPage()
+		if app.activePlugin != nil {
+			n = len(app.activePlugin.hotkeys)
+		}
+	})
+	testutil.Equal(t, visible, true)
+	testutil.Equal(t, mode, modePluginView)
+	testutil.Equal(t, front, "pluginhelp")
+	testutil.Equal(t, n, 0) // empty dictionary
+
+	// Render and confirm it does not panic and shows the plugin title.
+	syncUI(t, app.tapp)
+	if !previewScreenContains(sim, "Ludwig") {
+		t.Error("overlay title must include the plugin title 'Ludwig' even with an empty dictionary")
+	}
+}
+
 // TestPluginHelp_NextKeyDismisses asserts that while the overlay is visible the
 // next key is consumed to dismiss it and returns to the plugin view.
 func TestPluginHelp_NextKeyDismisses(t *testing.T) {

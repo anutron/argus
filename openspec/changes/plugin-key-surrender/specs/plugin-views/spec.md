@@ -132,3 +132,8 @@ Argus SHALL accept plugin → argus control frames over the plugin-view WebSocke
 
 - **WHEN** the plugin sends a malformed (non-JSON) text frame
 - **THEN** argus ignores it without panicking and the binary ANSI stream continues to render
+
+#### Scenario: oversized hotkey dictionary is bounded
+
+- **WHEN** a plugin pushes a hotkey dictionary whose item count or whose individual `key`/`label` rune lengths exceed argus's caps
+- **THEN** argus MUST store only a bounded subset (item count clamped, over-long `key`/`label` truncated rather than dropped) so that both the bottom bar and the help overlay render without unbounded memory or CPU use
