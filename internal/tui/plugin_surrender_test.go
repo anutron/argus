@@ -141,6 +141,25 @@ func TestHandleGlobalKey_PluginMode_DoubleCtrlQOutsideWindowDoesNotDeactivate(t 
 	}
 }
 
+// TestHandleGlobalKey_PluginMode_DoubleCtrlQAtExactWindowBoundaryDeactivates
+// pins the documented `<=` semantics of the failsafe window: two Ctrl+Q presses
+// separated by EXACTLY pluginFailsafeWindow (400ms) count as inside the window
+// (inclusive boundary) and force-return control to argus.
+func TestHandleGlobalKey_PluginMode_DoubleCtrlQAtExactWindowBoundaryDeactivates(t *testing.T) {
+	app, clock := pluginSurrenderApp(t)
+
+	first := app.handleGlobalKey(tcell.NewEventKey(tcell.KeyCtrlQ, 0, 0))
+	testutil.Equal(t, first != nil, true) // forwarded
+
+	*clock = clock.Add(pluginFailsafeWindow) // exactly at the boundary (inclusive)
+	second := app.handleGlobalKey(tcell.NewEventKey(tcell.KeyCtrlQ, 0, 0))
+	testutil.Nil(t, second) // intercepted: boundary counts as inside
+	testutil.Equal(t, app.mode, modeTaskList)
+	if app.activePlugin != nil {
+		t.Fatal("double Ctrl+Q exactly at the window boundary must deactivate (<= semantics)")
+	}
+}
+
 // TestActivatePluginView_ResetsLastCtrlQ asserts the failsafe timestamp is
 // cleared on activation so a stale press can't trip the failsafe in a new view.
 func TestActivatePluginView_ResetsLastCtrlQ(t *testing.T) {

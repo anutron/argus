@@ -2,23 +2,23 @@
 
 ## 1. Tests (write first, prove the gap)
 
-- [ ] 1.1 Encoder table tests: port every existing `terminalpane_test`/`streampane_test`/`app_test` (tcellKeyToBytes) case into the new `internal/tui/keyenc` package and assert byte-identical output (no-regression pin)
-- [ ] 1.2 Encoder table tests for the new modified-key cases: `Ctrl+Right`→`\x1b[1;5C`, `Shift+Right`→`\x1b[1;2C`, `Alt+Right`→`\x1b[1;3C`, `Ctrl+Shift+Right`→`\x1b[1;6C`, `Ctrl+Alt+Right`→`\x1b[1;7C`, and plain arrows/Home/End/PgUp/PgDn
+- [x] 1.1 Encoder table tests: port every existing `terminalpane_test`/`streampane_test`/`app_test` (tcellKeyToBytes) case into the new `internal/tui/keyenc` package and assert byte-identical output (no-regression pin)
+- [x] 1.2 Encoder table tests for the new modified-key cases: `Ctrl+Right`→`\x1b[1;5C`, `Shift+Right`→`\x1b[1;2C`, `Alt+Right`→`\x1b[1;3C`, `Ctrl+Shift+Right`→`\x1b[1;6C`, `Ctrl+Alt+Right`→`\x1b[1;7C`, and plain arrows/Home/End/PgUp/PgDn
 - [x] 1.3 Routing/surrender tests (SimulationScreen smoke + handler unit): in plugin-view mode, Esc / Ctrl+C / `?` / a tab-switch number / a focus-rail arrow all reach the pane and trigger no argus action
 - [x] 1.4 Failsafe tests: single Ctrl+Q is forwarded; two Ctrl+Q within the window force-return (deactivate); two Ctrl+Q outside the window do not
 - [x] 1.5 Connector tests: a plugin→argus text frame is delivered to the control callback; `release`/`hotkeys`/`help` dispatch; unknown type and malformed JSON are ignored without disrupting the binary stream
 - [x] 1.6 Bottom-bar tests: bar-flagged subset renders; reserved exit hint always present and never displaced; live update on re-push; fallback affordance with no dictionary; argus hints return after release
 - [x] 1.7 Help-overlay tests: `help` frame renders the full dictionary; overlay lists only plugin hotkeys; `?` is not reserved by argus
-- [ ] 1.8 Confirm every `it should X` acceptance criterion in `design.md` has a corresponding failing test (Prove-It Pattern) and run `make test` to see them red
+- [x] 1.8 Confirm every `it should X` acceptance criterion in `design.md` has a corresponding failing test (Prove-It Pattern) and run `make test` to see them red
 
 ## 2. Shared key encoder
 
 **Depends on:** Stage 1
 
-- [ ] 2.1 Create `internal/tui/keyenc` with one exported function mapping `*tcell.EventKey` → `[]byte` using the xterm `CSI 1;<mod><final>` form (`<mod> = 1 + Shift(1) + Alt(2) + Ctrl(4)`), covering runes (Alt→ESC-prefixed), Enter/Shift+Enter, Tab/Backtab, Backspace/Delete, Escape, arrows + Home/End/PgUp/PgDn (modified and unmodified), and Ctrl+letter C0 bytes
-- [ ] 2.2 Route `terminalpane.eventBytes` and `streampane.eventBytes` through `keyenc`; delete the duplicate allowlists
-- [ ] 2.3 Route `app.go:tcellKeyToBytes` (agent PTY) through `keyenc`; verify the agent view still types correctly and existing app tests stay green
-- [ ] 2.4 Run `make test` — Stage 1.1/1.2 now green; assert no agent-view regression
+- [x] 2.1 Create `internal/tui/keyenc` with one exported function mapping `*tcell.EventKey` → `[]byte` using the xterm `CSI 1;<mod><final>` form (`<mod> = 1 + Shift(1) + Alt(2) + Ctrl(4)`), covering runes (Alt→ESC-prefixed), Enter/Shift+Enter, Tab/Backtab, Backspace/Delete, Escape, arrows + Home/End/PgUp/PgDn (modified and unmodified), and Ctrl+letter C0 bytes
+- [x] 2.2 Route `terminalpane.eventBytes` and `streampane.eventBytes` through `keyenc`; delete the duplicate allowlists
+- [x] 2.3 Route `app.go:tcellKeyToBytes` (agent PTY) through `keyenc`; verify the agent view still types correctly and existing app tests stay green
+- [x] 2.4 Run `make test` — Stage 1.1/1.2 now green; assert no agent-view regression
 
 ## 3. Connector control frames + release
 
@@ -62,7 +62,7 @@
 
 **Depends on:** Stage 2, Stage 4, Stage 6
 
-- [ ] 7.1 Update `docs/plugins.md`: full surrender, the `release`/`hotkeys`/`help` envelopes, the double-Ctrl+Q failsafe, and the iTerm2 Cmd→Ctrl+Alt remap round-trip
-- [ ] 7.2 Add non-obvious gotchas to `context/knowledge/gotchas/` (encoder consolidation byte-identical invariant, control-frame-on-read-pump threading via QueueUpdateDraw, failsafe window, mod-7 round-trip) and update the index bullet counts
-- [ ] 7.3 Run `make fmt-check`, `make vet`, `make test`, and `make test-cover` (≥95% on touched packages); fix gaps
-- [ ] 7.4 Run `openspec validate plugin-key-surrender --strict`
+- [x] 7.1 Update `docs/plugins.md`: full surrender, the `release`/`hotkeys`/`help` envelopes, the double-Ctrl+Q failsafe, and the iTerm2 Cmd→Ctrl+Alt remap round-trip
+- [x] 7.2 Add non-obvious gotchas to `context/knowledge/gotchas/` (encoder consolidation byte-identical invariant, control-frame-on-read-pump threading via QueueUpdateDraw, failsafe window, mod-7 round-trip) and update the index bullet counts
+- [x] 7.3 Run `make fmt-check`, `make vet`, `make test`, and `make test-cover` (≥95% on touched packages); fix gaps
+- [x] 7.4 Run `openspec validate plugin-key-surrender --strict`

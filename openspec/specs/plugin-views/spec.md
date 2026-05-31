@@ -1,5 +1,8 @@
-## ADDED Requirements
+# plugin-views Specification
 
+## Purpose
+TBD - created by archiving change plugin-key-surrender. Update Purpose after archive.
+## Requirements
 ### Requirement: Key surrender to a focused plugin view
 
 While a plugin view has focus (the TUI is in plugin-view mode), argus SHALL forward every key event to the focused plugin and SHALL NOT reserve any key for its own navigation, with the single exception of the failsafe defined in the failsafe requirement. Esc, Ctrl+C, Ctrl+Q, `?`, and all modified arrows MUST reach the plugin.
@@ -132,3 +135,9 @@ Argus SHALL accept plugin → argus control frames over the plugin-view WebSocke
 
 - **WHEN** the plugin sends a malformed (non-JSON) text frame
 - **THEN** argus ignores it without panicking and the binary ANSI stream continues to render
+
+#### Scenario: oversized hotkey dictionary is bounded
+
+- **WHEN** a plugin pushes a hotkey dictionary whose item count or whose individual `key`/`label` rune lengths exceed argus's caps
+- **THEN** argus MUST store only a bounded subset (item count clamped, over-long `key`/`label` truncated rather than dropped) so that both the bottom bar and the help overlay render without unbounded memory or CPU use
+

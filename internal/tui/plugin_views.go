@@ -19,6 +19,46 @@ import (
 // pluginHelpPage is the tview.Pages name for the plugin-triggered help overlay.
 const pluginHelpPage = "pluginhelp"
 
+// Caps on the plugin-pushed hotkey dictionary. A misbehaving plugin could push
+// millions of items or megabyte-long strings; clamping at store time bounds the
+// memory the mount holds and the CPU both the bottom bar and the `?` overlay
+// spend rendering it. Items beyond the count cap are dropped; over-long Key /
+// Label strings are truncated (not dropped) so the item still renders.
+const (
+	maxPluginHotkeys  = 64
+	maxHotkeyKeyLen   = 16
+	maxHotkeyLabelLen = 64
+)
+
+// clampHotkeys bounds a plugin-pushed hotkey dictionary: caps the item count and
+// truncates each item's Key and Label to a sane rune length. Truncation is on
+// runes (not bytes) so multi-byte glyphs are never split. Returns a fresh slice;
+// the caller may store it without aliasing the plugin-controlled input.
+func clampHotkeys(items []HotkeyItem) []HotkeyItem {
+	if len(items) > maxPluginHotkeys {
+		items = items[:maxPluginHotkeys]
+	}
+	out := make([]HotkeyItem, len(items))
+	for i, it := range items {
+		out[i] = HotkeyItem{
+			Key:   truncateRunes(it.Key, maxHotkeyKeyLen),
+			Label: truncateRunes(it.Label, maxHotkeyLabelLen),
+			Bar:   it.Bar,
+		}
+	}
+	return out
+}
+
+// truncateRunes returns s clamped to at most max runes, counting by rune so a
+// multi-byte glyph is never cut mid-encoding.
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max])
+}
+
 // HotkeyItem is one entry in a plugin's pushed hotkey dictionary. Stage 5
 // (bottom bar) and Stage 6 (help overlay) consume the stored slice; this
 // stage only decodes and stores it.
@@ -275,11 +315,24 @@ func (a *App) dispatchPluginControl(mount *pluginViewMount, raw []byte) {
 	case "release":
 		uxlog.Log("[plugin-view] dispatch: release")
 		if a.tapp != nil {
-			a.tapp.QueueUpdateDraw(func() { a.deactivatePluginView() })
+			a.tapp.QueueUpdateDraw(func() {
+				// Guard against a stale mount: only deactivate if this mount is
+				// still the active plugin. A late release from plugin A must not
+				// deactivate a freshly-activated plugin B (release/activation
+				// race between the read and the queued closure running).
+				if a.activePlugin == nil || a.activePlugin != mount {
+					uxlog.Log("[plugin-view] release ignored: mount no longer active")
+					return
+				}
+				a.deactivatePluginView()
+			})
 		}
 	case "hotkeys":
 		uxlog.Log("[plugin-view] dispatch: hotkeys (%d items)", len(env.Items))
-		items := env.Items
+		// Clamp BEFORE storing so both the bottom bar and the `?` overlay read a
+		// bounded dictionary — a plugin cannot grow argus's memory/CPU without
+		// bound. Truncates over-long Key/Label and drops items past the count cap.
+		items := clampHotkeys(env.Items)
 		if a.tapp != nil {
 			a.tapp.QueueUpdateDraw(func() {
 				// Guard against a stale/nil mount: only store if this mount is

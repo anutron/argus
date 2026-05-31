@@ -62,6 +62,7 @@ func TestEncode_AllCases(t *testing.T) {
 		{"ctrl-right", tcell.KeyRight, 0, tcell.ModCtrl, []byte("\x1b[1;5C")},
 		{"ctrl-shift-right", tcell.KeyRight, 0, tcell.ModCtrl | tcell.ModShift, []byte("\x1b[1;6C")},
 		{"ctrl-alt-right", tcell.KeyRight, 0, tcell.ModCtrl | tcell.ModAlt, []byte("\x1b[1;7C")},
+		{"ctrl-shift-alt-right", tcell.KeyRight, 0, tcell.ModCtrl | tcell.ModShift | tcell.ModAlt, []byte("\x1b[1;8C")},
 		{"shift-left", tcell.KeyLeft, 0, tcell.ModShift, []byte("\x1b[1;2D")},
 		{"ctrl-left", tcell.KeyLeft, 0, tcell.ModCtrl, []byte("\x1b[1;5D")},
 		{"ctrl-up", tcell.KeyUp, 0, tcell.ModCtrl, []byte("\x1b[1;5A")},

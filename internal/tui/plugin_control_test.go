@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -101,6 +102,75 @@ func TestDispatchPluginControl_HotkeysStoredOnMount(t *testing.T) {
 	testutil.Equal(t, mode, modePluginView)
 }
 
+func TestClampHotkeys_BoundsCountAndLengths(t *testing.T) {
+	// Build an oversized dictionary: more items than the cap, with over-long
+	// Key and Label strings.
+	longKey := strings.Repeat("K", maxHotkeyKeyLen*4)
+	longLabel := strings.Repeat("L", maxHotkeyLabelLen*4)
+	items := make([]HotkeyItem, maxPluginHotkeys*3)
+	for i := range items {
+		items[i] = HotkeyItem{Key: longKey, Label: longLabel, Bar: true}
+	}
+
+	got := clampHotkeys(items)
+
+	testutil.Equal(t, len(got), maxPluginHotkeys)
+	testutil.Equal(t, len([]rune(got[0].Key)), maxHotkeyKeyLen)
+	testutil.Equal(t, len([]rune(got[0].Label)), maxHotkeyLabelLen)
+	// Truncated, not dropped — the bar flag survives.
+	testutil.Equal(t, got[0].Bar, true)
+}
+
+func TestClampHotkeys_ShortDictionaryUnchanged(t *testing.T) {
+	in := []HotkeyItem{{Key: "^F", Label: "next", Bar: true}}
+	got := clampHotkeys(in)
+	testutil.Equal(t, len(got), 1)
+	testutil.Equal(t, got[0].Key, "^F")
+	testutil.Equal(t, got[0].Label, "next")
+}
+
+func TestClampHotkeys_TruncatesOnRuneBoundary(t *testing.T) {
+	// Multi-byte glyphs must not be split mid-encoding: truncation counts runes.
+	in := []HotkeyItem{{Key: strings.Repeat("é", maxHotkeyKeyLen+5), Label: "x"}}
+	got := clampHotkeys(in)
+	testutil.Equal(t, len([]rune(got[0].Key)), maxHotkeyKeyLen)
+	// Still valid UTF-8 (no split byte): every rune is 'é'.
+	for _, r := range got[0].Key {
+		testutil.Equal(t, r, 'é')
+	}
+}
+
+func TestDispatchPluginControl_OversizedHotkeysClampedOnStore(t *testing.T) {
+	app, fake, stop := activatePluginForTest(t)
+	defer stop()
+
+	// Build a JSON dictionary that blows past every cap.
+	longLabel := strings.Repeat("Z", maxHotkeyLabelLen*2)
+	var b strings.Builder
+	b.WriteString(`{"type":"hotkeys","items":[`)
+	for i := 0; i < maxPluginHotkeys*2; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`{"key":"^F","label":"`)
+		b.WriteString(longLabel)
+		b.WriteString(`","bar":true}`)
+	}
+	b.WriteString(`]}`)
+
+	fake.onControl([]byte(b.String()))
+	syncUI(t, app.tapp)
+
+	var stored []HotkeyItem
+	readUI(t, app.tapp, func() {
+		if app.activePlugin != nil {
+			stored = app.activePlugin.hotkeys
+		}
+	})
+	testutil.Equal(t, len(stored), maxPluginHotkeys)
+	testutil.Equal(t, len([]rune(stored[0].Label)), maxHotkeyLabelLen)
+}
+
 func TestDispatchPluginControl_HelpTriggersStub(t *testing.T) {
 	app, fake, stop := activatePluginForTest(t)
 	defer stop()
@@ -169,6 +239,41 @@ func TestDispatchPluginControl_HelpDroppedWhenMountStale(t *testing.T) {
 	var help bool
 	readUI(t, app.tapp, func() { help = app.pluginHelpRequested })
 	testutil.Equal(t, help, false)
+}
+
+// TestDispatchPluginControl_ReleaseDroppedWhenMountStale models a late release
+// from plugin A arriving after plugin B has taken the ball: the release frame
+// carries A's mount, but app.activePlugin is now B. The guard must ignore the
+// stale release rather than deactivate the live plugin B.
+func TestDispatchPluginControl_ReleaseDroppedWhenMountStale(t *testing.T) {
+	app, _, stop := activatePluginForTest(t)
+	defer stop()
+
+	// Capture the active mount (plugin A).
+	var staleMount *pluginViewMount
+	readUI(t, app.tapp, func() { staleMount = app.activePlugin })
+
+	// Make a different mount (plugin B) the current active plugin.
+	otherMount := &pluginViewMount{
+		view:     &views.View{ID: 99, Title: "Other", CallbackURL: "ws://other"},
+		pageName: "plugin-view:99",
+	}
+	readUI(t, app.tapp, func() { app.activePlugin = otherMount })
+
+	// A late release frame for plugin A's stale mount must be ignored.
+	app.dispatchPluginControl(staleMount, []byte(`{"type":"release"}`))
+	syncUI(t, app.tapp)
+
+	var active *pluginViewMount
+	var mode viewMode
+	readUI(t, app.tapp, func() {
+		active = app.activePlugin
+		mode = app.mode
+	})
+	if active != otherMount {
+		t.Fatal("stale release must not deactivate the currently-active plugin")
+	}
+	testutil.Equal(t, mode, modePluginView)
 }
 
 func TestDispatchPluginControl_HotkeysDroppedWhenMountStale(t *testing.T) {
