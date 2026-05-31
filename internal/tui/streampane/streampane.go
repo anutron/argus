@@ -22,6 +22,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 
+	"github.com/drn/argus/internal/tui/keyenc"
 	"github.com/drn/argus/internal/tui/theme"
 	"github.com/drn/argus/internal/tui/widget"
 )
@@ -261,20 +262,10 @@ func (sp *StreamPane) send(b []byte) {
 }
 
 // eventBytes maps a tcell key event to the bytes a remote plugin would
-// expect. Only the small set documented in the plugin contract is mapped
-// here; everything else is rendered as a rune if printable.
+// expect. It delegates to the shared keyenc.Encode — the single source of
+// truth for key encoding across the agent PTY and both plugin panes. The
+// prior local allowlist here silently dropped arrows and every modifier
+// combo; keyenc forwards them so a plugin can bind Ctrl/Alt/Shift+arrow.
 func eventBytes(ev *tcell.EventKey) []byte {
-	switch ev.Key() {
-	case tcell.KeyRune:
-		return []byte(string(ev.Rune()))
-	case tcell.KeyEnter:
-		return []byte{'\r'}
-	case tcell.KeyTab:
-		return []byte{'\t'}
-	case tcell.KeyBackspace, tcell.KeyBackspace2:
-		return []byte{0x7f}
-	case tcell.KeyEscape:
-		return []byte{0x1b}
-	}
-	return nil
+	return keyenc.Encode(ev)
 }

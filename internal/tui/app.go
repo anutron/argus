@@ -33,6 +33,7 @@ import (
 	"github.com/drn/argus/internal/scheduler"
 	"github.com/drn/argus/internal/tui/dagview"
 	"github.com/drn/argus/internal/tui/gitpanel"
+	"github.com/drn/argus/internal/tui/keyenc"
 	"github.com/drn/argus/internal/tui/modal"
 	"github.com/drn/argus/internal/tui/store"
 	"github.com/drn/argus/internal/tui/taskview"
@@ -2137,118 +2138,13 @@ func (a *App) openPR() {
 	}
 }
 
-// tcellKeyToBytes converts a tcell key event to raw terminal bytes for PTY input.
+// tcellKeyToBytes converts a tcell key event to raw terminal bytes for PTY
+// input. It delegates to the shared keyenc.Encode so the agent PTY, the
+// plugin terminal pane, and the plugin stream pane all encode keys
+// identically. keyenc additionally emits the modified-arrow xterm forms
+// (Ctrl/Shift/Alt+arrow) that the prior pane encoders dropped.
 func tcellKeyToBytes(ev *tcell.EventKey) []byte {
-	if ev.Key() == tcell.KeyRune {
-		r := ev.Rune()
-		if ev.Modifiers()&tcell.ModAlt != 0 {
-			return append([]byte{0x1b}, []byte(string(r))...)
-		}
-		return []byte(string(r))
-	}
-
-	alt := ev.Modifiers()&tcell.ModAlt != 0
-
-	if alt {
-		switch ev.Key() {
-		case tcell.KeyUp:
-			return []byte("\x1b[1;3A")
-		case tcell.KeyDown:
-			return []byte("\x1b[1;3B")
-		case tcell.KeyRight:
-			return []byte("\x1b[1;3C")
-		case tcell.KeyLeft:
-			return []byte("\x1b[1;3D")
-		case tcell.KeyDelete:
-			return []byte{0x1b, 0x7f}
-		}
-	}
-
-	switch ev.Key() {
-	case tcell.KeyEnter:
-		// Shift+Enter / Alt+Enter → newline-insert (ESC + CR). TUIs
-		// running in the PTY (ink-based Claude Code, blessed, textual)
-		// treat CR as submit and ESC+CR as "insert newline" — the same
-		// sequence iTerm2 / Kitty emit for Shift+Enter when configured.
-		if ev.Modifiers()&(tcell.ModShift|tcell.ModAlt) != 0 {
-			return []byte{0x1b, '\r'}
-		}
-		return []byte{'\r'}
-	case tcell.KeyTab:
-		return []byte{'\t'}
-	case tcell.KeyBacktab:
-		return []byte("\x1b[Z")
-	case tcell.KeyBackspace, tcell.KeyBackspace2:
-		if alt {
-			return []byte{0x1b, 0x7f}
-		}
-		return []byte{0x7f}
-	case tcell.KeyDelete:
-		return []byte("\x1b[3~")
-	case tcell.KeyUp:
-		return []byte("\x1b[A")
-	case tcell.KeyDown:
-		return []byte("\x1b[B")
-	case tcell.KeyRight:
-		return []byte("\x1b[C")
-	case tcell.KeyLeft:
-		return []byte("\x1b[D")
-	case tcell.KeyHome:
-		return []byte("\x1b[H")
-	case tcell.KeyEnd:
-		return []byte("\x1b[F")
-	case tcell.KeyPgUp:
-		return []byte("\x1b[5~")
-	case tcell.KeyPgDn:
-		return []byte("\x1b[6~")
-	case tcell.KeyCtrlA:
-		return []byte{0x01}
-	case tcell.KeyCtrlB:
-		return []byte{0x02}
-	case tcell.KeyCtrlC:
-		return []byte{0x03}
-	case tcell.KeyCtrlD:
-		return []byte{0x04}
-	case tcell.KeyCtrlE:
-		return []byte{0x05}
-	case tcell.KeyCtrlF:
-		return []byte{0x06}
-	case tcell.KeyCtrlG:
-		return []byte{0x07}
-	case tcell.KeyCtrlH:
-		return []byte{0x08}
-	case tcell.KeyCtrlK:
-		return []byte{0x0b}
-	case tcell.KeyCtrlL:
-		return []byte{0x0c}
-	case tcell.KeyCtrlN:
-		return []byte{0x0e}
-	case tcell.KeyCtrlO:
-		return []byte{0x0f}
-	case tcell.KeyCtrlP:
-		return []byte{0x10}
-	case tcell.KeyCtrlR:
-		return []byte{0x12}
-	case tcell.KeyCtrlS:
-		return []byte{0x13}
-	case tcell.KeyCtrlT:
-		return []byte{0x14}
-	case tcell.KeyCtrlU:
-		return []byte{0x15}
-	case tcell.KeyCtrlV:
-		return []byte{0x16}
-	case tcell.KeyCtrlW:
-		return []byte{0x17}
-	case tcell.KeyCtrlX:
-		return []byte{0x18}
-	case tcell.KeyCtrlY:
-		return []byte{0x19}
-	case tcell.KeyCtrlZ:
-		return []byte{0x1a}
-	case tcell.KeyEscape:
-		return []byte{0x1b}
-	}
-	return nil
+	return keyenc.Encode(ev)
 }
 
 // switchTab changes the active top-level tab.
