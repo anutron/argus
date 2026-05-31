@@ -28,7 +28,10 @@ func (a *App) openStreamSection(scope, title, callbackURL string, bytesIn chan<-
 			// Drop on backpressure to match the rest of argus's PTY plumbing.
 		}
 	}
-	conn := a.pluginConnFactory(callbackURL, onBytes, keysOut)
+	// Settings-stream sections do not participate in the plugin-view
+	// ball/release model, so they pass a nil control sink — plugin → argus
+	// text frames here are dropped by the connector.
+	conn := a.pluginConnFactory(callbackURL, onBytes, nil, keysOut)
 
 	a.streamConnsMu.Lock()
 	if a.streamConns == nil {

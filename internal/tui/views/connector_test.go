@@ -24,6 +24,7 @@ type pluginEcho struct {
 	envelopes   []controlEnvelope
 	keystrokes  [][]byte
 	bytesToSend chan []byte // buffered ANSI to push from server → client
+	textToSend  chan string // buffered text frames to push from server → client
 	done        chan struct{}
 	closeOnce   sync.Once
 }
@@ -31,6 +32,7 @@ type pluginEcho struct {
 func newPluginEcho() *pluginEcho {
 	return &pluginEcho{
 		bytesToSend: make(chan []byte, 16),
+		textToSend:  make(chan string, 16),
 		done:        make(chan struct{}),
 	}
 }
@@ -55,6 +57,10 @@ func (p *pluginEcho) handler() http.Handler {
 				case b := <-p.bytesToSend:
 					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 					_ = c.Write(ctx, websocket.MessageBinary, b)
+					cancel()
+				case s := <-p.textToSend:
+					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					_ = c.Write(ctx, websocket.MessageText, []byte(s))
 					cancel()
 				}
 			}
@@ -119,13 +125,19 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Fatalf("condition not met within %v", timeout)
 }
 
+// pushText queues a text frame for the server to push to the client. Used by
+// control-frame tests; the base pluginEcho only pushes binary frames.
+func (p *pluginEcho) pushText(s string) {
+	p.textToSend <- s
+}
+
 func TestConnector_DialAndControlEnvelopes(t *testing.T) {
 	plugin := newPluginEcho()
 	srv := httptest.NewServer(plugin.handler())
 	t.Cleanup(srv.Close)
 
 	in := make(chan []byte, 4)
-	c := NewConnector(wsURL(srv), nil, in)
+	c := NewConnector(wsURL(srv), nil, nil, in)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	testutil.NoError(t, c.Dial(ctx))
@@ -150,7 +162,7 @@ func TestConnector_KeystrokesForwardedAsBinary(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	in := make(chan []byte, 4)
-	c := NewConnector(wsURL(srv), nil, in)
+	c := NewConnector(wsURL(srv), nil, nil, in)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	testutil.NoError(t, c.Dial(ctx))
@@ -180,7 +192,7 @@ func TestConnector_ANSIDeliveredAsBinary(t *testing.T) {
 		gotMu.Unlock()
 	}
 	in := make(chan []byte, 4)
-	c := NewConnector(wsURL(srv), onBytes, in)
+	c := NewConnector(wsURL(srv), onBytes, nil, in)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	testutil.NoError(t, c.Dial(ctx))
@@ -213,7 +225,7 @@ func TestConnector_LargeFrameSurvivesReadLimit(t *testing.T) {
 		gotMu.Unlock()
 	}
 	in := make(chan []byte, 4)
-	c := NewConnector(wsURL(srv), onBytes, in)
+	c := NewConnector(wsURL(srv), onBytes, nil, in)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	testutil.NoError(t, c.Dial(ctx))
@@ -247,7 +259,7 @@ func TestConnector_LargeFrameSurvivesReadLimit(t *testing.T) {
 }
 
 func TestConnector_DialErrorPropagates(t *testing.T) {
-	c := NewConnector("ws://127.0.0.1:1", nil, nil) // port 1 — unreachable
+	c := NewConnector("ws://127.0.0.1:1", nil, nil, nil) // port 1 — unreachable
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 	err := c.Dial(ctx)
@@ -257,7 +269,7 @@ func TestConnector_DialErrorPropagates(t *testing.T) {
 }
 
 func TestConnector_SendBeforeDialFails(t *testing.T) {
-	c := NewConnector("ws://example.invalid", nil, nil)
+	c := NewConnector("ws://example.invalid", nil, nil, nil)
 	if err := c.SendResize(80, 24); err == nil {
 		t.Fatal("expected send-before-dial error")
 	}
@@ -269,7 +281,7 @@ func TestConnector_CloseIsIdempotent(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	in := make(chan []byte, 4)
-	c := NewConnector(wsURL(srv), nil, in)
+	c := NewConnector(wsURL(srv), nil, nil, in)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	testutil.NoError(t, c.Dial(ctx))
@@ -285,7 +297,7 @@ func TestConnector_WritePumpExitsOnInClose(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	in := make(chan []byte, 1)
-	c := NewConnector(wsURL(srv), nil, in)
+	c := NewConnector(wsURL(srv), nil, nil, in)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	testutil.NoError(t, c.Dial(ctx))
@@ -301,4 +313,147 @@ func TestConnector_WritePumpExitsOnInClose(t *testing.T) {
 	// Give the write pump a beat to drain.
 	time.Sleep(20 * time.Millisecond)
 	testutil.NoError(t, c.SendBlur())
+}
+
+func TestConnector_TextFrameReachesOnControl(t *testing.T) {
+	plugin := newPluginEcho()
+	srv := httptest.NewServer(plugin.handler())
+	t.Cleanup(srv.Close)
+
+	var (
+		ctrlMu sync.Mutex
+		ctrl   [][]byte
+	)
+	onControl := func(b []byte) {
+		ctrlMu.Lock()
+		ctrl = append(ctrl, append([]byte(nil), b...))
+		ctrlMu.Unlock()
+	}
+	in := make(chan []byte, 4)
+	c := NewConnector(wsURL(srv), nil, onControl, in)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	testutil.NoError(t, c.Dial(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	plugin.pushText(`{"type":"release"}`)
+
+	waitFor(t, time.Second, func() bool {
+		ctrlMu.Lock()
+		defer ctrlMu.Unlock()
+		return len(ctrl) >= 1
+	})
+	ctrlMu.Lock()
+	defer ctrlMu.Unlock()
+	testutil.Equal(t, string(ctrl[0]), `{"type":"release"}`)
+}
+
+func TestConnector_BinaryStillHitsOnBytesWithControlSet(t *testing.T) {
+	plugin := newPluginEcho()
+	srv := httptest.NewServer(plugin.handler())
+	t.Cleanup(srv.Close)
+
+	var (
+		byMu  sync.Mutex
+		bin   []byte
+		ctlMu sync.Mutex
+		ctl   int
+	)
+	onBytes := func(b []byte) {
+		byMu.Lock()
+		bin = append(bin, b...)
+		byMu.Unlock()
+	}
+	onControl := func([]byte) {
+		ctlMu.Lock()
+		ctl++
+		ctlMu.Unlock()
+	}
+	in := make(chan []byte, 4)
+	c := NewConnector(wsURL(srv), onBytes, onControl, in)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	testutil.NoError(t, c.Dial(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	plugin.bytesToSend <- []byte("ansi-bytes")
+
+	waitFor(t, time.Second, func() bool {
+		byMu.Lock()
+		defer byMu.Unlock()
+		return len(bin) > 0
+	})
+	byMu.Lock()
+	testutil.Equal(t, string(bin), "ansi-bytes")
+	byMu.Unlock()
+	ctlMu.Lock()
+	testutil.Equal(t, ctl, 0) // binary frame must not invoke onControl
+	ctlMu.Unlock()
+}
+
+func TestConnector_MalformedTextDoesNotStopPump(t *testing.T) {
+	plugin := newPluginEcho()
+	srv := httptest.NewServer(plugin.handler())
+	t.Cleanup(srv.Close)
+
+	var (
+		byMu sync.Mutex
+		bin  []byte
+	)
+	onBytes := func(b []byte) {
+		byMu.Lock()
+		bin = append(bin, b...)
+		byMu.Unlock()
+	}
+	// onControl still receives the raw bytes — defensive JSON parsing is the
+	// dispatcher's job (plugin_views.go), not the connector's. The connector
+	// only routes text→onControl and must not crash on any payload.
+	in := make(chan []byte, 4)
+	c := NewConnector(wsURL(srv), onBytes, func([]byte) {}, in)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	testutil.NoError(t, c.Dial(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	// A non-JSON text frame, then a binary frame: the pump must survive the
+	// garbage and keep delivering binary ANSI.
+	plugin.pushText("not json at all {{{")
+	plugin.bytesToSend <- []byte("still-flowing")
+
+	waitFor(t, time.Second, func() bool {
+		byMu.Lock()
+		defer byMu.Unlock()
+		return string(bin) == "still-flowing"
+	})
+}
+
+func TestConnector_NilOnControlIgnoresTextFrame(t *testing.T) {
+	plugin := newPluginEcho()
+	srv := httptest.NewServer(plugin.handler())
+	t.Cleanup(srv.Close)
+
+	var (
+		byMu sync.Mutex
+		bin  []byte
+	)
+	onBytes := func(b []byte) {
+		byMu.Lock()
+		bin = append(bin, b...)
+		byMu.Unlock()
+	}
+	in := make(chan []byte, 4)
+	c := NewConnector(wsURL(srv), onBytes, nil, in) // no control sink
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	testutil.NoError(t, c.Dial(ctx))
+	t.Cleanup(func() { _ = c.Close() })
+
+	plugin.pushText(`{"type":"release"}`) // must be dropped without crashing
+	plugin.bytesToSend <- []byte("ok")
+
+	waitFor(t, time.Second, func() bool {
+		byMu.Lock()
+		defer byMu.Unlock()
+		return string(bin) == "ok"
+	})
 }

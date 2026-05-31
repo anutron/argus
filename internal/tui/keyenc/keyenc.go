@@ -116,6 +116,8 @@ func Encode(ev *tcell.EventKey) []byte {
 		return []byte{0x0f}
 	case tcell.KeyCtrlP:
 		return []byte{0x10}
+	case tcell.KeyCtrlQ:
+		return []byte{0x11}
 	case tcell.KeyCtrlR:
 		return []byte{0x12}
 	case tcell.KeyCtrlS:

@@ -262,6 +262,21 @@ type App struct {
 	pluginHotkeys     map[tcell.Key]*pluginViewMount
 	activePlugin      *pluginViewMount
 	pluginConnFactory pluginConnectorFactory
+	// pluginHelpRequested is set when the active plugin sends a help control
+	// frame. Stage 6 will consume this to pop the help overlay; for now it is
+	// an observable seam (the rendering is not yet wired). Touched only on the
+	// tview goroutine.
+	pluginHelpRequested bool
+
+	// lastCtrlQ timestamps the most recent Ctrl+Q seen while a plugin has the
+	// ball. A second Ctrl+Q within pluginFailsafeWindow force-returns to argus
+	// (the failsafe). Reset to zero in activatePluginView so a stale timestamp
+	// never carries between views. Touched only on the tview main goroutine via
+	// SetInputCapture → handleGlobalKey, so it needs no mutex.
+	lastCtrlQ time.Time
+	// nowFn is the clock used by the failsafe window check. Defaults to
+	// time.Now; tests override it to make the timing deterministic.
+	nowFn func() time.Time
 
 	// Stream-section connectors. Keyed by (scope, title). Created on
 	// SettingsView.OnStreamFocus, closed on OnStreamBlur. Reuses the same
@@ -302,6 +317,7 @@ func New(database store.Store, runner agent.SessionProvider, daemonConnected boo
 		lastAttachCols:         make(map[string]uint16),
 		wtRoot:                 filepath.Join(db.DataDir(), "worktrees"),
 		clipboardWriter:        pbcopyWriter,
+		nowFn:                  time.Now,
 	}
 	if dc, ok := runner.(*dclient.Client); ok {
 		app.daemonClient = dc
@@ -1511,16 +1527,33 @@ func (a *App) refreshTasksWithIDs(runningIDs, idleIDs []string) {
 	}
 }
 
+// pluginFailsafeWindow is the maximum gap between two Ctrl+Q presses for the
+// second to fire the failsafe (force-return to argus). A first Ctrl+Q is always
+// forwarded to the plugin; only a second within this window is intercepted.
+const pluginFailsafeWindow = 400 * time.Millisecond
+
 // handleGlobalKey processes key events at the application level.
 func (a *App) handleGlobalKey(event *tcell.EventKey) *tcell.EventKey {
-	// Plugin-view mode — Esc exits, every other keystroke forwards to the
-	// plugin via the streampane's InputBack channel. The streampane's
-	// InputHandler does the actual forwarding; we just need to intercept
-	// Esc here before the streampane consumes it. See plugin_views.go.
+	// Plugin-view mode — full surrender. While a plugin has the ball, argus
+	// reserves NO key for its own navigation: Esc, Ctrl+C, `?`, tab-switch
+	// numbers, focus-rail arrows — all forward to the plugin via the focused
+	// pane's InputHandler. The ONE exception is the double-Ctrl+Q failsafe
+	// (Decision 3) so a hung plugin can't trap the keyboard. See
+	// plugin_views.go.
 	if a.mode == modePluginView {
-		if event.Key() == tcell.KeyEscape {
-			a.deactivatePluginView()
-			return nil
+		if event.Key() == tcell.KeyCtrlQ {
+			now := a.nowFn()
+			if !a.lastCtrlQ.IsZero() && now.Sub(a.lastCtrlQ) <= pluginFailsafeWindow {
+				// Second fast Ctrl+Q — intercept, do NOT forward, force-return.
+				uxlog.Log("[plugin-view] failsafe fired: double Ctrl+Q force-return")
+				a.lastCtrlQ = time.Time{}
+				a.deactivatePluginView()
+				return nil
+			}
+			// First Ctrl+Q (or one outside the window) — record and forward so
+			// the plugin receives it.
+			a.lastCtrlQ = now
+			return event
 		}
 		return event
 	}

@@ -1,5 +1,9 @@
 ## Key Bindings & Navigation
 
+- **`modePluginView` fully surrenders the keyboard — argus reserves NOTHING but the double-Ctrl+Q failsafe.** Every key (Esc, Ctrl+C, `?`, tab numbers, modified arrows) returns the event so tview routes it to the focused pane. The ONLY interception is a fast double Ctrl+Q (`pluginFailsafeWindow`, 400ms): the first press is recorded in `a.lastCtrlQ` and forwarded; a second within the window intercepts (returns nil) and force-returns via `deactivatePluginView`. Two presses outside the window do NOT fire.
+- **`a.lastCtrlQ` needs no mutex but MUST be reset in `activatePluginView`.** It's touched only on the tview main goroutine (via `SetInputCapture` → `handleGlobalKey`). Without the reset, a stale timestamp from a prior plugin view could trip the failsafe on the very first Ctrl+Q in a new view.
+- **The failsafe window reads `a.nowFn` (defaults to `time.Now`).** Tests override it to drive the 400ms window deterministically — a real clock makes the double-tap timing flaky.
+- **`keyenc` maps `tcell.KeyCtrlQ` → `{0x11}`.** Added for plugin-view surrender so a single Ctrl+Q forwards. Safe for the agent view because `handleAgentKey` intercepts Ctrl+Q before the encoder ever runs.
 - **`ctrl+c` only exits from task list view.** In agent mode, writes `0x03` to PTY (or no-op if dead).
 - **`ctrl+q` in diff mode must exit diff AND refocus terminal.** Otherwise user needs a second keypress.
 - **`ctrl+d` exits agent view when session is dead.** Without this, Ctrl+D after agent exit is silently dropped.
