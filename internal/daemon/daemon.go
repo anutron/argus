@@ -422,6 +422,7 @@ func (d *Daemon) Serve(sockPath string) error {
 		mcpSrv.SetScheduleManager(d.db, sch)
 		mcpSrv.SetMessageManager(d.db, runnerNudger{runner: d.runner})
 		mcpSrv.SetPluginRegistry(pluginRegistry)
+		mcpSrv.SetArtifactManager(d.db)
 		d.mcpServer = mcpSrv
 		actualPort, err := mcpSrv.ListenAndServe()
 		if err != nil {

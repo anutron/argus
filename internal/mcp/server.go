@@ -150,6 +150,7 @@ type Server struct {
 	schedRunner ScheduleRunner  // optional; set via SetScheduleManager
 	messages    MessageStore    // optional; set via SetMessageManager
 	nudger      MessageNudger   // optional; set via SetMessageManager (best-effort)
+	artifacts   ArtifactStore   // optional; set via SetArtifactManager
 	createMu    sync.Mutex
 	creating    int // number of in-flight task_create calls
 	// creatingKeys tracks (project, name) pairs currently being created so
@@ -807,6 +808,9 @@ func (s *Server) handleToolsList(req *Request) *Response {
 			log.Printf("[mcp] tools/list plugin registry error: %v", err)
 		}
 	}
+	if s.artifactsEnabled() {
+		tools = append(tools, artifactToolDefs...)
+	}
 	return &Response{
 		JSONRPC: "2.0",
 		ID:      req.ID,
@@ -877,6 +881,8 @@ func (s *Server) handleToolsCall(req *Request) *Response {
 		return s.toolTaskMessageAck(req.ID, params.Arguments)
 	case "task_ask":
 		return s.toolTaskAsk(req.ID, params.Arguments)
+	case "artifact_register":
+		return s.toolArtifactRegister(req.ID, params.Arguments)
 	default:
 		// Plugin-registered tool? PR 4 — dispatch into the registry which
 		// HTTP-POSTs to the plugin's callback_url and returns the response

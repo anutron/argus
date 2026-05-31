@@ -355,5 +355,28 @@ func (d *DB) createTables() error {
 		return fmt.Errorf("creating plugin_views table: %w", err)
 	}
 
+	// Session artifacts: files an agent/skill produced (HTML reports, PDFs,
+	// rendered markdown, images) and registered for viewing in Argus Web. The
+	// bytes live at ~/.argus/artifacts/<task-id>/<filename>; this table is the
+	// manifest that SCOPES serving — a row must exist for a file to be served,
+	// so a user-supplied name only selects a registered row and never builds a
+	// filesystem path directly. One row per (task_id, filename); re-registering
+	// the same filename overwrites (last write wins).
+	if _, err := d.conn.Exec(`
+		CREATE TABLE IF NOT EXISTS artifacts (
+			id          TEXT PRIMARY KEY,
+			task_id     TEXT NOT NULL,
+			name        TEXT NOT NULL,
+			filename    TEXT NOT NULL,
+			type        TEXT NOT NULL DEFAULT 'text',
+			size        INTEGER NOT NULL DEFAULT 0,
+			created_at  TEXT NOT NULL,
+			UNIQUE(task_id, filename)
+		)
+	`); err != nil {
+		return fmt.Errorf("creating artifacts table: %w", err)
+	}
+	d.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id, created_at)`) //nolint:errcheck
+
 	return nil
 }
