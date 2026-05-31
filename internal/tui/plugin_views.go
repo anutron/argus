@@ -9,11 +9,15 @@ import (
 	"github.com/gdamore/tcell/v2"
 
 	"github.com/drn/argus/internal/db"
+	"github.com/drn/argus/internal/tui/modal"
 	"github.com/drn/argus/internal/tui/terminalpane"
 	"github.com/drn/argus/internal/tui/views"
 	"github.com/drn/argus/internal/tui/widget"
 	"github.com/drn/argus/internal/uxlog"
 )
+
+// pluginHelpPage is the tview.Pages name for the plugin-triggered help overlay.
+const pluginHelpPage = "pluginhelp"
 
 // HotkeyItem is one entry in a plugin's pushed hotkey dictionary. Stage 5
 // (bottom bar) and Stage 6 (help overlay) consume the stored slice; this
@@ -217,6 +221,14 @@ func (a *App) deactivatePluginView() {
 		m.conn = nil
 	}
 
+	// Tear down a lingering help overlay before clearing state — otherwise the
+	// page would survive into the next plugin. RemovePage directly (not
+	// dismissPluginHelp, which would try to refocus the now-cleared activePlugin).
+	if a.pluginHelpVisible {
+		a.pages.RemovePage(pluginHelpPage)
+	}
+	a.pluginHelpVisible = false
+
 	// Clear all plugin-view bar state so nothing bleeds into the next plugin:
 	// drop the bottom-bar plugin mode (argus's own tab hints return — the bar
 	// already tracks the active tab via SetTab), forget the pushed dictionary,
@@ -291,21 +303,60 @@ func (a *App) dispatchPluginControl(mount *pluginViewMount, raw []byte) {
 	}
 }
 
-// requestPluginHelp is the Stage 6 seam for the plugin-triggered help overlay.
-// For now it only records that help was requested (observable via
-// pluginHelpRequested) and logs; the overlay rendering lands in Stage 6.
-// Runs on the tview goroutine (called from a QueueUpdateDraw closure).
+// requestPluginHelp pops the plugin-triggered help overlay, rendering the
+// active mount's full hotkey dictionary (every item, the bar flag ignored) in
+// argus's help modal styled like argus help. The overlay shows ONLY the
+// plugin's hotkeys — never argus's own bindings — because argus has fully
+// surrendered the keyboard. The plugin owns `?` and is the authority on when
+// help is shown; argus reserves nothing.
 //
-// Stage 6: render mount.hotkeys (the full dictionary, ignoring the bar flag)
-// in argus's help modal, styled like argus help, showing only the plugin's
-// hotkeys.
+// Runs on the tview goroutine (called from a QueueUpdateDraw closure in
+// dispatchPluginControl). The next key dismisses the overlay (see the
+// modePluginView branch of handleGlobalKey) — it does not capture the keyboard
+// beyond that single dismissal.
 func (a *App) requestPluginHelp(mount *pluginViewMount) {
 	if a.activePlugin == nil || a.activePlugin != mount {
 		uxlog.Log("[plugin-view] help dropped: mount no longer active")
 		return
 	}
 	a.pluginHelpRequested = true
-	uxlog.Log("[plugin-view] help requested for %q (overlay is Stage 6)", mount.view.Title)
+
+	overlay := modal.NewHelpModalWith(mount.view.Title, pluginHelpSections(mount.hotkeys))
+	// Re-add replaces any prior instance (a second help frame just refreshes).
+	a.pages.AddPage(pluginHelpPage, overlay, true, true)
+	a.pages.SwitchToPage(pluginHelpPage)
+	a.pluginHelpVisible = true
+	uxlog.Log("[plugin-view] help overlay shown for %q (%d hotkeys)", mount.view.Title, len(mount.hotkeys))
+}
+
+// dismissPluginHelp hides the plugin help overlay and returns focus to the
+// active plugin pane, restoring its bottom bar. No-op if the overlay is not
+// visible. Runs on the tview goroutine.
+func (a *App) dismissPluginHelp() {
+	if !a.pluginHelpVisible {
+		return
+	}
+	a.pluginHelpVisible = false
+	a.pluginHelpRequested = false
+	a.pages.RemovePage(pluginHelpPage)
+	uxlog.Log("[plugin-view] help overlay dismissed")
+	if m := a.activePlugin; m != nil {
+		a.pages.SwitchToPage(m.pageName)
+		a.tapp.SetFocus(m.pane)
+		a.statusbar.SetPluginMode(true, m.view.Title, barHints(m.hotkeys))
+	}
+}
+
+// pluginHelpSections converts a plugin's full hotkey dictionary into the single
+// HelpSection the overlay renders. Every item is included regardless of its bar
+// flag — the help overlay is the complete reference, the bottom bar is the
+// subset.
+func pluginHelpSections(items []HotkeyItem) []modal.HelpSection {
+	bindings := make([]modal.HelpBinding, 0, len(items))
+	for _, it := range items {
+		bindings = append(bindings, modal.HelpBinding{Key: it.Key, Action: it.Label})
+	}
+	return []modal.HelpSection{{Title: "Hotkeys", Bindings: bindings}}
 }
 
 // pluginViewportSize returns the cols/rows the active plugin view should
