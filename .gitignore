@@ -28,6 +28,9 @@ Thumbs.db
 # Config (user-specific)
 # ~/.config/argus/ is the config dir, not in repo
 
+# Per-developer iris overrides (machine-specific)
+.iris.local.toml
+
 # Context dir
 .context/
 
