@@ -419,6 +419,91 @@ A plugin can unregister only its own section. The master token can drop any sect
 
 Built-in settings sections render first in their canonical order, followed by a blank-line separator and a `Plugins` header before alphabetically-sorted plugin sections. When no plugin sections exist, both the `Plugins` header and the preceding separator disappear.
 
+## Plugin views
+
+A plugin can register a top-level view — its own full-screen page in the TUI, listed alongside argus's built-in tabs. The plugin renders the page itself: argus opens a WebSocket to the view's `callback_url` when the user activates it (via the registered hotkey), pipes the plugin's ANSI bytes into a terminal pane that fills the screen, and forwards keystrokes back to the plugin.
+
+Register / list / unregister via the `/api/plugins/views` endpoints in the table above. Activation, the WebSocket protocol, and the key-handling contract are described below.
+
+### The WebSocket protocol
+
+Once activated, argus dials `callback_url` and runs a read pump and a write pump for the life of the connection. Two frame types flow in each direction:
+
+| Direction        | Frame type | Carries                                                                 |
+| ---------------- | ---------- | ----------------------------------------------------------------------- |
+| argus → plugin   | binary     | Keystrokes, encoded as the raw terminal bytes (see "Key encoding" below) |
+| argus → plugin   | text       | A control envelope: `resize` / `focus` / `blur`                          |
+| plugin → argus   | binary     | ANSI bytes for the plugin's pane (full-screen terminal output)          |
+| plugin → argus   | text       | A control envelope: `release` / `hotkeys` / `help`                       |
+
+The split is strictly by WebSocket frame type — binary frames are the ANSI/keystroke fast path, text frames are JSON control envelopes. A malformed text frame is logged and dropped; it never stalls the pump or disturbs the binary stream.
+
+The connector disables the per-message read cap (`SetReadLimit(-1)`) because a full-screen ANSI surface with per-cell SGR colors routinely exceeds the 32 KiB default. This is safe only because the connector is loopback-only — argus and the plugin daemon both bind `127.0.0.1`.
+
+### Control envelopes
+
+**argus → plugin** (sent by argus as TEXT frames):
+
+| Envelope                                   | When argus sends it                                                        |
+| ------------------------------------------ | -------------------------------------------------------------------------- |
+| `{"type":"resize","cols":N,"rows":M}`      | On initial connect, and on every terminal resize while the view is active. |
+| `{"type":"focus"}`                         | On activation, after the first resize.                                     |
+| `{"type":"blur"}`                          | Just before argus closes the connection (deactivation).                    |
+
+**plugin → argus** (sent by the plugin as TEXT frames, decoded defensively by argus):
+
+| Envelope                                                                  | Effect                                                                                                                                                              |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `{"type":"release"}`                                                      | Hand the keyboard back to argus. argus blurs + closes the connection and returns to the task list. This is the plugin's normal "I'm done" exit.                     |
+| `{"type":"hotkeys","items":[{"key":"^F","label":"next pane","bar":true}]}` | Push (or replace) the plugin's hotkey dictionary. Items with `"bar":true` populate the context-sensitive bottom bar; the full set (bar flag ignored) drives the `?` help overlay. Re-pushing replaces the prior dictionary live. |
+| `{"type":"help"}`                                                         | Pop argus's help overlay, rendering the plugin's full hotkey dictionary styled like argus help. The overlay shows only the plugin's hotkeys.                        |
+
+Unknown `type` values and malformed JSON are logged and ignored — they do not disrupt the binary stream or deactivate the view. The `key` / `label` / `bar` fields in a `hotkeys` item are display-only: argus never binds them itself (it has surrendered the keyboard), it only advertises them.
+
+### Full key surrender
+
+While a plugin view holds the keyboard, **argus forwards every key to the plugin and reserves nothing for its own navigation.** Esc, Ctrl+C, `?`, tab-switch number keys, and modified arrows all reach the plugin's pane — none trigger an argus action. This is a hard departure from argus's normal global key routing: a plugin view is the one mode where argus is a transparent pipe.
+
+There are exactly **two** keys argus intercepts in this mode:
+
+- The **double-Ctrl+Q failsafe** (below).
+- A **single key to dismiss the help overlay**, while that overlay is visible (see "Help overlay").
+
+Everything else, including a single `?` and a single Ctrl+Q, is forwarded.
+
+### The double-Ctrl+Q failsafe
+
+So a hung or misbehaving plugin can never trap the keyboard, argus watches for two Ctrl+Q presses within ~400 ms:
+
+- A **single** Ctrl+Q is forwarded to the plugin like any other key (the plugin may bind it).
+- A **second** Ctrl+Q **within ~400 ms** is intercepted by argus — not forwarded — and force-returns control to argus (equivalent to the plugin sending `release`).
+- Two Ctrl+Q presses **more than ~400 ms apart** are both forwarded; the failsafe does not fire.
+
+The bottom bar advertises this as the reserved exit hint `^Q^Q argus`, rendered flush-right and never displaceable by plugin hints. Because Esc is surrendered, the double-Ctrl+Q is the only argus-guaranteed escape.
+
+### The bottom bar and help overlay
+
+While a view is active, the bottom status bar switches to plugin mode:
+
+- The left side shows a `▶ <plugin> has the keyboard` affordance.
+- The right side shows the plugin's `bar:true` hotkeys (capped in count and width, truncated if they overflow), followed by the reserved `^Q^Q argus` exit hint, which is always rendered last and can never be pushed off.
+- With no dictionary pushed yet, only the fallback affordance + exit hint render.
+
+A `{"type":"help"}` frame pops argus's help modal showing the plugin's full dictionary (every item, the `bar` flag ignored). Because argus has surrendered `?`, the plugin decides when help appears — typically by binding `?` itself and sending the `help` frame in response. While the overlay is up, the next single key dismisses it; the overlay does not capture the keyboard beyond that one dismissal.
+
+### Key encoding (argus → plugin keystrokes)
+
+argus encodes keystrokes into the raw bytes a terminal application expects, using standard xterm conventions — the same encoder the agent PTY uses, so a plugin pane behaves like any other terminal:
+
+- Runes: plain → UTF-8 bytes; with Alt → ESC-prefixed.
+- Arrows / Home / End / PgUp / PgDn: unmodified → the bare CSI final; modified → the xterm form `CSI 1 ; <mod> <final>`, where `<mod> = 1 + Shift(1) + Alt(2) + Ctrl(4)`. So `Ctrl+Right` → `\x1b[1;5C`, `Shift+Right` → `\x1b[1;2C`, `Ctrl+Alt+Right` → `\x1b[1;7C`.
+- Ctrl+letter → the C0 control byte (e.g. Ctrl+Q → `0x11`).
+- Enter → CR; Shift/Alt+Enter → ESC+CR (newline-insert). Tab → HT; Backtab → `CSI Z`. Backspace → `0x7f`; Delete → `CSI 3 ~`.
+
+#### iTerm2 Cmd → Ctrl+Alt remap
+
+A plugin can bind **Cmd+arrow** on macOS by configuring iTerm2 to send Cmd+arrow as the **Ctrl+Alt (mod 7)** xterm form. iTerm2 delivers Cmd+Right as `\x1b[1;7C`, which argus round-trips faithfully to the plugin (argus does not special-case it — `Ctrl+Alt` is just `<mod> = 7` in the standard encoding). The plugin sees the exact `\x1b[1;7<final>` sequence and can map it to a Cmd+arrow binding.
+
 ## Versioning
 
 The plugin contract ships as `v1`. Plugins should send:
