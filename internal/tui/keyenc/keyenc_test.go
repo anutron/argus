@@ -75,6 +75,7 @@ func TestEncode_AllCases(t *testing.T) {
 		{"ctrl-a", tcell.KeyCtrlA, 0, tcell.ModNone, []byte{0x01}},
 		{"ctrl-b", tcell.KeyCtrlB, 0, tcell.ModNone, []byte{0x02}},
 		{"ctrl-c", tcell.KeyCtrlC, 0, tcell.ModNone, []byte{0x03}},
+		{"ctrl-q", tcell.KeyCtrlQ, 0, tcell.ModNone, []byte{0x11}},
 		{"ctrl-d", tcell.KeyCtrlD, 0, tcell.ModNone, []byte{0x04}},
 		{"ctrl-e", tcell.KeyCtrlE, 0, tcell.ModNone, []byte{0x05}},
 		{"ctrl-f", tcell.KeyCtrlF, 0, tcell.ModNone, []byte{0x06}},

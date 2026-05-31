@@ -4,8 +4,8 @@
 
 - [ ] 1.1 Encoder table tests: port every existing `terminalpane_test`/`streampane_test`/`app_test` (tcellKeyToBytes) case into the new `internal/tui/keyenc` package and assert byte-identical output (no-regression pin)
 - [ ] 1.2 Encoder table tests for the new modified-key cases: `Ctrl+Right`→`\x1b[1;5C`, `Shift+Right`→`\x1b[1;2C`, `Alt+Right`→`\x1b[1;3C`, `Ctrl+Shift+Right`→`\x1b[1;6C`, `Ctrl+Alt+Right`→`\x1b[1;7C`, and plain arrows/Home/End/PgUp/PgDn
-- [ ] 1.3 Routing/surrender tests (SimulationScreen smoke + handler unit): in plugin-view mode, Esc / Ctrl+C / `?` / a tab-switch number / a focus-rail arrow all reach the pane and trigger no argus action
-- [ ] 1.4 Failsafe tests: single Ctrl+Q is forwarded; two Ctrl+Q within the window force-return (deactivate); two Ctrl+Q outside the window do not
+- [x] 1.3 Routing/surrender tests (SimulationScreen smoke + handler unit): in plugin-view mode, Esc / Ctrl+C / `?` / a tab-switch number / a focus-rail arrow all reach the pane and trigger no argus action
+- [x] 1.4 Failsafe tests: single Ctrl+Q is forwarded; two Ctrl+Q within the window force-return (deactivate); two Ctrl+Q outside the window do not
 - [ ] 1.5 Connector tests: a plugin→argus text frame is delivered to the control callback; `release`/`hotkeys`/`help` dispatch; unknown type and malformed JSON are ignored without disrupting the binary stream
 - [ ] 1.6 Bottom-bar tests: bar-flagged subset renders; reserved exit hint always present and never displaced; live update on re-push; fallback affordance with no dictionary; argus hints return after release
 - [ ] 1.7 Help-overlay tests: `help` frame renders the full dictionary; overlay lists only plugin hotkeys; `?` is not reserved by argus
@@ -34,10 +34,10 @@
 
 **Depends on:** Stage 1
 
-- [ ] 4.1 Rewrite the `modePluginView` branch in `app.go:handleGlobalKey` to forward every key (stop intercepting Esc); argus reserves nothing for its own nav
-- [ ] 4.2 Add `lastCtrlQ time.Time` to `App`, reset on `activatePluginView`; in plugin-view mode, forward a single Ctrl+Q but intercept the second within the window and call `deactivatePluginView`
-- [ ] 4.3 Add `uxlog` for surrender entry/exit and failsafe firing
-- [ ] 4.4 Run `make test` — Stage 1.3/1.4 green
+- [x] 4.1 Rewrite the `modePluginView` branch in `app.go:handleGlobalKey` to forward every key (stop intercepting Esc); argus reserves nothing for its own nav
+- [x] 4.2 Add `lastCtrlQ time.Time` to `App`, reset on `activatePluginView`; in plugin-view mode, forward a single Ctrl+Q but intercept the second within the window and call `deactivatePluginView`
+- [x] 4.3 Add `uxlog` for surrender entry/exit and failsafe firing
+- [x] 4.4 Run `make test` — Stage 1.3/1.4 green
 
 ## 5. Hotkey dictionary + context-sensitive bottom bar
 

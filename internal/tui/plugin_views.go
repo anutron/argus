@@ -129,6 +129,10 @@ func (a *App) activatePluginView(m *pluginViewMount) {
 
 	a.activePlugin = m
 	a.mode = modePluginView
+	// Reset the failsafe timestamp so a stale Ctrl+Q from a prior view can't
+	// trip the double-tap failsafe on the first press in this one.
+	a.lastCtrlQ = time.Time{}
+	uxlog.Log("[plugin-view] surrender: %q has the keyboard (full surrender, ^Q^Q failsafe)", m.view.Title)
 	a.pages.SwitchToPage(m.pageName)
 	a.tapp.SetFocus(m.pane)
 
@@ -167,6 +171,7 @@ func (a *App) deactivatePluginView() {
 	}
 	m := a.activePlugin
 	a.activePlugin = nil
+	uxlog.Log("[plugin-view] release: %q gave back the keyboard", m.view.Title)
 
 	if m.conn != nil {
 		_ = m.conn.SendBlur()
