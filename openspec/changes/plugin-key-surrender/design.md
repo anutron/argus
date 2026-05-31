@@ -24,12 +24,11 @@ The substrate already has the seams needed to fix this cleanly. The WebSocket co
 - Formalize a "who has the ball" model: while a plugin view is focused, the plugin owns the keyboard and argus forwards every key faithfully, including Ctrl/Shift/Alt-arrow, function keys, and Ctrl-combos.
 - Fix the encoder so modified keys are encoded with standard xterm control sequences instead of being dropped or flattened — via a single shared encoder used by all three current call sites.
 - Let the plugin hand control back to argus cleanly (plugin-initiated release) and guarantee argus can always reclaim the keyboard even if the plugin misbehaves (failsafe).
-- Make the bottom bar context-sensitive: render plugin-supplied hints while a plugin has the ball, with a non-overridable "return to argus" hint always present.
-- Keep the v1 plugin contract backwards compatible: every protocol addition is additive; a plugin that ignores the new envelopes still works.
+- Formalize a plugin **hotkey dictionary** the plugin pushes to argus: the full set of the plugin's hotkeys, each flagged for whether it appears in the bottom bar. Argus renders the bar-flagged subset in a context-sensitive bottom bar (with a non-overridable "return to argus" hint always present) and renders the full set in argus's `?` help overlay when the plugin asks for it.
 
 **Non-Goals:**
 
-- Cmd-arrow support. macOS terminals do not forward the Command modifier to TTY apps, so Cmd-arrow can never reach argus regardless of design. The realistic targets are Ctrl / Shift / Alt-arrow.
+- Cmd-specific decoding. macOS terminals do not send a raw "Command" modifier to TTY apps, but the operator's iTerm2 is configured to **remap Cmd+arrow into standard xterm CSI sequences** — `⌘→` emits `\x1b[1;7C`, `⌘←` → `\x1b[1;7D`, `⌘↑` → `\x1b[1;7A`, `⌘↓` → `\x1b[1;7B` (modifier param `7` = `1 + Alt(2) + Ctrl(4)`, i.e. Ctrl+Alt). tcell decodes those to `KeyRight/Left/Up/Down` with `ModCtrl|ModAlt`, which is exactly what argus's agent-view nav binds today (`app.go:1829`). So Cmd+arrow already reaches argus — as a Ctrl+Alt+arrow event — and this change supports it the same way it supports any other modified arrow: **the shared encoder must faithfully round-trip the `\x1b[1;7<final>]` form** so hera receives the identical bytes it would have received directly. Argus adds no Command-specific handling; correct Ctrl/Shift/Alt encoding is sufficient, and the terminal-side remap is the operator's responsibility (documented, not owned by argus).
 - Hiding or restyling argus's top tab header in plugin mode. The header's number-key hints (1/2/3) are also surrendered while a plugin has the ball; whether to dim or hide the header is left as an open question, out of scope for this change.
 - Plugin process lifecycle, supervision, or restart. Unchanged — that remains the plugin author's problem.
 - Remote-TUI (`--remote`) plugin views. Plugin views already no-op cleanly in remote mode (`loadPluginViews` returns early when `a.db` is an `apistore.Store`); this change does not add remote support.
@@ -78,56 +77,69 @@ Coverage:
 - Runes, with Alt → ESC-prefixed.
 - Enter (and Shift/Alt+Enter → `ESC CR`), Tab, Backtab, Backspace, Delete, Escape.
 - Arrows, Home, End, PgUp, PgDn — unmodified.
-- Modified arrows / Home / End using the xterm CSI form `CSI 1 ; <mod> <final>`, where `<mod>` is `1 + (Shift=1) + (Alt=2) + (Ctrl=4)`. So `Ctrl+Right` → `\x1b[1;5C`, `Shift+Right` → `\x1b[1;2C`, `Alt+Right` → `\x1b[1;3C`, `Ctrl+Shift+Right` → `\x1b[1;6C`, etc.
+- Modified arrows / Home / End using the xterm CSI form `CSI 1 ; <mod> <final>`, where `<mod>` is `1 + (Shift=1) + (Alt=2) + (Ctrl=4)`. So `Ctrl+Right` → `\x1b[1;5C`, `Shift+Right` → `\x1b[1;2C`, `Alt+Right` → `\x1b[1;3C`, `Ctrl+Shift+Right` → `\x1b[1;6C`, and `Ctrl+Alt+Right` → `\x1b[1;7C`. The last one is the load-bearing case for the operator's setup: iTerm2 remaps Cmd+arrow to the `\x1b[1;7<final>]` (Ctrl+Alt) form, so faithfully re-emitting mod-`7` sequences is what makes hera's Cmd+arrow focus-switching work end to end.
 - Ctrl+letter → the existing C0 control bytes.
 
 Rationale: the bug is literally a divergence between three encoders. Consolidating fixes Ctrl-arrow everywhere (including a latent gap in the agent PTY) and removes the footgun of three implementations drifting. Existing mapped sequences must stay byte-identical so the agent view and existing plugins do not regress.
 
 **Alternatives considered:** (a) fix only the two `eventBytes` copies — rejected; leaves three encoders and the agent gap. (b) fix plugin panes now, agent encoder later — rejected; the operator chose the full consolidation, and doing it once under one test suite is safer than twice.
 
-### Decision 5: Bottom bar — plugin pushes hints, argus reserves the exit hint
+### Decision 5: Plugin hotkey dictionary drives both the bottom bar and the `?` overlay
 
-The status bar gains a plugin-view state. While a plugin has the ball:
+The plugin pushes a **hotkey dictionary** to argus over the existing WebSocket: the full set of its currently-active hotkeys, each entry carrying a key glyph, a label, and a `bar` flag for whether it should appear in the bottom bar.
 
-- The plugin may push a `{"type":"hints","items":[{"key":"^F","label":"focus"},…]}` control envelope (same plugin→argus channel as `release`). Argus stores the latest hints on the active mount and renders them in the bar, refreshing live as hera's focus changes.
-- Argus **always** renders a reserved, non-overridable "return to argus" hint (the failsafe: `^Q^Q argus`). The plugin's pushed hints cannot occupy or suppress this segment.
-- If the plugin never pushes hints, the bar shows only the reserved exit hint plus a "▶ <plugin title> has the keyboard" affordance.
+```json
+{"type":"hotkeys","items":[
+  {"key":"^F","label":"next pane","bar":true},
+  {"key":"^B","label":"prev pane","bar":true},
+  {"key":"esc","label":"cancel agent","bar":false},
+  {"key":"r","label":"refresh","bar":false}
+]}
+```
 
-Rationale: the plugin owns the keyboard and is the only authority on what its keys do, and those bindings change with hera's internal focus — so static or registration-time hints would frequently be wrong. The reserved exit hint guarantees the escape affordance is always visible regardless of what (or whether) the plugin pushes.
+Argus stores the latest dictionary on the active mount and uses it two ways, both context-sensitive on `modePluginView`:
 
-**Alternatives considered:** (a) minimal bar, plugin paints its own hints inside its surface — viable and lower-surface, but loses argus-rendered integration the operator wanted. (b) static registration-time hints — rejected; can't track focus changes. (c) blank bar — rejected; loses the "who has the ball" affordance.
+- **Bottom bar.** Render the `bar:true` subset, refreshing live as hera changes focus and re-pushes. Argus **always** renders a reserved, non-overridable "return to argus" hint (the failsafe: `^Q^Q argus`) — the plugin's items can never occupy or suppress that segment, and it is drawn last so it can never be pushed off-screen. With no dictionary yet, the bar shows only the reserved exit hint plus a "▶ <plugin title> has the keyboard" affordance.
+- **`?` help overlay.** Argus renders the **full** dictionary (every item, `bar` flag ignored) in its existing help modal, styled like argus's own help so the look is normalized across plugins. While a plugin has the ball, the overlay shows only the plugin's hotkeys — not argus's bindings.
+
+**The `?` overlay is plugin-triggered, not argus-reserved.** Because argus fully surrenders every key (including `?`), the plugin owns `?`. When the user presses `?` inside hera, hera sends a `{"type":"help"}` control envelope and argus pops the overlay from the stored dictionary. This keeps the full-surrender contract intact (argus reserves nothing but the double-Ctrl+Q failsafe) while still normalizing the *rendering* in argus. The overlay is dismissed by argus on the next key or Esc-equivalent and does not itself capture the keyboard beyond dismissal.
+
+Rationale: the plugin owns the keyboard and is the only authority on what its keys do, and those bindings change with hera's internal focus — so static or registration-time hints would frequently be wrong. Argus already holds the dictionary for the bar, so rendering the `?` overlay from the same data is nearly free and consistent. The reserved exit hint guarantees the escape affordance is always visible regardless of what (or whether) the plugin pushes.
+
+**Alternatives considered:** (a) argus reserves `?` and renders the overlay itself — rejected; it carves `?` out of the full-surrender contract for marginal gain, and the always-on exit hint already covers the must-not-lose affordance. (b) plugin renders its own help inside its surface — rejected; every plugin would reinvent help rendering and argus already holds the dictionary, so the look would be inconsistent for no benefit. (c) static registration-time hints — rejected; can't track focus changes. (d) blank bar — rejected; loses the "who has the ball" affordance.
 
 ### Decision 6: "Who has the ball" state stays where it already lives
 
-The authoritative signal is the existing `a.mode == modePluginView` plus `a.activePlugin *pluginViewMount`. No new state machine. The status bar reads this (the app pushes plugin-mode on activate / clears on deactivate). Hints and the Ctrl+Q timestamp hang off the active mount / App, set on activate and cleared on deactivate, so a stale plugin's hints never bleed into the next.
+The authoritative signal is the existing `a.mode == modePluginView` plus `a.activePlugin *pluginViewMount`. No new state machine. The status bar reads this (the app pushes plugin-mode on activate / clears on deactivate). The hotkey dictionary and the Ctrl+Q timestamp hang off the active mount / App, set on activate and cleared on deactivate, so a stale plugin's dictionary never bleeds into the next.
 
-## Protocol summary (v1, additive)
+## Protocol summary
 
-New control envelopes, all JSON text frames:
+hera is the only plugin with a UX today, so these envelopes are treated as the contract hera implements, not as optional add-ons constrained by legacy compatibility. They are nonetheless additive to the documented v1 surface (new event/envelope types), so nothing existing breaks. New control envelopes, all JSON text frames:
 
 | Direction      | Envelope                                             | Effect                                                        |
 | -------------- | ---------------------------------------------------- | ------------------------------------------------------------- |
 | argus → plugin | `{"type":"resize","cols":N,"rows":M}` (existing)     | unchanged                                                     |
 | argus → plugin | `{"type":"focus"}` / `{"type":"blur"}` (existing)    | unchanged                                                     |
 | plugin → argus | `{"type":"release"}` (**new**)                       | argus tears down the view and returns the ball                |
-| plugin → argus | `{"type":"hints","items":[{"key":"…","label":"…"}]}` (**new**) | argus renders these in the bottom bar (exit hint reserved)    |
+| plugin → argus | `{"type":"hotkeys","items":[{"key":"…","label":"…","bar":bool}]}` (**new**) | argus stores the dictionary; renders `bar:true` items in the bottom bar (exit hint reserved) and the full set in the `?` overlay |
+| plugin → argus | `{"type":"help"}` (**new**)                          | argus pops the `?` help overlay rendered from the stored hotkey dictionary |
 
-Unknown plugin→argus envelope types are ignored (forward compatibility). A plugin that sends neither new type behaves exactly as today, exited via the double-Ctrl+Q failsafe.
+Unknown plugin→argus envelope types are ignored. A plugin that sends none of these still renders (encoder change is transparent) and is exited via the double-Ctrl+Q failsafe.
 
 ## Risks / Trade-offs
 
 - **Shared encoder touches the agent PTY input path (highest risk)** → A regression here breaks typing into live Claude/Codex sessions. Mitigation: the encoder is a pure function; pin every currently-emitted sequence with table tests (port the existing `terminalpane_test`, `streampane_test`, and `app_test` cases into the new package and assert byte-identical output), then add the new modified-key cases. Stage 1 of the plan writes these as failing tests first.
 - **Full surrender means Ctrl+C no longer quits argus while a plugin has the ball** → This is intended (Ctrl+C must reach the plugin), but it is a behavior change from "Ctrl+C quits" in other modes. Mitigation: the reserved exit hint documents the way out; the double-Ctrl+Q failsafe is always available.
 - **Failsafe false-positive** → A fast double Ctrl+Q intended for in-plugin nav exits to argus. Mitigation: the window is tunable; document the behavior; deliberate (paced) Ctrl+Q sequences are unaffected.
-- **Hints render path is argus-owned** → A plugin pushing many/oversized hint items could bloat the bar. Mitigation: cap item count and total rendered width; truncate; the reserved exit segment is always drawn last so it can never be pushed off-screen.
+- **Hotkey-dictionary render path is argus-owned** → A plugin pushing many/oversized items could bloat the bar or overlay. Mitigation: cap item count and total rendered width; truncate; the reserved exit segment is always drawn last so it can never be pushed off-screen.
 - **Control-frame parsing on the read pump** → Malformed JSON from the plugin must not panic the pump. Mitigation: parse defensively, ignore unparseable/unknown frames, keep binary ANSI frames on the existing fast path.
 
 ## Migration Plan
 
 - Additive only; no schema or data migration. The `plugin_views` table is unchanged.
-- Existing plugins keep working: encoder change is transparent (more keys arrive), and the new envelopes are opt-in. A plugin that does nothing new is exited via the failsafe.
+- hera is the only plugin, and it will implement `release`, `hotkeys`, and `help`; there is no fleet of existing plugins to preserve, so backwards compatibility is not a design constraint. The encoder change is transparent regardless (more keys simply arrive), and a plugin that implements none of the new envelopes still renders and is exited via the failsafe.
 - Rollback is a straight revert of the change; no persisted state is introduced.
-- Docs: update `docs/plugins.md` to document full surrender, the `release` and `hints` envelopes, and the double-Ctrl+Q failsafe. Add the non-obvious gotchas to `context/knowledge/gotchas/` (encoder consolidation invariant, control-frame-on-read-pump threading, failsafe window).
+- Docs: update `docs/plugins.md` to document full surrender, the `release` / `hotkeys` / `help` envelopes, and the double-Ctrl+Q failsafe. Add the non-obvious gotchas to `context/knowledge/gotchas/` (encoder consolidation invariant, control-frame-on-read-pump threading, failsafe window, the iTerm2 Cmd→Ctrl+Alt remap round-trip).
 
 ## Open Questions
 
@@ -152,6 +164,7 @@ Captured per behavioral section; these map to scenarios in the deltas.
 
 - it should forward Ctrl+Right to the active plugin as `\x1b[1;5C`
 - it should forward Shift/Alt/Ctrl+Shift modified arrows using the xterm `CSI 1;<mod><final>` form
+- it should forward a Ctrl+Alt+arrow event as the mod-`7` form (e.g. `\x1b[1;7C`), round-tripping the sequence iTerm2 emits for Cmd+arrow
 - it should forward Esc to the active plugin (not intercept it) so the plugin's PTY receives it
 - it should forward Ctrl+C to the active plugin instead of quitting argus while a plugin has the ball
 - it should forward plain arrows, Home, End, PgUp, PgDn to the active plugin
@@ -164,9 +177,16 @@ Captured per behavioral section; these map to scenarios in the deltas.
 - it should forward a single Ctrl+Q to the plugin (no force-return) when no second press arrives within the window
 - it should ignore an unknown or malformed plugin→argus control frame without disrupting the byte stream
 
-**Bottom bar (capability: `plugin-views`)**
+**Bottom bar + hotkey dictionary (capability: `plugin-views`)**
 
-- it should render plugin-supplied hints in the bottom bar while a plugin has the ball
-- it should always render a reserved "return to argus" exit hint that plugin hints cannot suppress or displace
-- it should show argus's own tab hints (not plugin hints) once the plugin releases the ball
-- it should fall back to a "<plugin> has the keyboard" affordance plus the exit hint when the plugin pushes no hints
+- it should render the `bar:true` subset of the plugin's pushed hotkey dictionary in the bottom bar while a plugin has the ball
+- it should always render a reserved "return to argus" exit hint that the plugin's items cannot suppress or displace
+- it should update the bottom bar live when the plugin re-pushes its hotkey dictionary
+- it should show argus's own tab hints (not plugin hotkeys) once the plugin releases the ball
+- it should fall back to a "<plugin> has the keyboard" affordance plus the exit hint when the plugin has pushed no dictionary
+
+**Help overlay (capability: `plugin-views`)**
+
+- it should pop the `?` help overlay rendered from the full pushed dictionary when the plugin sends `{"type":"help"}`
+- it should show only the plugin's hotkeys (not argus's bindings) in the overlay while a plugin has the ball
+- it should NOT reserve `?` itself — `?` is forwarded to the plugin like any other key
