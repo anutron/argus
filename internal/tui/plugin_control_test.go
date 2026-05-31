@@ -13,8 +13,16 @@ import (
 
 // activatePluginForTest registers one plugin view, wires a fake connector, and
 // activates it via the Ctrl+L hotkey so app.activePlugin is set. Returns the
-// running sim, a stop func, and the fake connector (with onControl captured).
+// app, the fake connector (with onControl captured), and a stop func.
 func activatePluginForTest(t *testing.T) (*App, *fakePluginConnector, func()) {
+	t.Helper()
+	app, fake, _, stop := activatePluginForTestWithSim(t)
+	return app, fake, stop
+}
+
+// activatePluginForTestWithSim is activatePluginForTest but also returns the
+// SimulationScreen so tests can scrape rendered overlay content.
+func activatePluginForTestWithSim(t *testing.T) (*App, *fakePluginConnector, tcell.SimulationScreen, func()) {
 	t.Helper()
 	d := testDB(t)
 	r := views.New(d)
@@ -44,7 +52,7 @@ func activatePluginForTest(t *testing.T) (*App, *fakePluginConnector, func()) {
 		stop()
 		t.Fatal("expected onControl to be captured by the fake connector")
 	}
-	return app, fake, stop
+	return app, fake, sim, stop
 }
 
 func TestDispatchPluginControl_ReleaseDeactivates(t *testing.T) {

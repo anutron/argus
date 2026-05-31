@@ -263,10 +263,17 @@ type App struct {
 	activePlugin      *pluginViewMount
 	pluginConnFactory pluginConnectorFactory
 	// pluginHelpRequested is set when the active plugin sends a help control
-	// frame. Stage 6 will consume this to pop the help overlay; for now it is
-	// an observable seam (the rendering is not yet wired). Touched only on the
-	// tview goroutine.
+	// frame. Retained as an observable seam (smoke tests assert it flips);
+	// requestPluginHelp also pops the overlay. Touched only on the tview
+	// goroutine.
 	pluginHelpRequested bool
+	// pluginHelpVisible is true while the plugin-triggered help overlay is on
+	// screen. While visible, the modePluginView branch of handleGlobalKey
+	// consumes exactly the NEXT key to dismiss the overlay (the overlay does
+	// not capture the keyboard beyond dismissal); otherwise argus fully
+	// surrenders. Cleared on dismiss and on deactivate. Touched only on the
+	// tview goroutine.
+	pluginHelpVisible bool
 
 	// lastCtrlQ timestamps the most recent Ctrl+Q seen while a plugin has the
 	// ball. A second Ctrl+Q within pluginFailsafeWindow force-returns to argus
@@ -1541,6 +1548,15 @@ func (a *App) handleGlobalKey(event *tcell.EventKey) *tcell.EventKey {
 	// (Decision 3) so a hung plugin can't trap the keyboard. See
 	// plugin_views.go.
 	if a.mode == modePluginView {
+		// Plugin-triggered help overlay: while it is visible, argus consumes
+		// exactly the NEXT key to dismiss it and hand control back to the
+		// plugin. This is the ONLY key (besides the double-Ctrl+Q failsafe)
+		// argus intercepts in plugin mode — the overlay does not capture the
+		// keyboard beyond this single dismissal.
+		if a.pluginHelpVisible {
+			a.dismissPluginHelp()
+			return nil
+		}
 		if event.Key() == tcell.KeyCtrlQ {
 			now := a.nowFn()
 			if !a.lastCtrlQ.IsZero() && now.Sub(a.lastCtrlQ) <= pluginFailsafeWindow {

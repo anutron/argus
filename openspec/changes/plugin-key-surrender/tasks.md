@@ -7,8 +7,8 @@
 - [x] 1.3 Routing/surrender tests (SimulationScreen smoke + handler unit): in plugin-view mode, Esc / Ctrl+C / `?` / a tab-switch number / a focus-rail arrow all reach the pane and trigger no argus action
 - [x] 1.4 Failsafe tests: single Ctrl+Q is forwarded; two Ctrl+Q within the window force-return (deactivate); two Ctrl+Q outside the window do not
 - [x] 1.5 Connector tests: a plugin→argus text frame is delivered to the control callback; `release`/`hotkeys`/`help` dispatch; unknown type and malformed JSON are ignored without disrupting the binary stream
-- [ ] 1.6 Bottom-bar tests: bar-flagged subset renders; reserved exit hint always present and never displaced; live update on re-push; fallback affordance with no dictionary; argus hints return after release
-- [ ] 1.7 Help-overlay tests: `help` frame renders the full dictionary; overlay lists only plugin hotkeys; `?` is not reserved by argus
+- [x] 1.6 Bottom-bar tests: bar-flagged subset renders; reserved exit hint always present and never displaced; live update on re-push; fallback affordance with no dictionary; argus hints return after release
+- [x] 1.7 Help-overlay tests: `help` frame renders the full dictionary; overlay lists only plugin hotkeys; `?` is not reserved by argus
 - [ ] 1.8 Confirm every `it should X` acceptance criterion in `design.md` has a corresponding failing test (Prove-It Pattern) and run `make test` to see them red
 
 ## 2. Shared key encoder
@@ -43,20 +43,20 @@
 
 **Depends on:** Stage 3
 
-- [ ] 5.1 Store the latest hotkey dictionary on the active `pluginViewMount`; set on `hotkeys` frame, clear on deactivate (no bleed into the next plugin)
-- [ ] 5.2 Add a plugin-view state setter to `widget/statusbar.go` (active flag, plugin title, dictionary); `Draw` branches to render the `bar:true` subset
-- [ ] 5.3 Always render the reserved "return to argus" exit hint last so plugin items cannot displace it; cap item count + total width and truncate
-- [ ] 5.4 Render the "<plugin> has the keyboard" fallback affordance when no dictionary is present; push plugin-mode on activate, clear on deactivate so argus hints return
-- [ ] 5.5 Re-render the bar on each `hotkeys` re-push (via `QueueUpdateDraw`)
-- [ ] 5.6 Run `make test` — Stage 1.6 green
+- [x] 5.1 Store the latest hotkey dictionary on the active `pluginViewMount`; set on `hotkeys` frame, clear on deactivate (no bleed into the next plugin)
+- [x] 5.2 Add a plugin-view state setter to `widget/statusbar.go` (active flag, plugin title, dictionary); `Draw` branches to render the `bar:true` subset
+- [x] 5.3 Always render the reserved "return to argus" exit hint last so plugin items cannot displace it; cap item count + total width and truncate
+- [x] 5.4 Render the "<plugin> has the keyboard" fallback affordance when no dictionary is present; push plugin-mode on activate, clear on deactivate so argus hints return
+- [x] 5.5 Re-render the bar on each `hotkeys` re-push (via `QueueUpdateDraw`)
+- [x] 5.6 Run `make test` — Stage 1.6 green
 
 ## 6. Plugin-triggered help overlay
 
 **Depends on:** Stage 5
 
-- [ ] 6.1 On a `help` control frame, render the full stored dictionary in argus's existing help modal, styled like argus help, showing only the plugin's hotkeys
-- [ ] 6.2 Confirm argus does NOT reserve `?` (it is forwarded to the plugin); the overlay is dismissible without capturing the keyboard beyond dismissal
-- [ ] 6.3 Run `make test` — Stage 1.7 green
+- [x] 6.1 On a `help` control frame, render the full stored dictionary in argus's existing help modal, styled like argus help, showing only the plugin's hotkeys
+- [x] 6.2 Confirm argus does NOT reserve `?` (it is forwarded to the plugin); the overlay is dismissible without capturing the keyboard beyond dismissal
+- [x] 6.3 Run `make test` — Stage 1.7 green
 
 ## 7. Docs, gotchas, and final verification
 
