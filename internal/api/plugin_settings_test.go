@@ -189,7 +189,7 @@ func TestAPI_SubmitPluginSectionValues_ProxiesToCallback(t *testing.T) {
 
 	var seenURL string
 	var seenBody string
-	srv.pluginSubmitFn = func(_ context.Context, url string, body []byte) (int, []byte, error) {
+	srv.pluginSubmitFn = func(_ context.Context, url, _ string, body []byte) (int, []byte, error) {
 		seenURL = url
 		seenBody = string(body)
 		return http.StatusOK, []byte(`{"ok":true}`), nil
@@ -226,7 +226,7 @@ func TestAPI_SubmitPluginSectionValues_PluginError(t *testing.T) {
 	mux := srv.routes()
 	mux.ServeHTTP(httptest.NewRecorder(), pluginReq("POST", "/api/plugins/settings/sections", "owner", validSectionBody))
 
-	srv.pluginSubmitFn = func(_ context.Context, _ string, _ []byte) (int, []byte, error) {
+	srv.pluginSubmitFn = func(_ context.Context, _, _ string, _ []byte) (int, []byte, error) {
 		return 0, nil, errors.New("connection refused")
 	}
 	w := httptest.NewRecorder()
@@ -245,7 +245,7 @@ func TestDefaultPluginSubmit_RoundTrip(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	status, body, err := defaultPluginSubmit(t.Context(), upstream.URL, []byte(`{"k":true}`))
+	status, body, err := defaultPluginSubmit(t.Context(), upstream.URL, "", []byte(`{"k":true}`))
 	testutil.NoError(t, err)
 	testutil.Equal(t, status, http.StatusAccepted)
 	testutil.Equal(t, string(body), `{"got":"yes"}`)
@@ -253,7 +253,7 @@ func TestDefaultPluginSubmit_RoundTrip(t *testing.T) {
 }
 
 func TestDefaultPluginSubmit_BadURL(t *testing.T) {
-	_, _, err := defaultPluginSubmit(t.Context(), "::not-a-url::", []byte(`{}`))
+	_, _, err := defaultPluginSubmit(t.Context(), "::not-a-url::", "", []byte(`{}`))
 	if err == nil {
 		t.Fatal("expected error for malformed URL")
 	}
@@ -261,7 +261,7 @@ func TestDefaultPluginSubmit_BadURL(t *testing.T) {
 
 func TestDefaultPluginSubmit_TransportError(t *testing.T) {
 	// Use an unroutable port to force a fast transport error.
-	_, _, err := defaultPluginSubmit(t.Context(), "http://127.0.0.1:1/", []byte(`{}`))
+	_, _, err := defaultPluginSubmit(t.Context(), "http://127.0.0.1:1/", "", []byte(`{}`))
 	if err == nil {
 		t.Fatal("expected error for unreachable URL")
 	}
@@ -285,6 +285,85 @@ func TestAPI_SubmitPluginSectionValues_DefaultSubmitterReachesPlugin(t *testing.
 	mux.ServeHTTP(w, authedReq("POST", "/api/plugins/settings/sections/owner/Hello/submit", `{"k":true}`))
 	testutil.Equal(t, w.Code, http.StatusOK)
 	testutil.Equal(t, string(seenBody), `{"k":true}`)
+}
+
+// TestAPI_SubmitPluginSectionValues_ForwardsAuthHeader pins the contract that
+// when a section is registered with an `auth_header`, the daemon's callback
+// proxy MUST set `Authorization: <auth_header>` on the POST to the plugin's
+// callback URL. hera's MCP listener (and any plugin gating its callback on a
+// shared secret) relies on this; before the fix the proxy dropped the header
+// and the plugin saw an unauthenticated POST → 401.
+func TestAPI_SubmitPluginSectionValues_ForwardsAuthHeader(t *testing.T) {
+	srv, _ := testServer(t)
+	mux := srv.routes()
+
+	// Real upstream so the production code path through defaultPluginSubmit
+	// runs — the test seam is intentionally NOT used here, because the bug
+	// was in defaultPluginSubmit dropping the header before egress.
+	var seenAuth string
+	var seenBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenAuth = r.Header.Get("Authorization")
+		seenBody, _ = readAll(r)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	const wantAuth = "Bearer plugin-secret-xyz"
+	body := `{"title":"Hello","callback_url":"` + upstream.URL +
+		`","auth_header":"` + wantAuth +
+		`","fields":[{"key":"k","label":"l","type":"bool","default":false}]}`
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, pluginReq("POST", "/api/plugins/settings/sections", "owner", body))
+	testutil.Equal(t, w.Code, http.StatusCreated)
+
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, authedReq("POST", "/api/plugins/settings/sections/owner/Hello/submit", `{"k":true}`))
+	testutil.Equal(t, w.Code, http.StatusOK)
+	testutil.Equal(t, string(seenBody), `{"k":true}`)
+	testutil.Equal(t, seenAuth, wantAuth)
+}
+
+// TestAPI_SubmitPluginSectionValues_OmitsEmptyAuthHeader covers the negative
+// half: sections registered without an `auth_header` MUST NOT have the
+// proxy set Authorization at all — otherwise plugins that reject unknown
+// auth headers would 401 on every save.
+func TestAPI_SubmitPluginSectionValues_OmitsEmptyAuthHeader(t *testing.T) {
+	srv, _ := testServer(t)
+	mux := srv.routes()
+	var hasAuth bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, hasAuth = r.Header["Authorization"]
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	body := `{"title":"Hello","callback_url":"` + upstream.URL + `","fields":[{"key":"k","label":"l","type":"bool","default":false}]}`
+	mux.ServeHTTP(httptest.NewRecorder(), pluginReq("POST", "/api/plugins/settings/sections", "owner", body))
+
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, authedReq("POST", "/api/plugins/settings/sections/owner/Hello/submit", `{"k":true}`))
+	testutil.Equal(t, w.Code, http.StatusOK)
+	testutil.Equal(t, hasAuth, false)
+}
+
+// TestDefaultPluginSubmit_SetsAuthorizationWhenNonEmpty is the unit-level
+// pin for defaultPluginSubmit itself. Belt-and-braces with the integration
+// test above so a refactor moving header logic out of defaultPluginSubmit
+// can't silently regress the contract.
+func TestDefaultPluginSubmit_SetsAuthorizationWhenNonEmpty(t *testing.T) {
+	var seen string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	_, _, err := defaultPluginSubmit(t.Context(), upstream.URL, "Bearer xyz", []byte(`{}`))
+	testutil.NoError(t, err)
+	testutil.Equal(t, seen, "Bearer xyz")
 }
 
 func TestAuthScope(t *testing.T) {

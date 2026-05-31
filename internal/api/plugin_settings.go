@@ -230,24 +230,30 @@ func (s *Server) handleSubmitPluginSectionValues(w http.ResponseWriter, r *http.
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	var callbackURL string
+	var (
+		callbackURL string
+		authHeader  string
+		found       bool
+	)
 	for _, row := range rows {
 		if row.Scope == scope && row.Title == title {
 			callbackURL = row.CallbackURL
+			authHeader = row.AuthHeader
+			found = true
 			break
 		}
 	}
-	if callbackURL == "" {
+	if !found {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "section not found"})
 		return
 	}
 
-	uxlog.Log("[api] plugin section submit scope=%q title=%q", scope, title)
+	uxlog.Log("[api] plugin section submit scope=%q title=%q has_auth=%v", scope, title, authHeader != "")
 	submit := s.pluginSubmitFn
 	if submit == nil {
 		submit = defaultPluginSubmit
 	}
-	statusCode, respBody, perr := submit(r.Context(), callbackURL, body)
+	statusCode, respBody, perr := submit(r.Context(), callbackURL, authHeader, body)
 	if perr != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": perr.Error()})
 		return
@@ -260,8 +266,11 @@ func (s *Server) handleSubmitPluginSectionValues(w http.ResponseWriter, r *http.
 // defaultPluginSubmit POSTs body to callbackURL with a 10s timeout. Used by
 // the form-submit proxy when no test seam has overridden s.pluginSubmitFn.
 // Returns the upstream status and body verbatim so the TUI can surface
-// failures to the user with the plugin's own error message.
-func defaultPluginSubmit(ctx context.Context, callbackURL string, body []byte) (int, []byte, error) {
+// failures to the user with the plugin's own error message. authHeader, if
+// non-empty, is set verbatim as the Authorization header — plugins gating
+// their callback endpoint (hera's MCP listener requires this on /mcp/*)
+// register the expected value at section-register time.
+func defaultPluginSubmit(ctx context.Context, callbackURL, authHeader string, body []byte) (int, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, callbackURL, bytes.NewReader(body))
@@ -269,6 +278,9 @@ func defaultPluginSubmit(ctx context.Context, callbackURL string, body []byte) (
 		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return 0, nil, err

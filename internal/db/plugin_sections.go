@@ -21,7 +21,12 @@ type PluginSection struct {
 	Type        string
 	SpecJSON    string
 	CallbackURL string
-	CreatedAt   time.Time
+	// AuthHeader is the verbatim Authorization-header value the callback proxy
+	// MUST set when POSTing form submissions to CallbackURL. Empty means no
+	// header; plugins that gate /mcp/* or their own endpoints on a static
+	// header use this to authenticate the daemon's callback.
+	AuthHeader string
+	CreatedAt  time.Time
 }
 
 // ErrPluginSectionInvalid rejects writes with empty scope, title, or
@@ -47,14 +52,15 @@ func (d *DB) UpsertPluginSection(s PluginSection) (int64, error) {
 	// upsert path also yields the id; tested via TestUpsertPluginSection_Replaces.
 	var id int64
 	err := d.conn.QueryRow(
-		`INSERT INTO plugin_settings (scope, title, type, spec_json, callback_url, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO plugin_settings (scope, title, type, spec_json, callback_url, auth_header, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(scope, title) DO UPDATE SET
 		   type=excluded.type,
 		   spec_json=excluded.spec_json,
-		   callback_url=excluded.callback_url
+		   callback_url=excluded.callback_url,
+		   auth_header=excluded.auth_header
 		 RETURNING id`,
-		s.Scope, s.Title, s.Type, s.SpecJSON, s.CallbackURL, now,
+		s.Scope, s.Title, s.Type, s.SpecJSON, s.CallbackURL, s.AuthHeader, now,
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("upsert plugin section: %w", err)
@@ -103,7 +109,7 @@ func (d *DB) ListPluginSections() ([]PluginSection, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	rows, err := d.conn.Query(
-		`SELECT id, scope, title, type, spec_json, callback_url, created_at
+		`SELECT id, scope, title, type, spec_json, callback_url, auth_header, created_at
 		 FROM plugin_settings
 		 ORDER BY title ASC, scope ASC`,
 	)
@@ -115,7 +121,7 @@ func (d *DB) ListPluginSections() ([]PluginSection, error) {
 	for rows.Next() {
 		var p PluginSection
 		var created string
-		if err := rows.Scan(&p.ID, &p.Scope, &p.Title, &p.Type, &p.SpecJSON, &p.CallbackURL, &created); err != nil {
+		if err := rows.Scan(&p.ID, &p.Scope, &p.Title, &p.Type, &p.SpecJSON, &p.CallbackURL, &p.AuthHeader, &created); err != nil {
 			return nil, fmt.Errorf("scan plugin section: %w", err)
 		}
 		p.CreatedAt = parseTime(created)
@@ -156,6 +162,7 @@ func (p PluginSection) ToSection() (settings.Section, error) {
 		Title:       p.Title,
 		Type:        settings.SectionType(p.Type),
 		CallbackURL: p.CallbackURL,
+		AuthHeader:  p.AuthHeader,
 	}
 	if p.SpecJSON == "" {
 		return sec, nil
@@ -179,6 +186,7 @@ func FromSection(s settings.Section) (PluginSection, error) {
 		Title:       s.Title,
 		Type:        string(s.Type),
 		CallbackURL: s.CallbackURL,
+		AuthHeader:  s.AuthHeader,
 	}
 	if s.Spec != nil {
 		raw, err := json.Marshal(s.Spec)

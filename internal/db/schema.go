@@ -323,12 +323,17 @@ func (d *DB) createTables() error {
 			type          TEXT NOT NULL DEFAULT 'form',
 			spec_json     TEXT NOT NULL DEFAULT '',
 			callback_url  TEXT NOT NULL,
+			auth_header   TEXT NOT NULL DEFAULT '',
 			created_at    TEXT NOT NULL,
 			UNIQUE(scope, title)
 		)
 	`); err != nil {
 		return fmt.Errorf("creating plugin_settings table: %w", err)
 	}
+	// Idempotent add for databases created before auth_header existed. The
+	// callback proxy forwards this as the Authorization header on form-submit
+	// POSTs so plugins can require auth on their callback endpoint.
+	d.conn.Exec(`ALTER TABLE plugin_settings ADD COLUMN auth_header TEXT NOT NULL DEFAULT ''`) //nolint:errcheck
 
 	// Plugin-registered top-level views (PR 9 of the plugin substrate). Each
 	// row is one full-screen UI surface owned by a plugin: the TUI opens a

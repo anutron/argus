@@ -50,6 +50,27 @@ func TestParseSection_InlineFieldsArray(t *testing.T) {
 	testutil.Equal(t, got.Spec.Fields[3].DefaultValue().(string), "")
 }
 
+// TestParseSection_AuthHeader covers the optional auth_header field — when
+// present, it MUST round-trip onto Section.AuthHeader so the callback proxy
+// can forward it as the Authorization header.
+func TestParseSection_AuthHeader(t *testing.T) {
+	raw := []byte(`{
+		"title": "Hello",
+		"callback_url": "http://127.0.0.1/save",
+		"auth_header": "Bearer s3cr3t",
+		"fields": [{"key":"k","label":"l","type":"bool","default":false}]
+	}`)
+	got, err := ParseSection("scope", raw)
+	testutil.NoError(t, err)
+	testutil.Equal(t, got.AuthHeader, "Bearer s3cr3t")
+
+	// Omitted is zero-value (no auth header set).
+	raw = []byte(`{"title":"x","callback_url":"http://x","fields":[{"key":"k","label":"l","type":"bool"}]}`)
+	got, err = ParseSection("scope", raw)
+	testutil.NoError(t, err)
+	testutil.Equal(t, got.AuthHeader, "")
+}
+
 func TestParseSection_DefaultTypeIsForm(t *testing.T) {
 	// Omitting `type` should default to "form" (most concise plugin shape).
 	raw := []byte(`{"title":"x","callback_url":"http://x","fields":[{"key":"k","label":"l","type":"bool"}]}`)

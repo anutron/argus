@@ -238,6 +238,33 @@ func TestDB_PluginSections_SkipsCorrupt(t *testing.T) {
 	testutil.Equal(t, sections[0].Title, "Good")
 }
 
+// TestPluginSection_RoundTripsAuthHeader pins the column round-trip for the
+// callback-proxy auth header — the upsert/list pair MUST preserve the value
+// so the submit handler can forward it as Authorization.
+func TestPluginSection_RoundTripsAuthHeader(t *testing.T) {
+	d, err := OpenInMemory()
+	testutil.NoError(t, err)
+	t.Cleanup(func() { d.Close() }) //nolint:errcheck
+
+	p := testPluginSection("scope", "Title")
+	p.AuthHeader = "Bearer plugin-secret"
+	_, err = d.UpsertPluginSection(p)
+	testutil.NoError(t, err)
+
+	sections, err := d.ListPluginSections()
+	testutil.NoError(t, err)
+	testutil.Equal(t, len(sections), 1)
+	testutil.Equal(t, sections[0].AuthHeader, "Bearer plugin-secret")
+
+	// Re-upsert with a new value to confirm ON CONFLICT updates auth_header.
+	p.AuthHeader = "Bearer rotated"
+	_, err = d.UpsertPluginSection(p)
+	testutil.NoError(t, err)
+	sections, err = d.ListPluginSections()
+	testutil.NoError(t, err)
+	testutil.Equal(t, sections[0].AuthHeader, "Bearer rotated")
+}
+
 func TestPluginSection_ToSectionEmptySpec(t *testing.T) {
 	p := PluginSection{Scope: "s", Title: "t", Type: "form", SpecJSON: "", CallbackURL: "http://x"}
 	sec, err := p.ToSection()
