@@ -11,6 +11,7 @@ import (
 	"github.com/drn/argus/internal/db"
 	"github.com/drn/argus/internal/tui/terminalpane"
 	"github.com/drn/argus/internal/tui/views"
+	"github.com/drn/argus/internal/tui/widget"
 	"github.com/drn/argus/internal/uxlog"
 )
 
@@ -163,6 +164,10 @@ func (a *App) activatePluginView(m *pluginViewMount) {
 	a.pages.SwitchToPage(m.pageName)
 	a.tapp.SetFocus(m.pane)
 
+	// Context-sensitive bottom bar: surface the plugin's bar:true hotkeys (if
+	// any were pushed before activation) plus the reserved exit hint.
+	a.statusbar.SetPluginMode(true, m.view.Title, barHints(m.hotkeys))
+
 	conn := a.pluginConnFactory(m.view.CallbackURL, func(b []byte) {
 		// Forward plugin → streampane source. Non-blocking — drop on
 		// backpressure to match the rest of argus's PTY plumbing.
@@ -212,9 +217,30 @@ func (a *App) deactivatePluginView() {
 		m.conn = nil
 	}
 
+	// Clear all plugin-view bar state so nothing bleeds into the next plugin:
+	// drop the bottom-bar plugin mode (argus's own tab hints return — the bar
+	// already tracks the active tab via SetTab), forget the pushed dictionary,
+	// and reset the help-requested seam.
+	a.statusbar.SetPluginMode(false, "", nil)
+	m.hotkeys = nil
+	a.pluginHelpRequested = false
+
 	a.mode = modeTaskList
 	a.pages.SwitchToPage("tasks")
 	a.tapp.SetFocus(a.tasklist)
+}
+
+// barHints converts a plugin's pushed hotkey dictionary into the widget-local
+// PluginHint slice the bottom bar renders, filtering to the bar:true subset.
+// Defined on the app side so the widget package never imports tui (cycle).
+func barHints(items []HotkeyItem) []widget.PluginHint {
+	var out []widget.PluginHint
+	for _, it := range items {
+		if it.Bar {
+			out = append(out, widget.PluginHint{Key: it.Key, Label: it.Label})
+		}
+	}
+	return out
 }
 
 // dispatchPluginControl decodes a raw plugin → argus control frame and
@@ -251,7 +277,8 @@ func (a *App) dispatchPluginControl(mount *pluginViewMount, raw []byte) {
 					return
 				}
 				mount.hotkeys = items
-				// Stage 5: render the bar:true subset in the bottom bar here.
+				// Refresh the bottom bar live with the bar:true subset.
+				a.statusbar.SetPluginMode(true, mount.view.Title, barHints(items))
 			})
 		}
 	case "help":

@@ -10,6 +10,7 @@ import (
 	"github.com/drn/argus/internal/agent"
 	"github.com/drn/argus/internal/testutil"
 	"github.com/drn/argus/internal/tui/views"
+	"github.com/drn/argus/internal/tui/widget"
 	"github.com/gdamore/tcell/v2"
 )
 
@@ -180,6 +181,84 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("condition not met within %v", timeout)
+}
+
+func TestSmoke_PluginView_BottomBarLifecycle(t *testing.T) {
+	d := testDB(t)
+	r := views.New(d)
+	_, err := r.Register("", "Ludwig", "ctrl+l", "ws://127.0.0.1:5111/ws")
+	testutil.NoError(t, err)
+
+	runner := agent.NewRunner(nil)
+	app := New(d, runner, true)
+
+	fake := &fakePluginConnector{}
+	app.pluginConnFactory = func(url string, onBytes func([]byte), onControl func([]byte), in <-chan []byte) pluginConnector {
+		fake.onBytes = onBytes
+		fake.onControl = onControl
+		return fake
+	}
+	app.loadPluginViews()
+
+	sim, stop := wireApp(t, app)
+	defer stop()
+
+	// Activate the plugin view → bar enters plugin mode with the plugin title.
+	sim.InjectKey(tcell.KeyCtrlL, 0, 0)
+	syncUI(t, app.tapp)
+
+	var active bool
+	var title string
+	var hints []widget.PluginHint
+	readUI(t, app.tapp, func() {
+		active, title, hints = app.statusbar.PluginMode()
+	})
+	testutil.Equal(t, active, true)
+	testutil.Equal(t, title, "Ludwig")
+	testutil.Equal(t, len(hints), 0)
+
+	// A hotkeys re-push refreshes the bar live. Only bar:true items render.
+	// dispatchPluginControl decodes on the calling goroutine then defers the
+	// tview mutation through QueueUpdateDraw, mirroring the read-pump path, so
+	// it is called from the test goroutine (not inside a readUI closure, which
+	// would nest QueueUpdate calls).
+	var mount0 *pluginViewMount
+	readUI(t, app.tapp, func() { mount0 = app.activePlugin })
+	app.dispatchPluginControl(mount0, []byte(
+		`{"type":"hotkeys","items":[`+
+			`{"key":"j","label":"down","bar":true},`+
+			`{"key":"k","label":"up","bar":true},`+
+			`{"key":"x","label":"hidden","bar":false}]}`))
+	syncUI(t, app.tapp)
+	readUI(t, app.tapp, func() {
+		active, title, hints = app.statusbar.PluginMode()
+	})
+	testutil.Equal(t, active, true)
+	testutil.Equal(t, len(hints), 2) // bar:false filtered out
+	testutil.Equal(t, hints[0].Key, "j")
+	testutil.Equal(t, hints[1].Key, "k")
+
+	// Deactivate → bar leaves plugin mode; mount.hotkeys + pluginHelpRequested
+	// are cleared so nothing bleeds into the next plugin.
+	var mount *pluginViewMount
+	readUI(t, app.tapp, func() {
+		mount = app.activePlugin
+		app.pluginHelpRequested = true // simulate a prior help request
+		app.deactivatePluginView()
+	})
+	syncUI(t, app.tapp)
+	readUI(t, app.tapp, func() {
+		active, title, hints = app.statusbar.PluginMode()
+	})
+	testutil.Equal(t, active, false)
+	testutil.Equal(t, title, "")
+	testutil.Equal(t, len(hints), 0)
+	if mount.hotkeys != nil {
+		t.Fatalf("mount.hotkeys not cleared on deactivate: %v", mount.hotkeys)
+	}
+	if app.pluginHelpRequested {
+		t.Fatal("pluginHelpRequested not cleared on deactivate")
+	}
 }
 
 func TestSmoke_PluginView_InvalidHotkeySkipped(t *testing.T) {
