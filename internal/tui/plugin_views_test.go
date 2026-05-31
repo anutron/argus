@@ -26,6 +26,7 @@ type fakePluginConnector struct {
 	closedCount    atomic.Int32
 	dialErr        error
 	onBytes        func([]byte)
+	onControl      func([]byte)
 	bytesToReceive [][]byte
 }
 
@@ -75,8 +76,9 @@ func TestSmoke_PluginView_HotkeyMountsAndEscExits(t *testing.T) {
 	app := New(d, runner, true)
 
 	fake := &fakePluginConnector{}
-	app.pluginConnFactory = func(url string, onBytes func([]byte), in <-chan []byte) pluginConnector {
+	app.pluginConnFactory = func(url string, onBytes func([]byte), onControl func([]byte), in <-chan []byte) pluginConnector {
 		fake.onBytes = onBytes
+		fake.onControl = onControl
 		return fake
 	}
 	// Re-mount with the test factory in place. buildUI already called
@@ -215,7 +217,7 @@ func TestSmoke_PluginView_RemoteModeIsNoOp(t *testing.T) {
 
 func TestDefaultPluginConnectorFactory_ReturnsNonNil(t *testing.T) {
 	in := make(chan []byte)
-	c := defaultPluginConnectorFactory("ws://127.0.0.1:1", nil, in)
+	c := defaultPluginConnectorFactory("ws://127.0.0.1:1", nil, nil, in)
 	if c == nil {
 		t.Fatal("expected non-nil connector")
 	}
@@ -256,8 +258,9 @@ func TestActivatePluginView_ReactivationResendsResize(t *testing.T) {
 	runner := agent.NewRunner(nil)
 	app := New(d, runner, true)
 	fake := &fakePluginConnector{}
-	app.pluginConnFactory = func(url string, onBytes func([]byte), in <-chan []byte) pluginConnector {
+	app.pluginConnFactory = func(url string, onBytes func([]byte), onControl func([]byte), in <-chan []byte) pluginConnector {
 		fake.onBytes = onBytes
+		fake.onControl = onControl
 		return fake
 	}
 	app.loadPluginViews()

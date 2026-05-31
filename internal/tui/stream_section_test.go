@@ -14,7 +14,7 @@ func newAppForStreamTest(t *testing.T) (*App, *fakePluginConnector) {
 	runner := agent.NewRunner(nil)
 	app := New(d, runner, true)
 	fake := &fakePluginConnector{}
-	app.pluginConnFactory = func(url string, onBytes func([]byte), _ <-chan []byte) pluginConnector {
+	app.pluginConnFactory = func(url string, onBytes func([]byte), _ func([]byte), _ <-chan []byte) pluginConnector {
 		fake.onBytes = onBytes
 		return fake
 	}
@@ -103,7 +103,7 @@ func TestApp_OpenStreamSection_ReplacesExisting(t *testing.T) {
 
 	// Swap the factory so the second open builds a different connector.
 	fake2 := &fakePluginConnector{}
-	app.pluginConnFactory = func(url string, onBytes func([]byte), _ <-chan []byte) pluginConnector {
+	app.pluginConnFactory = func(url string, onBytes func([]byte), _ func([]byte), _ <-chan []byte) pluginConnector {
 		fake2.onBytes = onBytes
 		return fake2
 	}

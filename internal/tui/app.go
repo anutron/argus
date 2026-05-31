@@ -260,6 +260,11 @@ type App struct {
 	pluginHotkeys     map[tcell.Key]*pluginViewMount
 	activePlugin      *pluginViewMount
 	pluginConnFactory pluginConnectorFactory
+	// pluginHelpRequested is set when the active plugin sends a help control
+	// frame. Stage 6 will consume this to pop the help overlay; for now it is
+	// an observable seam (the rendering is not yet wired). Touched only on the
+	// tview goroutine.
+	pluginHelpRequested bool
 
 	// lastCtrlQ timestamps the most recent Ctrl+Q seen while a plugin has the
 	// ball. A second Ctrl+Q within pluginFailsafeWindow force-returns to argus

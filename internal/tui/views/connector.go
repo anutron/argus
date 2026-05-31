@@ -13,12 +13,13 @@ import (
 
 // Plugin-view WebSocket protocol:
 //
-//   - Plugin → argus: binary frames carry ANSI bytes for streampane.
+//   - Plugin → argus: binary frames carry ANSI bytes for streampane; text
+//     frames carry JSON control envelopes (release/hotkeys/help), delivered
+//     raw to the onControl sink for defensive decode by the caller.
 //   - Argus → plugin: binary frames carry keystrokes; text frames carry JSON
 //     control envelopes (resize/focus/blur).
-//   - Argus reserves Esc for "exit plugin view back to argus" — Esc is
-//     intercepted before the keystroke pump runs, so it never reaches the
-//     plugin.
+//   - Under full key surrender, argus reserves nothing but a double-Ctrl+Q
+//     failsafe; the plugin asks for the keyboard back via a release envelope.
 type envelopeType string
 
 const (
@@ -43,6 +44,12 @@ type Connector struct {
 	// streampane's source channel is the natural sink. Always called from
 	// a single goroutine, so receivers don't need their own mutex.
 	onBytes func([]byte)
+	// onControl is called with the raw payload of each TEXT frame the plugin
+	// emits (plugin → argus control envelopes: release/hotkeys/help). The
+	// connector does NOT parse — it routes raw bytes to the sink, which decodes
+	// defensively. May be nil, in which case text frames are dropped. Called
+	// from the same single read-pump goroutine as onBytes.
+	onControl func([]byte)
 	// inBytes carries keystrokes from the TUI → plugin as binary frames.
 	// Closing the channel signals the write pump to exit cleanly.
 	inBytes <-chan []byte
@@ -64,14 +71,18 @@ type websocketResp struct{}
 // NewConnector constructs a Connector wired to the given URL and byte sinks.
 //
 // onBytes is invoked from the read pump for each binary frame from the
-// plugin. inBytes is consumed by the write pump as binary frames sent to the
-// plugin; closing inBytes triggers a clean shutdown of the write pump.
-func NewConnector(url string, onBytes func([]byte), inBytes <-chan []byte) *Connector {
+// plugin. onControl is invoked from the same read pump for each TEXT frame
+// (plugin → argus control envelopes); it receives the raw payload and may be
+// nil to drop text frames. inBytes is consumed by the write pump as binary
+// frames sent to the plugin; closing inBytes triggers a clean shutdown of the
+// write pump.
+func NewConnector(url string, onBytes func([]byte), onControl func([]byte), inBytes <-chan []byte) *Connector {
 	return &Connector{
-		url:     url,
-		onBytes: onBytes,
-		inBytes: inBytes,
-		closeCh: make(chan struct{}),
+		url:       url,
+		onBytes:   onBytes,
+		onControl: onControl,
+		inBytes:   inBytes,
+		closeCh:   make(chan struct{}),
 		dialer: func(ctx context.Context, url string) (*websocket.Conn, *websocketResp, error) {
 			c, _, err := websocket.Dial(ctx, url, nil)
 			if err != nil {
@@ -176,8 +187,13 @@ func (c *Connector) readPump() {
 			return
 		}
 		if typ != websocket.MessageBinary {
-			// Control text frames flow plugin→argus too, but the current
-			// protocol reserves them for argus→plugin. Drop unknown text.
+			// TEXT frames are plugin → argus control envelopes
+			// (release/hotkeys/help). Route the raw payload to onControl; the
+			// sink decodes defensively. Never parse here — a bad payload must
+			// not stall the pump or starve the binary ANSI fast path.
+			if c.onControl != nil && len(data) > 0 {
+				c.onControl(data)
+			}
 			continue
 		}
 		if c.onBytes != nil && len(data) > 0 {

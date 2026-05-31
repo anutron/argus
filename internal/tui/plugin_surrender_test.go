@@ -149,7 +149,7 @@ func TestActivatePluginView_ResetsLastCtrlQ(t *testing.T) {
 	app.lastCtrlQ = time.Unix(500, 0)
 	app.activePlugin = nil
 	app.mode = modeTaskList
-	app.pluginConnFactory = func(url string, onBytes func([]byte), in <-chan []byte) pluginConnector {
+	app.pluginConnFactory = func(url string, onBytes func([]byte), onControl func([]byte), in <-chan []byte) pluginConnector {
 		return &fakePluginConnector{}
 	}
 	bytesIn := make(chan []byte, 1)
