@@ -414,10 +414,20 @@ func TestSmoke_NewTaskFormPaste(t *testing.T) {
 		sim.InjectKey(tcell.KeyRune, r, 0)
 	}
 	sim.PostEvent(tcell.NewEventPaste(false))
-	syncUI(t, app.tapp)
 
+	// Poll for the prompt to populate. syncUI's 50 ms eventSettle is enough
+	// on a quiet machine but not reliably enough under -race on CI, where
+	// draining 20 queued events through the tcell→tview boundary can take
+	// longer than the fixed wait.
 	var prompt string
-	readUI(t, app.tapp, func() { prompt = string(form.prompt) })
+	deadline := time.Now().Add(uiTimeout)
+	for time.Now().Before(deadline) {
+		syncUI(t, app.tapp)
+		readUI(t, app.tapp, func() { prompt = string(form.prompt) })
+		if prompt == "pasted prompt text" {
+			break
+		}
+	}
 	testutil.Equal(t, prompt, "pasted prompt text")
 }
 
@@ -1821,7 +1831,8 @@ func TestRefreshTasks_NeedsInputSticky(t *testing.T) {
 
 	// Write a log file for the other task containing the needs-input marker.
 	// Path A ('❯ 1.' with literal space) is what survives ANSI strip in the
-	// AskUserQuestion overlay.
+	// AskUserQuestion overlay. Pad with a prompt-box opener so endsInQuestion
+	// doesn't also trip.
 	logPath := agent.SessionLogPath(other.ID)
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
 		t.Fatalf("mkdir sessions: %v", err)
